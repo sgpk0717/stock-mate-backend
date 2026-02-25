@@ -62,3 +62,9 @@ celerybeat.pid
 
 # Docker
 docker-compose.override.yml
+
+# PostgreSQL data (if running outside Docker)
+pgdata/
+
+# Alembic
+alembic/versions/__pycache__/

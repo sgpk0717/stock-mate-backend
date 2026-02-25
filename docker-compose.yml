@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stockmate-api
+    ports:
+      - "${PORT:-8007}:8007"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-stockmate}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
+      - POSTGRES_DB=${POSTGRES_DB:-stockmate}
+      - DEBUG=${DEBUG:-true}
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stockmate-db
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-stockmate}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
+      - POSTGRES_DB=${POSTGRES_DB:-stockmate}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-stockmate} -d ${POSTGRES_DB:-stockmate}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+    driver: local
