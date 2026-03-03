@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   app:
     build:
@@ -15,6 +13,9 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
       - POSTGRES_DB=${POSTGRES_DB:-stockmate}
       - DEBUG=${DEBUG:-true}
+      - USE_SIMULATOR=${USE_SIMULATOR:-false}
+      - ZMQ_HOST=host.docker.internal
+      - ZMQ_PORT=${ZMQ_PORT:-5555}
     volumes:
       - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload
@@ -24,7 +25,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:16-alpine
+    image: timescale/timescaledb:latest-pg16
     container_name: stockmate-db
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
