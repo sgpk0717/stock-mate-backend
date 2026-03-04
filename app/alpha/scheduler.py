@@ -228,6 +228,9 @@ class AlphaFactoryScheduler:
                 })
 
             async def iteration_cb(event: dict) -> None:
+                if event.get("type") == "generation_complete":
+                    self._state.population_size = event.get("population_size", 0)
+                    self._state.elite_count = event.get("elite_count", 0)
                 await manager.broadcast("alpha:factory", {
                     **event,
                     "cycle": cycle_num,
@@ -274,6 +277,7 @@ class AlphaFactoryScheduler:
                 completed_at=datetime.utcnow(),
             )
             db.add(mining_run)
+            await db.flush()  # FK 제약: mining_run이 먼저 존재해야 함
 
             for factor in discovered:
                 alpha_factor = AlphaFactor(
@@ -291,6 +295,7 @@ class AlphaFactoryScheduler:
                     sharpe=factor.metrics.sharpe,
                     max_drawdown=factor.metrics.max_drawdown,
                     status="discovered",
+                    population_active=False,
                     parent_ids=factor.parent_ids,
                 )
                 db.add(alpha_factor)

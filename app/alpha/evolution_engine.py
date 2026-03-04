@@ -544,8 +544,13 @@ class EvolutionEngine:
             .values(population_active=False, is_elite=False)
         )
 
+        # 엘리트 집합 미리 계산 (id() 기반 O(1) 조회)
+        elite_list = self._select_elites(population)
+        elite_obj_ids = {id(f) for f in elite_list}
+
         # 새 모집단 저장/업데이트
         for factor in population:
+            is_elite_now = id(factor) in elite_obj_ids
             if factor.factor_id:
                 # 기존 팩터 업데이트
                 await self._db.execute(
@@ -554,7 +559,7 @@ class EvolutionEngine:
                     .values(
                         population_active=True,
                         fitness_composite=factor.fitness_composite,
-                        is_elite=factor in self._select_elites(population),
+                        is_elite=is_elite_now,
                         birth_generation=factor.generation,
                     )
                 )
@@ -574,6 +579,7 @@ class EvolutionEngine:
                     expression_hash=factor.expression_hash,
                     operator_origin=factor.operator_origin,
                     population_active=True,
+                    is_elite=is_elite_now,
                     birth_generation=self._generation,
                     status="population",
                     parent_ids=factor.parent_ids if factor.parent_ids else None,
