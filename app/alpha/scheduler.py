@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 
 from app.alpha.evolution_engine import EvolutionEngine
 from app.alpha.memory import ExperienceVectorMemory
@@ -105,6 +105,14 @@ class AlphaFactoryScheduler:
             try:
                 async with async_session() as db:
                     await self._vector_memory.load_cache(db)
+                    # DB에서 마지막 세대 번호 복원
+                    max_gen = await db.execute(
+                        select(func.max(AlphaFactor.birth_generation))
+                        .where(AlphaFactor.population_active == True)  # noqa: E712
+                    )
+                    last_gen = max_gen.scalar() or 0
+                    self._state.generation = last_gen
+                    logger.info("Restored generation from DB: %d", last_gen)
             except Exception as e:
                 logger.warning("Vector memory cache load failed: %s", e)
 

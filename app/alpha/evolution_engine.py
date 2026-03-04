@@ -114,6 +114,11 @@ class EvolutionEngine:
                     expression_str=f.expression_str,
                     hypothesis=f.hypothesis or "",
                     ic_mean=f.ic_mean or 0.0,
+                    ic_std=f.ic_std or 0.0,
+                    icir=f.icir or 0.0,
+                    turnover=f.turnover or 0.0,
+                    sharpe=f.sharpe or 0.0,
+                    max_drawdown=f.max_drawdown or 0.0,
                     generation=f.birth_generation or 0,
                     factor_id=str(f.id),
                     fitness_composite=f.fitness_composite or 0.0,
@@ -187,7 +192,16 @@ class EvolutionEngine:
                         if self._is_overfit(child.ic_mean, val_ic):
                             continue  # 과적합 → 모집단에는 넣되 discovered에서 제외
 
-                    # discovered 팩터로 추가
+                    # discovered 팩터로 추가 (ScoredFactor의 실제 메트릭 사용)
+                    disc_metrics = FactorMetrics(
+                        ic_mean=child.ic_mean,
+                        ic_std=child.ic_std,
+                        icir=child.icir,
+                        turnover=child.turnover,
+                        sharpe=child.sharpe,
+                        max_drawdown=child.max_drawdown,
+                        ic_series=[],
+                    )
                     df = DiscoveredFactor(
                         name=f"evo_g{self._generation}_{len(new_discovered)}",
                         expression_str=child.expression_str,
@@ -195,15 +209,7 @@ class EvolutionEngine:
                         polars_code=self._safe_code_string(child.expression),
                         hypothesis=child.hypothesis,
                         generation=self._generation,
-                        metrics=FactorMetrics(
-                            ic_mean=child.ic_mean,
-                            ic_std=0.0,
-                            icir=0.0,
-                            turnover=0.0,
-                            sharpe=0.0,
-                            max_drawdown=0.0,
-                            ic_series=[],
-                        ),
+                        metrics=disc_metrics,
                         parent_ids=child.parent_ids,
                     )
                     new_discovered.append(df)
@@ -410,6 +416,11 @@ class EvolutionEngine:
                 expression_str=str(child_expr),
                 hypothesis=f"Evolved from {parent.expression_str[:50]}",
                 ic_mean=metrics.ic_mean,
+                ic_std=metrics.ic_std,
+                icir=metrics.icir,
+                turnover=metrics.turnover,
+                sharpe=metrics.sharpe,
+                max_drawdown=metrics.max_drawdown,
                 generation=self._generation,
                 parent_ids=parent_ids,
                 fitness_composite=fitness,
@@ -559,6 +570,12 @@ class EvolutionEngine:
                     .values(
                         population_active=True,
                         fitness_composite=factor.fitness_composite,
+                        ic_mean=factor.ic_mean,
+                        ic_std=factor.ic_std,
+                        icir=factor.icir,
+                        turnover=factor.turnover,
+                        sharpe=factor.sharpe,
+                        max_drawdown=factor.max_drawdown,
                         is_elite=is_elite_now,
                         birth_generation=factor.generation,
                     )
@@ -573,6 +590,11 @@ class EvolutionEngine:
                     hypothesis=factor.hypothesis,
                     generation=factor.generation,
                     ic_mean=factor.ic_mean,
+                    ic_std=factor.ic_std,
+                    icir=factor.icir,
+                    turnover=factor.turnover,
+                    sharpe=factor.sharpe,
+                    max_drawdown=factor.max_drawdown,
                     fitness_composite=factor.fitness_composite,
                     tree_depth=factor.tree_depth,
                     tree_size=factor.tree_size,

@@ -201,6 +201,11 @@ class ScoredFactor:
     tree_size: int = 0
     expression_hash: str = ""
     operator_origin: str = ""
+    ic_std: float = 0.0
+    icir: float = 0.0
+    turnover: float = 0.0
+    sharpe: float = 0.0
+    max_drawdown: float = 0.0
 
 
 def hoist_mutation(expr: sympy.Basic) -> sympy.Basic | None:
