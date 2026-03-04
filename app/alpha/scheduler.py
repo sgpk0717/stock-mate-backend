@@ -100,6 +100,9 @@ class AlphaFactoryScheduler:
                 },
             )
 
+            # 이전 엔진 리셋 (DB에서 세대 복원 후 새 엔진 생성)
+            self._evolution_engine = None
+
             # 벡터 메모리 초기화
             self._vector_memory = ExperienceVectorMemory()
             try:
