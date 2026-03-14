@@ -57,6 +57,12 @@ class AlphaFactor(Base):
         Index("ix_alpha_factors_mining_run_id", "mining_run_id"),
         Index("ix_alpha_factors_status", "status"),
         Index("ix_alpha_factors_ic_mean", "ic_mean"),
+        Index("ix_alpha_factors_icir", "icir"),
+        Index("ix_alpha_factors_sharpe", "sharpe"),
+        Index("ix_alpha_factors_max_drawdown", "max_drawdown"),
+        Index("ix_alpha_factors_causal_robust", "causal_robust"),
+        Index("ix_alpha_factors_created_at", "created_at"),
+        Index("ix_alpha_factors_interval", "interval"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -93,6 +99,7 @@ class AlphaFactor(Base):
     causal_robust: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     causal_effect_size: Mapped[float | None] = mapped_column(Float, nullable=True)
     causal_p_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    causal_failure_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Evolution Engine
     fitness_composite: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -110,6 +117,21 @@ class AlphaFactor(Base):
     )
     birth_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
+    )
+
+    # 데이터 인터벌
+    interval: Mapped[str] = mapped_column(
+        String(5), nullable=False, server_default="1d"
+    )
+
+    # 스탈니스 추적 (설계서 §12.3)
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    live_ic_7d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    live_sharpe_7d: Mapped[float | None] = mapped_column(Float, nullable=True)
+    staleness_warning: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
     )
 
     # Phase 3: 계보 + 복합 팩터
@@ -155,6 +177,7 @@ class AlphaExperience(Base):
         Integer, nullable=False, server_default="0"
     )
     parent_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

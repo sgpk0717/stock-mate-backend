@@ -15,7 +15,7 @@ from sqlalchemy import update
 from app.alpha.miner import EvolutionaryAlphaMiner, DiscoveredFactor
 from app.alpha.models import AlphaFactor, AlphaMiningRun
 from app.alpha.universe import Universe, resolve_universe
-from app.backtest.data_loader import load_candles
+from app.backtest.data_loader import load_enriched_candles
 from app.core.config import settings
 from app.core.database import async_session
 from app.services.ws_manager import manager
@@ -34,6 +34,8 @@ async def execute_alpha_mining(
     ic_threshold: float,
     orthogonality_threshold: float = 0.7,
     use_pysr: bool = False,
+    interval: str = "1d",
+    seed_factor_ids: list[str] | None = None,
 ) -> None:
     """백그라운드에서 알파 마이닝을 실행하고 DB에 결과를 저장한다."""
     channel = f"alpha:{run_id}"
@@ -67,10 +69,11 @@ async def execute_alpha_mining(
 
         # 유니버스 리졸브 → 데이터 로드
         symbols = await resolve_universe(Universe(universe))
-        data = await load_candles(
+        data = await load_enriched_candles(
             symbols=symbols,
             start_date=start_date,
             end_date=end_date,
+            interval=interval,
         )
 
         if data.height == 0:
@@ -84,7 +87,50 @@ async def execute_alpha_mining(
             ic_threshold=ic_threshold,
             orthogonality_threshold=orthogonality_threshold,
             use_pysr=use_pysr,
+            interval=interval,
         )
+
+        # 시드 팩터 주입
+        if seed_factor_ids:
+            from sqlalchemy import select as sa_select
+            from app.alpha.evaluator import FactorMetrics
+
+            async with async_session() as seed_db:
+                result = await seed_db.execute(
+                    sa_select(AlphaFactor).where(
+                        AlphaFactor.id.in_(
+                            [uuid.UUID(sid) for sid in seed_factor_ids]
+                        )
+                    )
+                )
+                seed_factors = result.scalars().all()
+
+            seeds = []
+            for sf in seed_factors:
+                seeds.append(DiscoveredFactor(
+                    name=sf.name,
+                    expression_str=sf.expression_str,
+                    expression_sympy=sf.expression_sympy or "",
+                    polars_code=sf.polars_code or "",
+                    hypothesis=sf.hypothesis or "",
+                    generation=-1,
+                    metrics=FactorMetrics(
+                        ic_mean=sf.ic_mean or 0,
+                        ic_std=sf.ic_std or 0,
+                        icir=sf.icir or 0,
+                        turnover=sf.turnover or 0,
+                        sharpe=sf.sharpe or 0,
+                        max_drawdown=sf.max_drawdown or 0,
+                        ic_series=[],
+                    ),
+                    parent_ids=[str(sf.id)],
+                ))
+
+            if seeds:
+                miner.inject_seeds(seeds)
+                logger.info(
+                    "Injected %d seed factors for run %s", len(seeds), run_id
+                )
 
         # iteration_cb: 실시간 이벤트 브로드캐스트
         async def iteration_cb(event: dict) -> None:
@@ -95,9 +141,10 @@ async def execute_alpha_mining(
             iteration_cb=iteration_cb,
         )
 
-        # 팩터 DB 저장 + iteration_logs 저장
+        # 팩터 DB 저장 + iteration_logs 저장 (시드 팩터 제외)
+        new_factors = [f for f in discovered if f.generation >= 0]
         async with async_session() as db:
-            for factor in discovered:
+            for factor in new_factors:
                 alpha_factor = AlphaFactor(
                     mining_run_id=run_id,
                     name=factor.name,
@@ -114,6 +161,7 @@ async def execute_alpha_mining(
                     max_drawdown=factor.metrics.max_drawdown,
                     status="discovered",
                     parent_ids=factor.parent_ids,
+                    interval=interval,
                 )
                 db.add(alpha_factor)
 
@@ -129,7 +177,7 @@ async def execute_alpha_mining(
                 .values(
                     status="COMPLETED",
                     progress=100,
-                    factors_found=len(discovered),
+                    factors_found=len(new_factors),
                     total_evaluated=max_iterations,
                     iteration_logs=logs_data,
                     completed_at=datetime.utcnow(),
@@ -137,30 +185,38 @@ async def execute_alpha_mining(
             )
             await db.commit()
 
-        # Phase 2: 자동 인과 검증
-        if settings.CAUSAL_AUTO_VALIDATE and len(discovered) > 0:
+        # Phase 2: 자동 인과 검증 (항상 실행)
+        if len(new_factors) > 0:
+            await manager.broadcast(channel, {
+                "type": "progress",
+                "current": 90,
+                "total": 100,
+                "percent": 90,
+                "message": f"인과 검증 시작 ({len(new_factors)}개 팩터)...",
+            })
             try:
                 from app.alpha.causal_runner import validate_factors_batch
                 async with async_session() as causal_db:
                     validated_count = await validate_factors_batch(run_id, causal_db)
                 logger.info(
-                    "Auto-validated %d factors for run %s",
-                    validated_count, run_id,
+                    "Auto-validated %d/%d factors for run %s",
+                    validated_count, len(new_factors), run_id,
                 )
             except Exception as e:
-                logger.warning(
+                logger.error(
                     "Auto causal validation failed for run %s: %s",
                     run_id, e,
                 )
+                validated_count = 0
 
         await manager.broadcast(channel, {
             "type": "completed",
-            "factors_found": len(discovered),
+            "factors_found": len(new_factors),
         })
 
         logger.info(
-            "Alpha mining %s completed: %d factors found",
-            run_id, len(discovered),
+            "Alpha mining %s completed: %d factors found (+ %d seeds)",
+            run_id, len(new_factors), len(discovered) - len(new_factors),
         )
 
     except Exception as e:
