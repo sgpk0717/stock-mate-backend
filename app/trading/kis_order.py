@@ -1,16 +1,32 @@
-"""KIS 주문 실행기 — 매수/매도/정정/취소.
+"""KIS 주문 실행기 — 매수/매도/정정/취소 + 체결 추적.
 
 한국투자증권 REST API를 통한 국내 주식 주문.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 from .kis_client import KISClient
 
 logger = logging.getLogger(__name__)
+
+
+# ── 미체결 주문 추적 ────────────────────────────────────────
+# key: order_id, value: {"symbol", "side", "qty", "price", "order_time", "retries"}
+_pending_orders: dict[str, dict[str, Any]] = {}
+
+
+def get_pending_orders() -> dict[str, dict[str, Any]]:
+    """현재 미체결 주문 목록."""
+    return dict(_pending_orders)
+
+
+def has_pending_order(symbol: str) -> bool:
+    """해당 종목에 미체결 주문이 있는지 확인."""
+    return any(o["symbol"] == symbol for o in _pending_orders.values())
 
 
 class KISOrderExecutor:
@@ -70,6 +86,14 @@ class KISOrderExecutor:
             }
             if rt_cd == "0":
                 logger.info("매수 주문 성공: %s %d주 @ %s", symbol, qty, price or "시장가")
+                # 미체결 추적 등록
+                order_id = output.get("ODNO", "")
+                if order_id:
+                    _pending_orders[order_id] = {
+                        "symbol": symbol, "side": "BUY", "qty": qty,
+                        "price": price, "order_time": output.get("ORD_TMD", ""),
+                        "retries": 0,
+                    }
             else:
                 logger.warning("매수 주문 실패: %s — %s", symbol, msg)
             return result
@@ -119,6 +143,13 @@ class KISOrderExecutor:
             }
             if rt_cd == "0":
                 logger.info("매도 주문 성공: %s %d주 @ %s", symbol, qty, price or "시장가")
+                order_id = output.get("ODNO", "")
+                if order_id:
+                    _pending_orders[order_id] = {
+                        "symbol": symbol, "side": "SELL", "qty": qty,
+                        "price": price, "order_time": output.get("ORD_TMD", ""),
+                        "retries": 0,
+                    }
             else:
                 logger.warning("매도 주문 실패: %s — %s", symbol, msg)
             return result
@@ -208,3 +239,61 @@ class KISOrderExecutor:
         except Exception as e:
             logger.error("주문 정정 에러: %s — %s", order_id, e)
             return {"success": False, "message": str(e)}
+
+    async def check_pending_orders(self) -> list[dict[str, Any]]:
+        """미체결 주문 체결 상태 확인 + 완료된 주문 제거.
+
+        KIS 당일 체결 내역(inquire_daily_ccld)을 조회하여
+        _pending_orders에서 체결 완료된 주문을 제거한다.
+
+        Returns:
+            체결 확인된 주문 목록.
+        """
+        if not _pending_orders:
+            return []
+
+        try:
+            ccld_list = await self.client.inquire_daily_ccld()
+        except Exception as e:
+            logger.warning("체결 조회 실패: %s", e)
+            return []
+
+        # order_id → 체결 정보 매핑
+        ccld_map: dict[str, dict] = {}
+        for item in ccld_list:
+            oid = item.get("order_id", "")
+            if oid:
+                ccld_map[oid] = item
+
+        filled: list[dict[str, Any]] = []
+        expired_ids: list[str] = []
+
+        for order_id, info in list(_pending_orders.items()):
+            ccld = ccld_map.get(order_id)
+            if ccld and ccld.get("status") == "FILLED":
+                filled.append({
+                    "order_id": order_id,
+                    "symbol": info["symbol"],
+                    "side": info["side"],
+                    "qty": ccld.get("qty", info["qty"]),
+                    "price": ccld.get("price", info["price"]),
+                })
+                expired_ids.append(order_id)
+                logger.info(
+                    "체결 확인: %s %s %s %d주",
+                    order_id, info["side"], info["symbol"], info["qty"],
+                )
+            else:
+                # 재시도 카운터 증가 (최대 3회 = 90초 후 포기)
+                info["retries"] = info.get("retries", 0) + 1
+                if info["retries"] >= 3:
+                    expired_ids.append(order_id)
+                    logger.warning(
+                        "미체결 만료: %s %s %s (3회 조회 후 미체결)",
+                        order_id, info["side"], info["symbol"],
+                    )
+
+        for oid in expired_ids:
+            _pending_orders.pop(oid, None)
+
+        return filled
