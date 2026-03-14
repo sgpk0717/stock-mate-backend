@@ -66,8 +66,13 @@ async def collect_and_analyze(
             except Exception as e:
                 logger.warning("BigKinds 수집 실패 (%s): %s", symbol, e)
 
-        # DART (종목 단위가 아닌 전체 공시 → 추후 corp_code 매핑 필요)
-        # 현재는 전체 공시 수집 후 종목 매핑은 NER에서 처리
+        # DART 공시 (API 키 있을 때만)
+        if settings.DART_API_KEY:
+            try:
+                dart_articles = await collect_disclosures(days=days)
+                all_articles.extend(dart_articles)
+            except Exception as e:
+                logger.warning("DART 공시 수집 실패: %s", e)
 
         if not all_articles:
             continue

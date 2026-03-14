@@ -44,15 +44,16 @@ async def _save_snapshot(
         await conn.execute(
             """
             INSERT INTO program_trading (symbol, dt, pgm_buy_qty, pgm_sell_qty,
-                pgm_net_qty, pgm_buy_amount, pgm_sell_amount, pgm_net_amount)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                pgm_net_qty, pgm_buy_amount, pgm_sell_amount, pgm_net_amount, collected_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (symbol, dt) DO UPDATE
             SET pgm_buy_qty = EXCLUDED.pgm_buy_qty,
                 pgm_sell_qty = EXCLUDED.pgm_sell_qty,
                 pgm_net_qty = EXCLUDED.pgm_net_qty,
                 pgm_buy_amount = EXCLUDED.pgm_buy_amount,
                 pgm_sell_amount = EXCLUDED.pgm_sell_amount,
-                pgm_net_amount = EXCLUDED.pgm_net_amount
+                pgm_net_amount = EXCLUDED.pgm_net_amount,
+                collected_at = EXCLUDED.collected_at
             """,
             symbol,
             dt,
@@ -62,6 +63,7 @@ async def _save_snapshot(
             data.get("pgm_buy_amount", 0),
             data.get("pgm_sell_amount", 0),
             data.get("pgm_net_amount", 0),
+            datetime.now(_KST),
         )
     finally:
         await conn.close()

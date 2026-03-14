@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import async_session
 from app.core.stock_master import load_stock_cache
-from app.routers import accounts, agents, alpha, backtest, health, mcp, news, orders, paper, positions, scheduler, sector, simulation, stocks, trading, workflow, ws
+from app.routers import accounts, agents, alpha, backtest, data_explorer, health, mcp, news, orders, paper, positions, scheduler, sector, simulation, stocks, trading, workflow, ws
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -78,7 +78,7 @@ async def lifespan(app: FastAPI):
         logger.info("Program trading collector started")
 
     # 인과 검증 스케줄러 (1시간 주기, 미검증 상위 30% 팩터) — inline 모드에서만
-    if settings.CAUSAL_AUTO_VALIDATE and settings.WORKER_MODE == "inline":
+    if settings.WORKER_MODE == "inline":
         from app.alpha.causal_scheduler import start_causal_scheduler
 
         tasks.append(start_causal_scheduler())
@@ -217,6 +217,7 @@ app.include_router(simulation.router)
 app.include_router(mcp.router)
 app.include_router(scheduler.router)
 app.include_router(workflow.router)
+app.include_router(data_explorer.router)
 
 
 @app.get("/")

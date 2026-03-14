@@ -25,3 +25,5 @@ networkx>=3.2.0
 fastmcp>=2.0.0
 apscheduler>=4.0.0a5
 psutil>=5.9.0
+opendartreader>=0.2.0
+google-genai>=1.0.0

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor")
+JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial")
 
 
 # ── 상태 ────────────────────────────────────────────────
@@ -87,6 +87,7 @@ class DailyScheduler:
             "pykrx": CircuitBreaker("pykrx", failure_threshold=10, reset_timeout=120.0),
             "kis": CircuitBreaker("kis", failure_threshold=5, reset_timeout=60.0),
             "claude": CircuitBreaker("claude", failure_threshold=3, reset_timeout=120.0),
+            "dart": CircuitBreaker("dart", failure_threshold=10, reset_timeout=120.0),
         }
 
     # ── 제어 ──
@@ -155,8 +156,46 @@ class DailyScheduler:
 
     # ── 메인 루프 ──
 
+    async def _already_collected_today(self) -> bool:
+        """DB에서 오늘 일봉 수집 기록 존재 여부 확인."""
+        from app.core.database import async_session
+        from sqlalchemy import text
+
+        today = _now_kst().strftime("%Y-%m-%d")
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    text(
+                        "SELECT 1 FROM stock_candles "
+                        "WHERE dt::date = :d AND interval = '1d' LIMIT 1"
+                    ),
+                    {"d": today},
+                )
+                return result.scalar() is not None
+        except Exception as e:
+            logger.warning("수집 여부 확인 실패 (기본 False): %s", e)
+            return False
+
     async def _daily_loop(self) -> None:
         """이벤트 기반 메인 루프 — 매일 지정 시각에 실행."""
+        # ── Catch-up: 앱 시작이 수집 시각 이후면 즉시 실행 ──
+        try:
+            now = _now_kst()
+            collect_time = now.replace(
+                hour=settings.DAILY_COLLECT_HOUR,
+                minute=settings.DAILY_COLLECT_MINUTE,
+                second=0, microsecond=0,
+            )
+            if now > collect_time:
+                target_date = _today_str()
+                if not await self._already_collected_today():
+                    logger.info("Catch-up: 당일 수집 미완료 (date=%s), 즉시 실행", target_date)
+                    await self._run_daily_cycle(target_date)
+                else:
+                    logger.info("Catch-up: 당일 수집 이미 완료 (date=%s), 스킵", target_date)
+        except Exception as e:
+            logger.error("Catch-up 체크 에러: %s", e, exc_info=True)
+
         while self._state.running:
             try:
                 next_run = _calc_next_run(
@@ -323,6 +362,15 @@ class DailyScheduler:
 
             return await collect_investor(
                 date, progress_cb=_progress_cb, cb=self._breakers["kis"],
+            )
+
+        if job_name == "dart_financial":
+            from app.scheduler.collectors.dart_financial import (
+                collect_dart_financials,
+            )
+
+            return await collect_dart_financials(
+                date, progress_cb=_progress_cb, cb=self._breakers["dart"],
             )
 
         return CollectionResult(job=job_name)

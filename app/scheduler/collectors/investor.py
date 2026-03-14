@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date as date_type
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Callable
 
 from sqlalchemy import text
@@ -53,11 +53,11 @@ async def _upsert_investor(
                         (symbol, dt, foreign_net, inst_net, retail_net,
                          foreign_buy_vol, foreign_sell_vol,
                          inst_buy_vol, inst_sell_vol,
-                         retail_buy_vol, retail_sell_vol)
+                         retail_buy_vol, retail_sell_vol, collected_at)
                     VALUES (:symbol, :dt, :foreign_net, :inst_net, :retail_net,
                             :foreign_buy_vol, :foreign_sell_vol,
                             :inst_buy_vol, :inst_sell_vol,
-                            :retail_buy_vol, :retail_sell_vol)
+                            :retail_buy_vol, :retail_sell_vol, :collected_at)
                     ON CONFLICT (symbol, dt) DO UPDATE
                     SET foreign_net = EXCLUDED.foreign_net,
                         inst_net = EXCLUDED.inst_net,
@@ -67,7 +67,8 @@ async def _upsert_investor(
                         inst_buy_vol = EXCLUDED.inst_buy_vol,
                         inst_sell_vol = EXCLUDED.inst_sell_vol,
                         retail_buy_vol = EXCLUDED.retail_buy_vol,
-                        retail_sell_vol = EXCLUDED.retail_sell_vol
+                        retail_sell_vol = EXCLUDED.retail_sell_vol,
+                        collected_at = EXCLUDED.collected_at
                 """),
                 {
                     "symbol": symbol,
@@ -81,6 +82,7 @@ async def _upsert_investor(
                     "inst_sell_vol": row["orgn_sell_vol"],
                     "retail_buy_vol": row["prsn_buy_vol"],
                     "retail_sell_vol": row["prsn_sell_vol"],
+                    "collected_at": datetime.now(timezone(timedelta(hours=9))),
                 },
             )
             upserted += 1

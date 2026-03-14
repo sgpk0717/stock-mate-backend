@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date as date_type
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Callable
 
 from sqlalchemy import text
@@ -54,17 +54,19 @@ async def _upsert_margin_short(
             await db.execute(
                 text("""
                     INSERT INTO margin_short_daily
-                        (symbol, dt, short_volume, short_balance_rate)
-                    VALUES (:symbol, :dt, :short_volume, :short_balance_rate)
+                        (symbol, dt, short_volume, short_balance_rate, collected_at)
+                    VALUES (:symbol, :dt, :short_volume, :short_balance_rate, :collected_at)
                     ON CONFLICT (symbol, dt) DO UPDATE
                     SET short_volume = EXCLUDED.short_volume,
-                        short_balance_rate = EXCLUDED.short_balance_rate
+                        short_balance_rate = EXCLUDED.short_balance_rate,
+                        collected_at = EXCLUDED.collected_at
                 """),
                 {
                     "symbol": symbol,
                     "dt": date_type(int(dt_str[:4]), int(dt_str[4:6]), int(dt_str[6:8])),
                     "short_volume": row["short_volume"],
                     "short_balance_rate": row["short_volume_ratio"],
+                    "collected_at": datetime.now(timezone(timedelta(hours=9))),
                 },
             )
             upserted += 1
@@ -77,17 +79,19 @@ async def _upsert_margin_short(
             await db.execute(
                 text("""
                     INSERT INTO margin_short_daily
-                        (symbol, dt, margin_balance, margin_rate)
-                    VALUES (:symbol, :dt, :margin_balance, :margin_rate)
+                        (symbol, dt, margin_balance, margin_rate, collected_at)
+                    VALUES (:symbol, :dt, :margin_balance, :margin_rate, :collected_at)
                     ON CONFLICT (symbol, dt) DO UPDATE
                     SET margin_balance = EXCLUDED.margin_balance,
-                        margin_rate = EXCLUDED.margin_rate
+                        margin_rate = EXCLUDED.margin_rate,
+                        collected_at = EXCLUDED.collected_at
                 """),
                 {
                     "symbol": symbol,
                     "dt": date_type(int(dt_str[:4]), int(dt_str[4:6]), int(dt_str[6:8])),
                     "margin_balance": row["margin_balance"],
                     "margin_rate": row["margin_rate"],
+                    "collected_at": datetime.now(timezone(timedelta(hours=9))),
                 },
             )
             upserted += 1

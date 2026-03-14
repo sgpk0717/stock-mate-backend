@@ -1,7 +1,7 @@
-"""LLM 클라이언트 — Anthropic Claude API 호출 통합.
+"""Anthropic Claude API 프로바이더.
 
-모든 Claude API 호출은 이 모듈의 get_client() 또는 chat()을 사용한다.
-모델/API키 설정은 settings에서 중앙 관리.
+기존 app/core/llm.py 로직을 그대로 이동.
+chat() 반환 타입은 anthropic.types.Message 유지 (Tool Use 호환).
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import anthropic
 import httpx
 
 from app.core.config import settings
+from app.core.llm._types import LLMProvider, LLMResponse
 
 _client: anthropic.AsyncAnthropic | None = None
 
@@ -41,6 +42,8 @@ async def chat(
     """Claude messages.create 래퍼.
 
     모델은 settings.AGENT_MODEL을 자동 사용한다.
+    Tool Use 호출자(manager.py, factor_chat.py)를 위해
+    반환 타입을 anthropic.types.Message로 유지.
     """
     client = get_client()
     kwargs: dict = {
@@ -53,3 +56,27 @@ async def chat(
     if tools is not None:
         kwargs["tools"] = tools
     return await client.messages.create(**kwargs)
+
+
+async def chat_simple(
+    *,
+    messages: list[dict],
+    system: str | None = None,
+    max_tokens: int = 4000,
+) -> LLMResponse:
+    """chat() 래퍼 — 프로바이더 독립적 LLMResponse 반환.
+
+    텍스트만 필요한 호출자용 (Tool Use 불필요).
+    """
+    response = await chat(
+        messages=messages,
+        system=system,
+        max_tokens=max_tokens,
+    )
+    return LLMResponse(
+        text=response.content[0].text,
+        model=response.model,
+        provider=LLMProvider.ANTHROPIC,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+    )

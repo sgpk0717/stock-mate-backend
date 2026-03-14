@@ -146,6 +146,9 @@ class StockCandle(Base):
     low: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
     close: Mapped[float] = mapped_column(Numeric(18, 2), nullable=False)
     volume: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class InvestorTrading(Base):
@@ -169,6 +172,9 @@ class InvestorTrading(Base):
     inst_sell_vol: Mapped[int] = mapped_column(BigInteger, server_default="0")
     retail_buy_vol: Mapped[int] = mapped_column(BigInteger, server_default="0")
     retail_sell_vol: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class DartFinancial(Base):
@@ -190,6 +196,9 @@ class DartFinancial(Base):
     bps: Mapped[float | None] = mapped_column(Float, nullable=True)
     operating_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
     debt_to_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class ProgramTrading(Base):
@@ -210,6 +219,9 @@ class ProgramTrading(Base):
     pgm_buy_amount: Mapped[int] = mapped_column(BigInteger, server_default="0")
     pgm_sell_amount: Mapped[int] = mapped_column(BigInteger, server_default="0")
     pgm_net_amount: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class MarginShortDaily(Base):
@@ -229,6 +241,9 @@ class MarginShortDaily(Base):
     short_volume: Mapped[int] = mapped_column(BigInteger, server_default="0")
     short_balance: Mapped[int] = mapped_column(BigInteger, server_default="0")
     short_balance_rate: Mapped[float] = mapped_column(Float, server_default="0")
+    collected_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
 
 
 class WorkerState(Base):

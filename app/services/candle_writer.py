@@ -44,15 +44,16 @@ async def write_candle(symbol: str, payload: dict):
     async with async_session() as db:
         await db.execute(
             text("""
-                INSERT INTO stock_candles (symbol, dt, interval, open, high, low, close, volume)
-                VALUES (:symbol, :dt, :interval, :open, :high, :low, :close, :volume)
+                INSERT INTO stock_candles (symbol, dt, interval, open, high, low, close, volume, collected_at)
+                VALUES (:symbol, :dt, :interval, :open, :high, :low, :close, :volume, :collected_at)
                 ON CONFLICT ON CONSTRAINT uq_candle
                 DO UPDATE SET
                     open = EXCLUDED.open,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
                     close = EXCLUDED.close,
-                    volume = EXCLUDED.volume
+                    volume = EXCLUDED.volume,
+                    collected_at = EXCLUDED.collected_at
             """),
             {
                 "symbol": symbol,
@@ -63,6 +64,7 @@ async def write_candle(symbol: str, payload: dict):
                 "low": payload.get("low", 0),
                 "close": payload.get("close", 0),
                 "volume": payload.get("volume", 0),
+                "collected_at": datetime.now(KST),
             },
         )
         await db.commit()
@@ -94,6 +96,7 @@ async def write_candles_bulk(
             "low": c.get("low", 0),
             "close": c.get("close", 0),
             "volume": c.get("volume", 0),
+            "collected_at": datetime.now(KST),
         })
 
     if not params:
@@ -102,15 +105,16 @@ async def write_candles_bulk(
     async with async_session() as db:
         await db.execute(
             text("""
-                INSERT INTO stock_candles (symbol, dt, interval, open, high, low, close, volume)
-                VALUES (:symbol, :dt, :interval, :open, :high, :low, :close, :volume)
+                INSERT INTO stock_candles (symbol, dt, interval, open, high, low, close, volume, collected_at)
+                VALUES (:symbol, :dt, :interval, :open, :high, :low, :close, :volume, :collected_at)
                 ON CONFLICT ON CONSTRAINT uq_candle
                 DO UPDATE SET
                     open = EXCLUDED.open,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
                     close = EXCLUDED.close,
-                    volume = EXCLUDED.volume
+                    volume = EXCLUDED.volume,
+                    collected_at = EXCLUDED.collected_at
             """),
             params,
         )

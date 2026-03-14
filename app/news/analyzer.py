@@ -1,6 +1,6 @@
-"""Claude API 기반 배치 감성 분석기.
+"""뉴스 배치 감성 분석기.
 
-뉴스 기사를 배치로 묶어 Claude에 감성 분석을 요청한다.
+Gemini 기본, Anthropic 폴백.
 장마감 후 일괄 처리를 전제로 설계됨.
 """
 
@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 
 from app.core.config import settings
 
@@ -58,6 +57,39 @@ ANALYSIS_PROMPT = """\
 ]
 """
 
+# Gemini 네이티브 JSON 모드용 스키마
+SENTIMENT_JSON_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "article_index": {"type": "integer"},
+            "sentiment_score": {"type": "number"},
+            "sentiment_magnitude": {"type": "number"},
+            "market_impact": {"type": "number"},
+            "entities": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "relevance": {"type": "number"},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        "required": [
+            "article_index",
+            "sentiment_score",
+            "sentiment_magnitude",
+            "market_impact",
+            "entities",
+        ],
+    },
+}
+
 
 async def analyze_batch(
     articles: list[dict],
@@ -66,6 +98,8 @@ async def analyze_batch(
 ) -> list[SentimentResult]:
     """기사 배치에 대해 감성 분석을 수행한다.
 
+    Gemini 우선, 실패 시 Anthropic 폴백.
+
     Args:
         articles: [{"title": str, "content": str | None, "source": str}]
         max_content_len: 본문 최대 길이 (truncate)
@@ -73,11 +107,15 @@ async def analyze_batch(
     Returns:
         SentimentResult 리스트
     """
-    if not settings.ANTHROPIC_API_KEY:
-        logger.warning("ANTHROPIC_API_KEY 미설정. 감성 분석 건너뜀.")
+    if not articles:
         return []
 
-    if not articles:
+    # API 키 확인
+    has_gemini = bool(settings.GEMINI_API_KEY)
+    has_anthropic = bool(settings.ANTHROPIC_API_KEY)
+
+    if not has_gemini and not has_anthropic:
+        logger.warning("GEMINI_API_KEY, ANTHROPIC_API_KEY 모두 미설정. 감성 분석 건너뜀.")
         return []
 
     # 기사 텍스트 구성
@@ -93,41 +131,126 @@ async def analyze_batch(
         article_texts.append(text)
 
     user_message = "\n\n".join(article_texts)
+    messages = [{"role": "user", "content": user_message}]
 
-    from app.core.llm import chat
+    # 1차: Gemini 시도 (5건씩 서브배치 — 큰 배치에서 JSON 잘림 방지)
+    if has_gemini:
+        gemini_batch_size = 5
+        all_results: list[SentimentResult] = []
+        gemini_failed = False
 
-    try:
-        response = await chat(
-            max_tokens=2000,
-            system=ANALYSIS_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        )
+        for i in range(0, len(articles), gemini_batch_size):
+            sub_articles = article_texts[i : i + gemini_batch_size]
+            sub_message = "\n\n".join(sub_articles)
+            sub_messages = [{"role": "user", "content": sub_message}]
 
-        text = response.content[0].text
-        results_data = _parse_results(text)
+            try:
+                results = await _analyze_with_gemini(sub_messages)
+                # article_index 보정 (서브배치 오프셋)
+                for r in results:
+                    r.article_index += i
+                all_results.extend(results)
+            except Exception as e:
+                logger.warning("Gemini 감성 분석 실패 (batch %d~%d): %s", i, i + len(sub_articles), e)
+                gemini_failed = True
+                break
 
-        results: list[SentimentResult] = []
-        for item in results_data:
-            results.append(
-                SentimentResult(
-                    article_index=item.get("article_index", 0),
-                    sentiment_score=_clamp(item.get("sentiment_score", 0), -1, 1),
-                    sentiment_magnitude=_clamp(item.get("sentiment_magnitude", 0.5), 0, 1),
-                    market_impact=_clamp(item.get("market_impact", 0.5), 0, 1),
-                    entities=item.get("entities", []),
-                )
+        if not gemini_failed and all_results:
+            logger.info("Gemini 감성 분석 완료: %d건", len(all_results))
+            return all_results
+
+    # 2차: Anthropic 폴백
+    if has_anthropic:
+        try:
+            results = await _analyze_with_anthropic(messages)
+            if results:
+                logger.info("Anthropic 감성 분석 완료 (폴백): %d건", len(results))
+                return results
+        except Exception as e:
+            logger.error("Anthropic 감성 분석 실패: %s", e)
+
+    return []
+
+
+async def _analyze_with_gemini(messages: list[dict]) -> list[SentimentResult]:
+    """Gemini로 감성 분석."""
+    from app.core.llm import chat_gemini
+
+    response = await chat_gemini(
+        system=ANALYSIS_PROMPT,
+        messages=messages,
+        max_tokens=8000,
+        temperature=0.1,
+        json_mode=True,
+    )
+
+    # Gemini JSON 수리 후 파싱
+    text = _repair_json(response.text)
+    results_data = _parse_results(text)
+    if not results_data:
+        raise ValueError("Gemini 응답에서 JSON 추출 실패")
+    return _build_results(results_data)
+
+
+async def _analyze_with_anthropic(messages: list[dict]) -> list[SentimentResult]:
+    """Anthropic Claude로 감성 분석 (폴백)."""
+    from app.core.llm import chat_simple
+
+    response = await chat_simple(
+        system=ANALYSIS_PROMPT,
+        messages=messages,
+        max_tokens=2000,
+    )
+
+    results_data = _parse_results(response.text)
+    return _build_results(results_data)
+
+
+def _build_results(results_data: list[dict]) -> list[SentimentResult]:
+    """파싱된 JSON → SentimentResult 리스트."""
+    results: list[SentimentResult] = []
+    for item in results_data:
+        results.append(
+            SentimentResult(
+                article_index=item.get("article_index", 0),
+                sentiment_score=_clamp(item.get("sentiment_score", 0), -1, 1),
+                sentiment_magnitude=_clamp(item.get("sentiment_magnitude", 0.5), 0, 1),
+                market_impact=_clamp(item.get("market_impact", 0.5), 0, 1),
+                entities=item.get("entities", []),
             )
+        )
+    return results
 
-        logger.info("감성 분석 완료: %d건", len(results))
-        return results
 
-    except Exception as e:
-        logger.error("감성 분석 실패: %s", e)
-        return []
+def _repair_json(text: str) -> str:
+    """Gemini가 출력한 불완전 JSON을 수리한다."""
+    import re
+
+    # 마크다운 코드블록 제거
+    text = re.sub(r"```json\s*\n?", "", text)
+    text = re.sub(r"\n?```", "", text)
+    text = text.strip()
+
+    # 마지막 완전한 객체까지 자르기 (잘린 JSON 복구)
+    # 패턴: }] 또는 } ] 로 끝나야 함
+    last_bracket = text.rfind("]")
+    if last_bracket > 0:
+        text = text[: last_bracket + 1]
+    else:
+        # ] 가 없으면 마지막 } 뒤에 ] 추가
+        last_brace = text.rfind("}")
+        if last_brace > 0:
+            text = text[: last_brace + 1] + "]"
+
+    # trailing comma 제거: ,] → ]  또는 ,} → }
+    text = re.sub(r",\s*]", "]", text)
+    text = re.sub(r",\s*}", "}", text)
+
+    return text
 
 
 def _parse_results(text: str) -> list[dict]:
-    """응답에서 JSON 배열을 추출한다."""
+    """응답에서 JSON 배열을 추출한다 (Anthropic 폴백용)."""
     import re
 
     # ```json ... ``` 패턴

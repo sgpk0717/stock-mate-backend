@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     CAUSAL_USE_FAST_ENGINE: bool = True  # NumPy 고속 엔진 (False → DoWhy 레거시)
 
     # Evolution Engine (진화형 팩토리)
-    ALPHA_POPULATION_SIZE: int = 500
+    ALPHA_POPULATION_SIZE: int = 100  # 5분봉 대규모 데이터 OOM 방지 (메모리 안정화 후 점진적 증가)
     ALPHA_ELITE_PCT: float = 0.05
     ALPHA_AST_MUTATION_RATIO: float = 0.92
     ALPHA_LLM_MUTATION_RATIO: float = 0.08
