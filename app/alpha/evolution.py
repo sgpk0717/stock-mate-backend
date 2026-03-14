@@ -9,6 +9,7 @@ import logging
 import random
 from dataclasses import dataclass, field
 
+import numpy as np
 import sympy
 
 from app.alpha.ast_converter import (
@@ -203,8 +204,8 @@ class ScoredFactor:
     operator_origin: str = ""
     ic_std: float = 0.0
     icir: float = 0.0
-    turnover: float = 0.0
-    sharpe: float = 0.0
+    turnover: float = 0.0          # 포지션 턴오버 (일별 포트폴리오 변경 비율)
+    sharpe: float = 0.0            # Long-only Sharpe (상위 분위 포트폴리오)
     max_drawdown: float = 0.0
 
 
@@ -272,11 +273,12 @@ def tournament_select(
     k: int = 3,
     n_select: int = 2,
     parsimony: bool = True,
+    multi_objective: bool = True,
 ) -> list[ScoredFactor]:
-    """토너먼트 선택 (Double Tournament with Parsimony Pressure).
+    """토너먼트 선택 (Multi-Objective Mini-Lexicase + Parsimony Pressure).
 
-    parsimony=True: 먼저 tree_size로 1차 필터, 그 중 fitness로 최종 선택.
-    parsimony=False: 순수 fitness_composite 기반 선택.
+    multi_objective=True: IC/Sharpe/Turnover 3축 mini-lexicase로 다양성 유지.
+    parsimony=True: tree_size 1차 필터 적용.
     """
     if len(population) < n_select:
         return list(population)
@@ -287,9 +289,27 @@ def tournament_select(
             # 1차: tree_size로 상위 70% 필터
             size_sorted = sorted(tournament, key=lambda f: f.tree_size)
             keep_n = max(2, int(len(tournament) * 0.7))
-            size_filtered = size_sorted[:keep_n]
-            # 2차: fitness 최고 선택
-            return max(size_filtered, key=lambda f: f.fitness_composite)
+            tournament = size_sorted[:keep_n]
+
+        if multi_objective and len(tournament) > 1:
+            # 3축 mini-lexicase: [ic_mean, long_only_sharpe, -position_turnover]
+            objectives = [
+                ("ic_mean", lambda f: f.ic_mean if f.ic_mean is not None else 0.0),
+                ("long_only_sharpe", lambda f: f.sharpe if f.sharpe is not None else 0.0),
+                ("low_turnover", lambda f: -(f.turnover if f.turnover is not None else 0.0)),
+            ]
+            random.shuffle(objectives)
+            candidates = list(tournament)
+            for _, key_fn in objectives:
+                if len(candidates) <= 1:
+                    break
+                best_val = max(key_fn(c) for c in candidates)
+                # ε = MAD (Median Absolute Deviation)
+                vals = [key_fn(c) for c in candidates]
+                median_val = sorted(vals)[len(vals) // 2]
+                mad = max(1e-10, float(np.median([abs(v - median_val) for v in vals])))
+                candidates = [c for c in candidates if key_fn(c) >= best_val - mad]
+            return random.choice(candidates)
         else:
             return max(tournament, key=lambda f: f.fitness_composite)
 

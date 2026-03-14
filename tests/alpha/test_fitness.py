@@ -75,19 +75,46 @@ class TestCompositeFitness:
         fitness = compute_composite_fitness(
             ic_mean=0.05, icir=0.0, turnover=0.0,
             tree_depth=0, tree_size=0,
-            w_ic=1.0, w_icir=0.0, w_turnover=0.0, w_complexity=0.0,
+            w_ic=1.0, w_icir=0.0, w_sharpe=0.0, w_mdd=0.0,
+            w_turnover=0.0, w_complexity=0.0,
         )
         assert abs(fitness - 0.05) < 1e-9
 
     def test_zero_inputs_zero_fitness(self):
-        """모든 입력이 0이면 적합도도 0."""
+        """모든 입력이 0이면 적합도도 0 (sharpe 보정 제외)."""
         from app.alpha.fitness import compute_composite_fitness
 
         fitness = compute_composite_fitness(
             ic_mean=0.0, icir=0.0, turnover=0.0,
             tree_depth=0, tree_size=0,
+            sharpe=0.0, max_drawdown=0.0,
+            w_sharpe=0.0, w_mdd=0.0,
         )
         assert fitness == 0.0
+
+    def test_higher_sharpe_gives_higher_fitness(self):
+        """Sharpe가 높을수록 적합도가 높아야 한다."""
+        from app.alpha.fitness import compute_composite_fitness
+
+        base_kwargs = dict(
+            ic_mean=0.05, icir=1.0, turnover=0.3,
+            tree_depth=3, tree_size=8, max_drawdown=-0.1,
+        )
+        low_sharpe = compute_composite_fitness(sharpe=0.0, **base_kwargs)
+        high_sharpe = compute_composite_fitness(sharpe=2.0, **base_kwargs)
+        assert high_sharpe > low_sharpe
+
+    def test_higher_mdd_gives_lower_fitness(self):
+        """MDD가 클수록 적합도가 낮아야 한다 (패널티)."""
+        from app.alpha.fitness import compute_composite_fitness
+
+        base_kwargs = dict(
+            ic_mean=0.05, icir=1.0, turnover=0.3,
+            tree_depth=3, tree_size=8, sharpe=1.0,
+        )
+        small_mdd = compute_composite_fitness(max_drawdown=-0.05, **base_kwargs)
+        large_mdd = compute_composite_fitness(max_drawdown=-0.40, **base_kwargs)
+        assert small_mdd > large_mdd
 
     def test_nan_safe(self):
         """NaN 입력 시 NaN 전파 (또는 0.0 반환) — 크래시하지 않아야 한다."""

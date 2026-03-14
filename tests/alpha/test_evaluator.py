@@ -194,14 +194,22 @@ class TestMDD:
     """MDD 계산 테스트."""
 
     def test_t14_mdd_known_sequence(self):
-        """T14: 알려진 IC 시퀀스로 MDD 정확성 검증."""
-        # 누적 IC: [0.1, 0.3, 0.2, 0.35]
-        # peak:    [0.1, 0.3, 0.3, 0.35]
-        # drawdown:[0.0, 0.0, -0.1, 0.0]
-        # MDD = -0.1
+        """T14: L/S 수익률 기반 MDD 정확성 검증."""
+        # ls_returns가 없으면 MDD=0.0
         ic_series = [0.1, 0.2, -0.1, 0.15]
-
         metrics = compute_factor_metrics(ic_series)
-        assert abs(metrics.max_drawdown - (-0.1)) < 1e-10, (
-            f"Expected MDD=-0.1, got {metrics.max_drawdown}"
+        assert metrics.max_drawdown == 0.0, (
+            "Without ls_returns, MDD should be 0.0"
+        )
+
+        # ls_returns 제공 시 실제 포트폴리오 MDD 계산
+        # 수익률: [0.05, 0.03, -0.10, 0.02]
+        # 누적: [1.05, 1.0815, 0.97335, 0.992697]
+        # peak: [1.05, 1.0815, 1.0815, 1.0815]
+        # dd:   [0.0, 0.0, -0.0999..., -0.0820...]
+        ls_returns = [0.05, 0.03, -0.10, 0.02]
+        metrics2 = compute_factor_metrics(ic_series, ls_returns=ls_returns)
+        assert metrics2.max_drawdown < 0, "MDD should be negative"
+        assert abs(metrics2.max_drawdown - (-0.0999)) < 0.01, (
+            f"Expected MDD≈-0.10, got {metrics2.max_drawdown}"
         )
