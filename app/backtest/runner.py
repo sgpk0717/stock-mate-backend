@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import uuid
@@ -76,18 +77,40 @@ async def execute_backtest(
             )
             await db.commit()
 
-        # 엔진 실행
-        result = await run_backtest(
-            strategy=strategy_json,
-            symbols=symbols,
-            start_date=start_date,
-            end_date=end_date,
-            initial_capital=initial_capital,
-            max_positions=max_positions,
-            position_size_pct=position_size_pct,
-            cost_config=cost_config,
-            progress_cb=progress_cb,
-        )
+        # H5: 엔진 실행 (타임아웃 30분)
+        from app.core.config import settings
+        timeout = getattr(settings, "BACKTEST_TIMEOUT_SECONDS", 1800)
+        try:
+            result = await asyncio.wait_for(
+                run_backtest(
+                    strategy=strategy_json,
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    initial_capital=initial_capital,
+                    max_positions=max_positions,
+                    position_size_pct=position_size_pct,
+                    cost_config=cost_config,
+                    progress_cb=progress_cb,
+                ),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            msg = f"타임아웃 ({timeout // 60}분 초과)"
+            async with async_session() as db:
+                await db.execute(
+                    update(BacktestRun)
+                    .where(BacktestRun.id == run_id)
+                    .values(
+                        status="FAILED",
+                        error_message=msg,
+                        completed_at=datetime.utcnow(),
+                    )
+                )
+                await db.commit()
+            await manager.broadcast(channel, {"type": "failed", "error": msg})
+            logger.warning("Backtest %s timed out after %ds", run_id, timeout)
+            return
 
         # 엔진이 에러를 반환한 경우 (데이터 없음 등) → FAILED 처리
         if "error" in result.metrics:

@@ -111,6 +111,20 @@ def add_open_gap_pct(df: pl.DataFrame) -> pl.DataFrame:
     return df.with_columns(gap_pct.alias("open_gap_pct"))
 
 
+def add_lag(df: pl.DataFrame, col_name: str = "close", lag: int = 1) -> pl.DataFrame:
+    """시차 피처: col_name을 lag만큼 shift."""
+    return df.with_columns(
+        pl.col(col_name).shift(lag).alias(f"{col_name}_lag_{lag}")
+    )
+
+
+def add_return_nd(df: pl.DataFrame, period: int = 5) -> pl.DataFrame:
+    """N일 수익률: (close / close[t-period]) - 1."""
+    return df.with_columns(
+        (pl.col("close") / pl.col("close").shift(period) - 1.0).alias(f"return_{period}d")
+    )
+
+
 def add_atr(df: pl.DataFrame, period: int = 14) -> pl.DataFrame:
     prev_close = pl.col("close").shift(1)
     tr = pl.max_horizontal(

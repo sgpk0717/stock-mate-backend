@@ -32,6 +32,7 @@ def compute_metrics(
     trades: list[Trade],
     equity_curve: list[dict],
     initial_capital: float,
+    annualize: float = 252.0,
 ) -> dict:
     """trades 와 equity_curve 로부터 성과 지표를 산출한다."""
 
@@ -44,7 +45,7 @@ def compute_metrics(
 
     # 연환산 수익률
     days = max(len(equity_curve), 1)
-    years = days / 252
+    years = days / annualize
     annualized = ((final_equity / initial_capital) ** (1 / max(years, 0.01)) - 1) * 100 if years > 0 else 0
 
     # MDD
@@ -66,8 +67,8 @@ def compute_metrics(
     gross_loss = abs(sum(t.pnl for t in losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-    # 샤프 비율 (일간 수익률 기반)
-    sharpe = _calc_sharpe(equity_curve)
+    # 샤프 비율 (봉간 수익률 기반)
+    sharpe = _calc_sharpe(equity_curve, annualize=annualize)
 
     # 평균 보유일
     avg_holding = sum(t.holding_days for t in closed) / total_trades if total_trades > 0 else 0
@@ -134,7 +135,11 @@ def _calc_mdd(equity_curve: list[dict]) -> tuple[float, float]:
     return max_dd_pct, max_dd_amt
 
 
-def _calc_sharpe(equity_curve: list[dict], risk_free_rate: float = 0.03) -> float:
+def _calc_sharpe(
+    equity_curve: list[dict],
+    risk_free_rate: float = 0.03,
+    annualize: float = 252.0,
+) -> float:
     if len(equity_curve) < 2:
         return 0.0
     returns = []
@@ -148,8 +153,8 @@ def _calc_sharpe(equity_curve: list[dict], risk_free_rate: float = 0.03) -> floa
     std_r = math.sqrt(sum((r - mean_r) ** 2 for r in returns) / len(returns))
     if std_r == 0:
         return 0.0
-    daily_rf = risk_free_rate / 252
-    return (mean_r - daily_rf) / std_r * math.sqrt(252)
+    bar_rf = risk_free_rate / annualize
+    return (mean_r - bar_rf) / std_r * math.sqrt(annualize)
 
 
 def _calc_streaks(closed: list[Trade]) -> tuple[int, int]:
