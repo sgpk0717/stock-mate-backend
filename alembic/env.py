@@ -5,6 +5,7 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
 from app.models import Base  # noqa: F401
+import app.workflow.models  # noqa: F401 — Alembic이 워크플로우 테이블 인식
 
 config = context.config
 
