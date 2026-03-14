@@ -284,11 +284,22 @@ async def collect_one_verified(
 
 # ── retry 모드 ────────────────────────────────────────────
 
-async def get_retry_targets(max_days: int = 365) -> list[dict]:
+async def get_retry_targets(
+    max_days: int = 365,
+    min_candles: int = 0,
+    min_trade_days: int = 0,
+) -> list[dict]:
     """DB에서 데이터가 부족한 종목 목록 조회.
 
+    판정 기준 (OR 조건):
+    1. 분봉 데이터 0건
+    2. oldest가 max_days 전까지 도달하지 못함
+    3. min_candles > 0이면 분봉 건수가 min_candles 미만
+    4. min_trade_days > 0이면 거래일 수가 min_trade_days 미만
+
     Returns:
-        [{"symbol": "...", "name": "...", "oldest_dt": "YYYYMMDD" or None}]
+        [{"symbol": "...", "name": "...", "oldest_dt": "YYYYMMDD" or None,
+          "count": int, "trade_days": int}]
     """
     from datetime import timezone as tz
     KST = tz(timedelta(hours=9))
@@ -297,7 +308,10 @@ async def get_retry_targets(max_days: int = 365) -> list[dict]:
     async with async_session() as db:
         result = await db.execute(
             text("""
-                SELECT m.symbol, m.name, MIN(c.dt) AS oldest_dt
+                SELECT m.symbol, m.name,
+                       MIN(c.dt) AS oldest_dt,
+                       COUNT(c.id) AS cnt,
+                       COUNT(DISTINCT c.dt::date) AS trade_days
                 FROM stock_masters m
                 LEFT JOIN stock_candles c
                     ON c.symbol = m.symbol AND c.interval = '1m'
@@ -309,25 +323,41 @@ async def get_retry_targets(max_days: int = 365) -> list[dict]:
 
     targets = []
     for row in rows:
-        sym, name, oldest_dt = row[0], row[1], row[2]
+        sym, name, oldest_dt, cnt, trade_days = row[0], row[1], row[2], row[3], row[4]
         if oldest_dt is None:
-            targets.append({"symbol": sym, "name": name, "oldest_dt": None})
+            targets.append({
+                "symbol": sym, "name": name, "oldest_dt": None,
+                "count": 0, "trade_days": 0,
+            })
         else:
             if hasattr(oldest_dt, "astimezone"):
                 dt_kst = oldest_dt.astimezone(KST)
             else:
                 dt_kst = oldest_dt
             oldest_str = dt_kst.strftime("%Y%m%d")
+
+            need_retry = False
             if oldest_str > cutoff:
-                targets.append({"symbol": sym, "name": name, "oldest_dt": oldest_str})
-            # oldest_str <= cutoff → 이미 1년치 있음 → 스킵
+                need_retry = True
+            if min_candles > 0 and cnt < min_candles:
+                need_retry = True
+            if min_trade_days > 0 and trade_days < min_trade_days:
+                need_retry = True
+
+            if need_retry:
+                targets.append({
+                    "symbol": sym, "name": name, "oldest_dt": oldest_str,
+                    "count": cnt, "trade_days": trade_days,
+                })
 
     return targets
 
 
-async def run_retry(max_days: int = 365):
+async def run_retry(max_days: int = 365, min_candles: int = 0, min_trade_days: int = 0):
     """데이터 부족 종목만 재수집."""
-    targets = await get_retry_targets(max_days)
+    targets = await get_retry_targets(
+        max_days, min_candles=min_candles, min_trade_days=min_trade_days,
+    )
     if not targets:
         logger.info("재수집 대상 없음 — 모든 종목 1년치 충족")
         return
@@ -368,6 +398,9 @@ async def run_retry(max_days: int = 365):
 
         current = done + i + 1
 
+        existing_cnt = target.get("count", 0)
+        existing_days = target.get("trade_days", 0)
+
         if oldest_dt is None:
             fill_start = today
             fill_days = max_days
@@ -380,9 +413,9 @@ async def run_retry(max_days: int = 365):
             fill_start = overlap_dt.strftime("%Y%m%d")
             fill_days = (overlap_dt - datetime.strptime(one_year_ago, "%Y%m%d")).days
             logger.info(
-                "[%d/%d] %s %s — oldest=%s, %s~%s 보충 (%d일) (elapsed %s, ETA %s)",
-                current, total, sym, name, oldest_dt,
-                one_year_ago, fill_start, fill_days,
+                "[%d/%d] %s %s — %d건/%d일, oldest=%s, 보충 %d일 (elapsed %s, ETA %s)",
+                current, total, sym, name, existing_cnt, existing_days,
+                oldest_dt, fill_days,
                 _format_duration(elapsed), eta,
             )
 
@@ -522,10 +555,22 @@ async def main():
         "--retry", action="store_true",
         help="DB에 데이터가 부족한 종목만 재수집 (에러로 누락된 종목 복구)",
     )
+    parser.add_argument(
+        "--min-candles", type=int, default=0,
+        help="retry 시 최소 분봉 건수 기준 (이 미만이면 재수집 대상)",
+    )
+    parser.add_argument(
+        "--min-trade-days", type=int, default=0,
+        help="retry 시 최소 거래일 수 기준 (이 미만이면 재수집 대상)",
+    )
     args = parser.parse_args()
 
     if args.retry:
-        await run_retry(max_days=args.max_days)
+        await run_retry(
+            max_days=args.max_days,
+            min_candles=args.min_candles,
+            min_trade_days=args.min_trade_days,
+        )
         return
 
     if args.fill_kiwoom:
