@@ -7,10 +7,10 @@ from pydantic import BaseModel
 
 from app.trading.context import (
     TradingContext,
-    delete_context,
+    delete_context_from_db,
     get_context,
     list_contexts,
-    save_context,
+    save_context_to_db,
 )
 from app.trading.kis_client import get_kis_client
 from app.trading.kis_order import KISOrderExecutor
@@ -94,7 +94,7 @@ async def create_context(req: ContextCreateRequest):
         symbols=req.symbols,
         source_backtest_id=req.source_backtest_id,
     )
-    save_context(ctx)
+    await save_context_to_db(ctx)
     return ctx.to_dict()
 
 
@@ -102,7 +102,7 @@ async def create_context(req: ContextCreateRequest):
 async def create_context_from_backtest(req: ContextFromBacktestRequest):
     """백테스트 결과에서 Context 생성."""
     ctx = TradingContext.from_backtest_run(req.run, req.mode)
-    save_context(ctx)
+    await save_context_to_db(ctx)
     return ctx.to_dict()
 
 
@@ -122,7 +122,7 @@ async def get_context_detail(context_id: str):
 
 @router.delete("/context/{context_id}")
 async def remove_context(context_id: str):
-    if not delete_context(context_id):
+    if not await delete_context_from_db(context_id):
         raise HTTPException(404, "Context not found")
     return {"status": "deleted"}
 
@@ -172,9 +172,67 @@ async def get_session_detail(session_id: str):
 @router.get("/session/{session_id}/trades")
 async def get_session_trades(session_id: str):
     session = get_session(session_id)
+    if session:
+        return session.trade_log
+    # fallback: DB에서 조회 (서버 재시작 전 매매 기록)
+    try:
+        from app.core.database import async_session
+        from app.workflow.models import LiveTrade
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        async with async_session() as db:
+            stmt = (
+                select(LiveTrade)
+                .where(LiveTrade.context_id == _uuid.UUID(session_id))
+                .order_by(LiveTrade.executed_at)
+            )
+            result = await db.execute(stmt)
+            trades = result.scalars().all()
+            if trades:
+                return [
+                    {
+                        "symbol": t.symbol, "name": t.name, "side": t.side,
+                        "step": t.step, "qty": t.qty, "price": float(t.price),
+                        "pnl_pct": t.pnl_pct,
+                        "pnl_amount": float(t.pnl_amount) if t.pnl_amount is not None else None,
+                        "holding_minutes": t.holding_minutes,
+                        "success": t.success, "order_id": t.order_id,
+                        "reason": t.reason,
+                        "timestamp": t.executed_at.isoformat() if t.executed_at else "",
+                        "snapshot": t.snapshot,
+                    }
+                    for t in trades
+                ]
+    except Exception:
+        pass
+    raise HTTPException(404, "Session not found")
+
+
+@router.get("/session/{session_id}/decisions")
+async def get_session_decisions(
+    session_id: str,
+    action: str | None = None,
+    symbol: str | None = None,
+    limit: int = 200,
+):
+    """판단 로그 조회 (매매 실행 + 스킵 포함).
+
+    query params:
+      - action: BUY, SELL, SKIP_BUY, SKIP_DATA, SKIP_ERROR, RISK_STOP, RISK_TRAIL 등
+      - symbol: 특정 종목 필터
+      - limit: 최대 반환 건수 (기본 200)
+    """
+    session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")
-    return session.trade_log
+
+    logs = session.decision_log
+    if action:
+        logs = [d for d in logs if d.get("action") == action]
+    if symbol:
+        logs = [d for d in logs if d.get("symbol") == symbol]
+    return logs[-limit:]
 
 
 # ── KIS 직접 주문 ───────────────────────────────────────

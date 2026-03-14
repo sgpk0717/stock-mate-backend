@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alpha.models import AlphaFactor, AlphaMiningRun
 from app.alpha.runner import execute_alpha_mining
 from app.alpha.schemas import (
     AlphaFactorBacktestRequest,
+    AlphaFactorPageResponse,
     AlphaFactorResponse,
     AlphaFactoryStartRequest,
     AlphaFactoryStatusResponse,
@@ -25,10 +27,16 @@ from app.alpha.schemas import (
     CompositeFactorResponse,
     CorrelationRequest,
     CorrelationMatrixResponse,
+    FactorChatCreateResponse,
+    FactorChatMessageRequest,
+    FactorChatMessageResponse,
+    FactorChatSessionResponse,
     MiningIterationLogs,
 )
 from app.alpha.universe import Universe, get_universe_info
 from app.core.database import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/alpha", tags=["alpha"])
 
@@ -60,6 +68,7 @@ async def start_mining(data: AlphaMineRequest, db: AsyncSession = Depends(get_db
             "start_date": data.start_date,
             "end_date": data.end_date,
             "universe": data.universe,
+            "interval": data.interval,
             "max_iterations": data.max_iterations,
             "ic_threshold": data.ic_threshold,
             "orthogonality_threshold": data.orthogonality_threshold,
@@ -86,6 +95,8 @@ async def start_mining(data: AlphaMineRequest, db: AsyncSession = Depends(get_db
             ic_threshold=data.ic_threshold,
             orthogonality_threshold=data.orthogonality_threshold,
             use_pysr=data.use_pysr,
+            interval=data.interval,
+            seed_factor_ids=data.seed_factor_ids or None,
         )
     )
 
@@ -173,24 +184,74 @@ async def delete_mining_run(run_id: str, db: AsyncSession = Depends(get_db)):
 
 # ── 팩터 조회 ──
 
-@router.get("/factors", response_model=list[AlphaFactorResponse])
+_ALLOWED_SORT_COLUMNS = {
+    "ic_mean", "icir", "sharpe", "max_drawdown",
+    "generation", "fitness_composite", "created_at",
+}
+
+
+@router.get("/factors", response_model=AlphaFactorPageResponse)
 async def list_factors(
     status: str | None = None,
     min_ic: float | None = None,
+    causal_robust: bool | None = None,
+    interval: str | None = None,
+    sort_by: str = "ic_mean",
+    order: str = "desc",
+    offset: int = 0,
+    limit: int = 100,
     db: AsyncSession = Depends(get_db),
 ):
-    """팩터 목록 (status/min_ic 필터)."""
-    query = select(AlphaFactor).order_by(AlphaFactor.ic_mean.desc().nulls_last())
+    """팩터 목록 (status/min_ic/causal_robust 필터, 멀티 정렬, 페이지네이션).
 
+    sort_by/order는 쉼표 구분 문자열로 멀티 정렬 지원.
+    예: sort_by=ic_mean,sharpe&order=desc,asc
+    """
+    sort_cols = [s.strip() for s in sort_by.split(",") if s.strip()]
+    sort_orders = [s.strip() for s in order.split(",") if s.strip()]
+
+    order_clauses = []
+    for i, sc in enumerate(sort_cols):
+        if sc not in _ALLOWED_SORT_COLUMNS:
+            continue
+        col = getattr(AlphaFactor, sc)
+        od = sort_orders[i] if i < len(sort_orders) else "desc"
+        order_clauses.append(
+            col.asc().nulls_last() if od == "asc" else col.desc().nulls_last()
+        )
+    if not order_clauses:
+        order_clauses.append(AlphaFactor.ic_mean.desc().nulls_last())
+
+    # WHERE 조건 구성
+    filters = []
     if status:
-        query = query.where(AlphaFactor.status == status)
+        filters.append(AlphaFactor.status == status)
     if min_ic is not None:
-        query = query.where(AlphaFactor.ic_mean >= min_ic)
+        filters.append(AlphaFactor.ic_mean >= min_ic)
+    if causal_robust is not None:
+        filters.append(AlphaFactor.causal_robust == causal_robust)
+    if interval:
+        filters.append(AlphaFactor.interval == interval)
 
-    result = await db.execute(query)
+    # 전체 개수 (ORDER BY 없이 — 정렬은 COUNT에 불필요)
+    count_q = select(func.count()).select_from(AlphaFactor)
+    for f in filters:
+        count_q = count_q.where(f)
+    total = await db.scalar(count_q)
+
+    # 페이지 데이터 (WHERE + ORDER BY + OFFSET/LIMIT)
+    data_q = select(AlphaFactor)
+    for f in filters:
+        data_q = data_q.where(f)
+    data_q = data_q.order_by(*order_clauses).offset(offset).limit(limit)
+
+    result = await db.execute(data_q)
     factors = result.scalars().all()
 
-    return [_factor_to_response(f) for f in factors]
+    return AlphaFactorPageResponse(
+        items=[_factor_to_response(f) for f in factors],
+        total=total or 0,
+    )
 
 
 @router.get("/factor/{factor_id}", response_model=AlphaFactorResponse)
@@ -215,15 +276,32 @@ async def delete_factor(factor_id: str, db: AsyncSession = Depends(get_db)):
     await db.commit()
 
 
+@router.post("/factors/delete-batch", status_code=204)
+async def delete_factors_batch(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """팩터 일괄 삭제."""
+    ids = body.get("factor_ids", [])
+    if not ids:
+        return
+    uuids = [uuid.UUID(fid) for fid in ids]
+    await db.execute(
+        delete(AlphaFactor).where(AlphaFactor.id.in_(uuids))
+    )
+    await db.commit()
+
+
 @router.post("/factor/{factor_id}/backtest", status_code=202)
 async def backtest_with_factor(
     factor_id: str,
     data: AlphaFactorBacktestRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """팩터로 백테스트 실행.
+    """횡단면 포트폴리오 기반 팩터 백테스트.
 
-    팩터를 지표로 등록한 뒤 기존 백테스트 엔진에 위임한다.
+    매일 전체 종목을 팩터 값으로 랭킹하여 상위 top_pct% 종목을 매수한다.
+    symbols가 비어 있으면 마이닝 유니버스를 기본값으로 사용한다.
     """
     result = await db.execute(
         select(AlphaFactor).where(AlphaFactor.id == uuid.UUID(factor_id))
@@ -232,62 +310,86 @@ async def backtest_with_factor(
     if not factor:
         raise HTTPException(404, "Factor not found")
 
-    # 팩터를 지표로 등록
-    from app.alpha.backtest_bridge import register_alpha_factor
-
-    indicator_name = register_alpha_factor(
-        factor_id=str(factor.id),
-        expression_str=factor.expression_str,
-    )
-
-    # 백테스트 전략 구성
-    from app.backtest.schemas import BacktestRunCreate, StrategySchema, ConditionSchema
-
-    strategy = StrategySchema(
-        name=f"Alpha: {factor.name}",
-        description=f"Alpha factor: {factor.expression_str}",
-        timeframe="1d",
-        buy_conditions=[
-            ConditionSchema(
-                indicator=indicator_name,
-                op=">",
-                value=data.buy_threshold,
+    # 마이닝 run config 조회 (symbols/날짜 폴백 공용)
+    run_config: dict | None = None
+    need_run_config = not data.symbols or not data.start_date or not data.end_date
+    if need_run_config and factor.mining_run_id:
+        run_result = await db.execute(
+            select(AlphaMiningRun.config).where(
+                AlphaMiningRun.id == factor.mining_run_id
             )
-        ],
-        sell_conditions=[
-            ConditionSchema(
-                indicator=indicator_name,
-                op="<",
-                value=data.sell_threshold,
+        )
+        run_config = run_result.scalar_one_or_none()
+
+    # symbols가 비어 있으면 마이닝 유니버스에서 가져옴
+    symbols = data.symbols if data.symbols else None
+    if not symbols:
+        if not run_config or not run_config.get("universe"):
+            raise HTTPException(
+                400,
+                "종목 리스트가 비어 있고, 마이닝 run에 유니버스 설정이 없습니다. "
+                "symbols를 직접 지정해 주세요.",
             )
-        ],
-    )
 
-    backtest_data = BacktestRunCreate(
-        strategy=strategy,
-        start_date=data.start_date,
-        end_date=data.end_date,
-        symbols=data.symbols if data.symbols else None,
-        initial_capital=data.initial_capital,
-        position_size_pct=data.position_size_pct,
-        max_positions=data.max_positions,
-    )
+        from app.alpha.universe import Universe, resolve_universe
 
-    # 기존 백테스트 라우터 로직 재사용
-    from app.backtest.cost_model import CostConfig
+        symbols = await resolve_universe(Universe(run_config["universe"]))
+        if not symbols:
+            raise HTTPException(
+                500,
+                f"유니버스 '{run_config['universe']}' 리졸브 결과가 비어 있습니다.",
+            )
+        logger.info(
+            "팩터 백테스트: 마이닝 유니버스 '%s' 사용 (%d종목)",
+            run_config["universe"],
+            len(symbols),
+        )
+
+    # 날짜 범위: 요청값 → 마이닝 config 폴백
+    start_str = data.start_date or (run_config.get("start_date") if run_config else None)
+    end_str = data.end_date or (run_config.get("end_date") if run_config else None)
+    if not start_str or not end_str:
+        raise HTTPException(
+            400,
+            "백테스트 날짜 범위가 지정되지 않았고 마이닝 run에도 날짜 설정이 없습니다.",
+        )
+
+    from app.backtest.cost_model import CostConfig, default_cost_config
     from app.backtest.models import BacktestRun
-    from app.backtest.runner import execute_backtest
+    from app.alpha.factor_backtest import execute_factor_backtest
 
-    start = date.fromisoformat(data.start_date)
-    end = date.fromisoformat(data.end_date)
+    start = date.fromisoformat(start_str)
+    end = date.fromisoformat(end_str)
+
+    # 인터벌 검증: 팩터의 원래 인터벌과 불일치 방지
+    bt_interval = data.interval
+    if factor.interval and bt_interval != factor.interval:
+        raise HTTPException(
+            400,
+            f"팩터 인터벌({factor.interval})과 요청 인터벌({bt_interval})이 다릅니다. "
+            f"팩터에 맞는 인터벌을 사용하세요.",
+        )
+    if not factor.interval:
+        bt_interval = "1d"  # interval 컬럼 추가 이전 레거시 팩터
+
+    cost_cfg = default_cost_config(bt_interval)
 
     run = BacktestRun(
-        strategy_name=strategy.name,
-        strategy_json=strategy.model_dump(),
+        strategy_name=f"Alpha: {factor.name}",
+        strategy_json={
+            "name": f"Alpha: {factor.name}",
+            "expression": factor.expression_str,
+            "mode": "cross_sectional_portfolio",
+            "interval": bt_interval,
+            "top_pct": data.top_pct,
+            "max_positions": data.max_positions,
+            "rebalance_freq": data.rebalance_freq,
+            "band_threshold": data.band_threshold,
+        },
         start_date=start,
         end_date=end,
         initial_capital=float(data.initial_capital),
-        cost_config=CostConfig().model_dump(),
+        cost_config=cost_cfg.model_dump(),
         status="PENDING",
         progress=0,
     )
@@ -296,16 +398,21 @@ async def backtest_with_factor(
     await db.refresh(run)
 
     asyncio.create_task(
-        execute_backtest(
+        execute_factor_backtest(
             run_id=run.id,
-            strategy_json=strategy.model_dump(),
+            expression_str=factor.expression_str,
+            symbols=symbols,
             start_date=start,
             end_date=end,
             initial_capital=data.initial_capital,
-            symbols=data.symbols if data.symbols else None,
-            position_size_pct=data.position_size_pct,
+            top_pct=data.top_pct,
             max_positions=data.max_positions,
-            cost_config=CostConfig(),
+            rebalance_freq=data.rebalance_freq,
+            band_threshold=data.band_threshold,
+            cost_config=cost_cfg,
+            interval=bt_interval,
+            stop_loss_pct=data.stop_loss_pct,
+            max_drawdown_pct=data.max_drawdown_pct,
         )
     )
 
@@ -346,57 +453,109 @@ async def validate_factor(factor_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
+@router.post("/factors/validate-batch", status_code=202)
+async def validate_factors_batch_endpoint(
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """선택된 팩터 일괄 인과 검증 (비동기). job_id를 반환하고 백그라운드에서 실행."""
+    from app.alpha.factory_client import get_factory_client
+
+    ids = body.get("factor_ids", [])
+    if not ids:
+        return {"job_id": None, "total": 0, "skipped": 0}
+
+    uuids = [uuid.UUID(fid) for fid in ids]
+    result = await db.execute(
+        select(AlphaFactor).where(AlphaFactor.id.in_(uuids))
+    )
+    factors = result.scalars().all()
+
+    to_validate = []
+    skipped = 0
+
+    for factor in factors:
+        if factor.causal_robust is not None:
+            skipped += 1
+        else:
+            to_validate.append(factor)
+
+    if not to_validate:
+        return {"job_id": None, "total": 0, "skipped": skipped}
+
+    job_id = uuid.uuid4().hex[:12]
+    factor_ids = [f.id for f in to_validate]
+
+    client = get_factory_client()
+    await client.start_validation_batch(factor_ids, job_id, len(factor_ids))
+
+    return {"job_id": job_id, "total": len(factor_ids), "skipped": skipped}
+
+
+@router.get("/validate/{job_id}/status")
+async def get_validation_status(job_id: str):
+    """인과 검증 잡 진행 상황 조회."""
+    from app.alpha.factory_client import get_factory_client
+
+    client = get_factory_client()
+    progress = await client.get_validation_progress(job_id)
+    if progress is None:
+        raise HTTPException(404, "Validation job not found")
+
+    return progress
+
+
 # ── Phase 3: 알파 팩토리 ──
 
 
 @router.post("/factory/start", response_model=AlphaFactoryStatusResponse)
 async def start_factory(data: AlphaFactoryStartRequest):
     """알파 팩토리 시작."""
-    from app.alpha.scheduler import get_scheduler
+    from app.alpha.factory_client import get_factory_client
 
-    scheduler = get_scheduler()
-    started = await scheduler.start(
+    client = get_factory_client()
+    result = await client.start(
         context=data.context,
         universe=data.universe,
         start_date=data.start_date,
         end_date=data.end_date,
+        data_interval=data.data_interval,
         interval_minutes=data.interval_minutes,
         max_iterations=data.max_iterations_per_cycle,
         ic_threshold=data.ic_threshold,
         orthogonality_threshold=data.orthogonality_threshold,
         enable_crossover=data.enable_crossover,
         enable_causal=data.enable_causal,
+        max_cycles=data.max_cycles,
     )
 
-    if not started:
+    if not result["started"]:
         raise HTTPException(409, "팩토리가 이미 실행 중입니다")
 
-    status = scheduler.get_status()
-    return AlphaFactoryStatusResponse(**status)
+    return AlphaFactoryStatusResponse(**result["status"])
 
 
 @router.post("/factory/stop", response_model=AlphaFactoryStatusResponse)
 async def stop_factory():
     """알파 팩토리 중지."""
-    from app.alpha.scheduler import get_scheduler
+    from app.alpha.factory_client import get_factory_client
 
-    scheduler = get_scheduler()
-    stopped = await scheduler.stop()
+    client = get_factory_client()
+    result = await client.stop()
 
-    if not stopped:
+    if not result["stopped"]:
         raise HTTPException(409, "팩토리가 실행 중이 아닙니다")
 
-    status = scheduler.get_status()
-    return AlphaFactoryStatusResponse(**status)
+    return AlphaFactoryStatusResponse(**result["status"])
 
 
 @router.get("/factory/status", response_model=AlphaFactoryStatusResponse)
 async def get_factory_status():
     """알파 팩토리 상태 조회."""
-    from app.alpha.scheduler import get_scheduler
+    from app.alpha.factory_client import get_factory_client
 
-    scheduler = get_scheduler()
-    status = scheduler.get_status()
+    client = get_factory_client()
+    status = await client.get_status()
     return AlphaFactoryStatusResponse(**status)
 
 
@@ -466,6 +625,201 @@ async def get_correlation(
     return CorrelationMatrixResponse(**result)
 
 
+# ── 팩터 AI 채팅 ──
+
+
+@router.post(
+    "/factor/{factor_id}/chat",
+    response_model=FactorChatCreateResponse,
+)
+async def create_factor_chat(
+    factor_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """팩터 기반 AI 채팅 세션 생성."""
+    result = await db.execute(
+        select(AlphaFactor).where(AlphaFactor.id == uuid.UUID(factor_id))
+    )
+    factor = result.scalar_one_or_none()
+    if not factor:
+        raise HTTPException(404, "Factor not found")
+
+    # 마이닝 run에서 universe/dates/interval 추출
+    universe = "KOSPI200"
+    start_date = "2025-06-01"
+    end_date = "2025-12-31"
+    interval = getattr(factor, "interval", "1d") or "1d"
+
+    if factor.mining_run_id:
+        run_result = await db.execute(
+            select(AlphaMiningRun.config).where(
+                AlphaMiningRun.id == factor.mining_run_id
+            )
+        )
+        run_config = run_result.scalar_one_or_none()
+        if run_config:
+            universe = run_config.get("universe", universe)
+            start_date = run_config.get("start_date", start_date)
+            end_date = run_config.get("end_date", end_date)
+            interval = run_config.get("interval", interval)
+
+    from app.alpha.factor_chat import factor_chat_store
+
+    session = factor_chat_store.create(
+        source_factor_id=str(factor.id),
+        source_expression=factor.expression_str,
+        source_hypothesis=factor.hypothesis or "",
+        source_metrics={
+            "ic_mean": factor.ic_mean or 0,
+            "ic_std": factor.ic_std or 0,
+            "icir": factor.icir or 0,
+            "turnover": factor.turnover or 0,
+            "sharpe": factor.sharpe or 0,
+            "max_drawdown": factor.max_drawdown or 0,
+        },
+        current_expression=factor.expression_str,
+        current_metrics={
+            "ic_mean": factor.ic_mean or 0,
+            "ic_std": factor.ic_std or 0,
+            "icir": factor.icir or 0,
+            "turnover": factor.turnover or 0,
+            "sharpe": factor.sharpe or 0,
+            "max_drawdown": factor.max_drawdown or 0,
+        },
+        universe=universe,
+        start_date=start_date,
+        end_date=end_date,
+        interval=interval,
+    )
+
+    return FactorChatCreateResponse(
+        session_id=session.id,
+        source_factor_id=str(factor.id),
+        source_expression=factor.expression_str,
+        universe=universe,
+        interval=interval,
+        status=session.status,
+    )
+
+
+@router.post(
+    "/factor/chat/{session_id}/message",
+    response_model=FactorChatMessageResponse,
+)
+async def send_factor_chat_message(
+    session_id: str,
+    req: FactorChatMessageRequest,
+):
+    """팩터 채팅 메시지 전송."""
+    from app.alpha.factor_chat import factor_chat_store, process_message
+
+    session = factor_chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "Chat session not found or expired")
+
+    try:
+        assistant_msg = await process_message(session, req.message)
+    except Exception as e:
+        logger.exception("Factor chat error for session %s", session_id)
+        raise HTTPException(500, f"채팅 처리 실패: {str(e)[:200]}")
+
+    return FactorChatMessageResponse(
+        role=assistant_msg.role,
+        content=assistant_msg.content,
+        timestamp=assistant_msg.timestamp,
+        factor_draft=assistant_msg.factor_draft,
+        current_expression=session.current_expression,
+        current_metrics=session.current_metrics,
+    )
+
+
+@router.get(
+    "/factor/chat/{session_id}",
+    response_model=FactorChatSessionResponse,
+)
+async def get_factor_chat_session(session_id: str):
+    """팩터 채팅 세션 조회."""
+    from app.alpha.factor_chat import factor_chat_store
+
+    session = factor_chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "Chat session not found or expired")
+
+    return FactorChatSessionResponse(**session.to_dict())
+
+
+@router.post("/factor/chat/{session_id}/save", response_model=AlphaFactorResponse)
+async def save_factor_from_chat(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """채팅에서 수정한 팩터를 새 AlphaFactor로 DB 저장."""
+    from app.alpha.factor_chat import factor_chat_store
+
+    session = factor_chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "Chat session not found or expired")
+
+    if not session.current_expression:
+        raise HTTPException(400, "저장할 수식이 없습니다. 먼저 대화로 수식을 수정하세요.")
+
+    # SymPy 문자열 생성
+    expression_sympy = None
+    polars_code = None
+    try:
+        from app.alpha.ast_converter import (
+            parse_expression,
+            sympy_to_code_string,
+            sympy_to_polars,
+        )
+        import sympy
+
+        parsed = parse_expression(session.current_expression)
+        expression_sympy = sympy.srepr(parsed)
+        polars_code = sympy_to_code_string(parsed)
+    except Exception:
+        pass
+
+    metrics = session.current_metrics or {}
+
+    new_factor = AlphaFactor(
+        mining_run_id=None,
+        name=f"Custom: {session.current_expression[:50]}",
+        expression_str=session.current_expression,
+        expression_sympy=expression_sympy,
+        polars_code=polars_code,
+        hypothesis=session.source_hypothesis,
+        generation=0,
+        ic_mean=metrics.get("ic_mean"),
+        ic_std=metrics.get("ic_std"),
+        icir=metrics.get("icir"),
+        turnover=metrics.get("turnover"),
+        sharpe=metrics.get("sharpe"),
+        max_drawdown=metrics.get("max_drawdown"),
+        status="discovered",
+        operator_origin="manual",
+        parent_ids=[session.source_factor_id],
+        interval=session.interval,
+    )
+    db.add(new_factor)
+    await db.commit()
+    await db.refresh(new_factor)
+
+    session.status = "saved"
+    session.touch()
+
+    return _factor_to_response(new_factor)
+
+
+@router.delete("/factor/chat/{session_id}", status_code=204)
+async def delete_factor_chat_session(session_id: str):
+    """팩터 채팅 세션 삭제."""
+    from app.alpha.factor_chat import factor_chat_store
+
+    if not factor_chat_store.delete(session_id):
+        raise HTTPException(404, "Chat session not found")
+
+
 # ── 내부 헬퍼 ──
 
 def _factor_to_response(f: AlphaFactor) -> AlphaFactorResponse:
@@ -474,6 +828,7 @@ def _factor_to_response(f: AlphaFactor) -> AlphaFactorResponse:
         mining_run_id=str(f.mining_run_id) if f.mining_run_id else None,
         name=f.name,
         expression_str=f.expression_str,
+        interval=getattr(f, "interval", "1d"),
         expression_sympy=f.expression_sympy,
         polars_code=f.polars_code,
         hypothesis=f.hypothesis,

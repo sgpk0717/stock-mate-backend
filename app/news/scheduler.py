@@ -53,9 +53,10 @@ async def collect_and_analyze(
         # 네이버 금융
         try:
             naver_articles = await naver_collect(symbol, page=1)
+            logger.info("네이버 수집 결과 (%s): %d건", symbol, len(naver_articles))
             all_articles.extend(naver_articles)
         except Exception as e:
-            logger.warning("네이버 수집 실패 (%s): %s", symbol, e)
+            logger.warning("네이버 수집 실패 (%s): %s: %s", symbol, type(e).__name__, e)
 
         # BigKinds (API 키 있을 때만)
         if settings.BIGKINDS_API_KEY:

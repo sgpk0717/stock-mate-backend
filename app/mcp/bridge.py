@@ -23,7 +23,7 @@ async def start_mcp_server() -> None:
 
     async def _run() -> None:
         try:
-            await mcp.run_async(transport="sse", port=settings.MCP_SSE_PORT)
+            await mcp.run_async(transport="sse", host="0.0.0.0", port=settings.MCP_SSE_PORT)
         except asyncio.CancelledError:
             pass
         except Exception as e:

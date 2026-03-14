@@ -67,7 +67,7 @@ async def collect_stock_news(
             )
             resp.raise_for_status()
     except httpx.HTTPError as e:
-        logger.error("네이버 뉴스 수집 실패 (%s): %s", symbol, e)
+        logger.error("네이버 뉴스 수집 실패 (%s): %s: %s", symbol, type(e).__name__, e)
         return articles
 
     soup = BeautifulSoup(resp.text, "lxml")

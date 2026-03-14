@@ -12,7 +12,7 @@ from app.core.database import async_session
 from app.news.models import NewsArticle, NewsSentimentDaily
 from app.news.scheduler import collect_and_analyze, collect_dart_disclosures
 
-from sqlalchemy import select, func
+from sqlalchemy import String, select, func, cast
 
 router = APIRouter(prefix="/news", tags=["news"])
 
@@ -96,7 +96,7 @@ async def get_articles(
         stmt = (
             select(NewsArticle)
             .where(
-                func.cast(NewsArticle.symbols, type_=func.text()).contains(symbol)
+                cast(NewsArticle.symbols, String).contains(symbol)
             )
             .order_by(NewsArticle.published_at.desc())
             .limit(limit)

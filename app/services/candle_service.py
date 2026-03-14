@@ -42,7 +42,7 @@ _CA_MAP = {
 }
 
 # 1분봉에서 집계하는 인터벌
-_DERIVED_FROM_1M = {"3m", "5m", "15m", "30m"}
+_DERIVED_FROM_1M = {"3m", "5m", "15m", "30m", "1h"}
 
 
 async def get_candles(
@@ -63,7 +63,7 @@ async def get_candles(
         return _aggregate_to_period(daily, interval, count)
 
     if interval in _DERIVED_FROM_1M:
-        minutes = int(interval.replace("m", ""))
+        minutes = 60 if interval == "1h" else int(interval.replace("m", ""))
         raw_1m = await _get_stitched_candles(db, symbol, "1m", count * minutes)
         return _aggregate_minutes(raw_1m, minutes, count)
 
@@ -73,10 +73,37 @@ async def get_candles(
 async def _get_stitched_candles(
     db: AsyncSession, symbol: str, interval: str, count: int
 ) -> list[dict]:
-    """CA + stock_candles 데이터를 병합. 겹치는 시간대는 CA 우선."""
+    """CA + stock_candles 데이터를 병합. 겹치는 시간대는 stock_candles 우선."""
     candle_map: dict[int, dict] = {}
 
-    # 1. stock_candles (과거 데이터)
+    # 1. Continuous aggregate (실시간 틱 기반 — 낮은 우선순위)
+    ca_view = _CA_MAP.get(interval)
+    if ca_view:
+        try:
+            agg_result = await db.execute(
+                text(f"""
+                    SELECT bucket, open, high, low, close, volume
+                    FROM {ca_view}
+                    WHERE symbol = :symbol
+                    ORDER BY bucket DESC
+                    LIMIT :count
+                """),
+                {"symbol": symbol, "count": count},
+            )
+            for row in agg_result.fetchall():
+                ts = _to_chart_ts(row[0], interval)
+                candle_map[ts] = {
+                    "time": ts,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": int(row[5]),
+                }
+        except Exception:
+            logger.debug("CA view %s not available, using stock_candles only", ca_view)
+
+    # 2. stock_candles (KIS/pykrx 과거 데이터 — 높은 우선순위, CA 덮어씀)
     hist_result = await db.execute(
         text("""
             SELECT dt, open, high, low, close, volume
@@ -97,34 +124,6 @@ async def _get_stitched_candles(
             "close": float(row[4]),
             "volume": int(row[5]),
         }
-
-    # 2. Continuous aggregate (실시간 데이터)
-    ca_view = _CA_MAP.get(interval)
-    if ca_view:
-        try:
-            agg_result = await db.execute(
-                text(f"""
-                    SELECT bucket, open, high, low, close, volume
-                    FROM {ca_view}
-                    WHERE symbol = :symbol
-                    ORDER BY bucket DESC
-                    LIMIT :count
-                """),
-                {"symbol": symbol, "count": count},
-            )
-            for row in agg_result.fetchall():
-                ts = _to_chart_ts(row[0], interval)
-                # CA 데이터가 우선 (실제 틱 기반이므로 더 정확)
-                candle_map[ts] = {
-                    "time": ts,
-                    "open": float(row[1]),
-                    "high": float(row[2]),
-                    "low": float(row[3]),
-                    "close": float(row[4]),
-                    "volume": int(row[5]),
-                }
-        except Exception:
-            logger.debug("CA view %s not available, using stock_candles only", ca_view)
 
     # 시간순 정렬, 최근 count개
     sorted_candles = sorted(candle_map.values(), key=lambda c: c["time"])
