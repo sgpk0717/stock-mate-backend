@@ -15,7 +15,7 @@ from dataclasses import asdict
 
 import polars as pl
 import sympy
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alpha.ast_converter import (
@@ -33,6 +33,7 @@ from app.alpha.evaluator import (
     compute_factor_metrics,
     compute_forward_returns,
     compute_ic_series,
+    compute_quantile_returns,
 )
 from app.alpha.evolution import (
     ScoredFactor,
@@ -42,6 +43,7 @@ from app.alpha.evolution import (
     mutate,
     tournament_select,
 )
+from app.alpha.expression_translator import generate_hypothesis_korean
 from app.alpha.fitness import compute_composite_fitness
 from app.alpha.memory import ExperienceVectorMemory
 from app.alpha.miner import DiscoveredFactor
@@ -76,6 +78,7 @@ class EvolutionEngine:
         vector_memory: ExperienceVectorMemory | None = None,
         generation: int = 0,
         train_ratio: float = 0.7,
+        interval: str = "1d",
     ) -> None:
         self._data = data
         self._db = db
@@ -88,6 +91,7 @@ class EvolutionEngine:
         self._vector_memory = vector_memory
         self._generation = generation
         self._train_ratio = train_ratio
+        self._interval = interval
 
         # 데이터 전처리
         self._data = ensure_alpha_features(self._data)
@@ -97,13 +101,31 @@ class EvolutionEngine:
         self._data = ensure_alpha_features(data)
 
     async def load_population(self) -> list[ScoredFactor]:
-        """DB에서 population_active=True인 팩터 로드."""
+        """DB에서 population_active=True인 팩터 로드 + 엘리트 아카이브 주입."""
         result = await self._db.execute(
             select(AlphaFactor).where(
                 AlphaFactor.population_active == True,  # noqa: E712
             ).order_by(AlphaFactor.fitness_composite.desc().nullslast())
         )
-        factors = result.scalars().all()
+        factors = list(result.scalars().all())
+
+        # 엘리트 아카이브: validated 팩터 중 비활성 상태인 것을 랜덤 샘플링
+        archive_size = max(5, int(self._population_size * 0.15))
+        archive_result = await self._db.execute(
+            select(AlphaFactor).where(
+                AlphaFactor.status == "validated",
+                AlphaFactor.population_active == False,  # noqa: E712
+            ).order_by(func.random()).limit(archive_size)
+        )
+        archive_factors = list(archive_result.scalars().all())
+
+        existing_ids = {f.id for f in factors}
+        archive_injected = [f for f in archive_factors if f.id not in existing_ids]
+        if archive_injected:
+            logger.info(
+                "Elite archive: injecting %d validated factors into population",
+                len(archive_injected),
+            )
 
         population: list[ScoredFactor] = []
         for f in factors:
@@ -130,6 +152,36 @@ class EvolutionEngine:
             except (ASTConversionError, Exception) as e:
                 logger.debug("Skipping unparseable factor %s: %s", f.id, e)
 
+        # 아카이브 팩터: fitness를 모집단 중앙값으로 리셋 (다른 유니버스 stale fitness 방지)
+        median_fitness = 0.0
+        if population:
+            sorted_fitness = sorted(f.fitness_composite for f in population)
+            median_fitness = sorted_fitness[len(sorted_fitness) // 2]
+
+        for f in archive_injected:
+            try:
+                expr = parse_expression(f.expression_str)
+                population.append(ScoredFactor(
+                    expression=expr,
+                    expression_str=f.expression_str,
+                    hypothesis=f.hypothesis or "",
+                    ic_mean=f.ic_mean or 0.0,
+                    ic_std=f.ic_std or 0.0,
+                    icir=f.icir or 0.0,
+                    turnover=f.turnover or 0.0,
+                    sharpe=f.sharpe or 0.0,
+                    max_drawdown=f.max_drawdown or 0.0,
+                    generation=f.birth_generation or 0,
+                    factor_id=str(f.id),
+                    fitness_composite=median_fitness,  # 중앙값으로 리셋
+                    tree_depth=f.tree_depth or 0,
+                    tree_size=f.tree_size or 0,
+                    expression_hash=f.expression_hash or "",
+                    operator_origin=f.operator_origin or "archive",
+                ))
+            except (ASTConversionError, Exception) as e:
+                logger.debug("Skipping archive factor %s: %s", f.id, e)
+
         return population
 
     async def run_generation(
@@ -145,6 +197,7 @@ class EvolutionEngine:
             이번 세대에서 새로 IC 기준을 통과한 팩터들.
         """
         self._generation += 1
+        self._eval_fail_logged = 0  # 세대별 리셋
 
         # 1. 모집단 로드
         population = await self.load_population()
@@ -165,34 +218,306 @@ class EvolutionEngine:
         # 3. Train/Val 분할
         train_data, val_data = self._split_train_val()
 
-        # 4. 진화 루프: 나머지 슬롯 채우기
+        # 3.5. fwd_return 사전 계산 (일봉: 팩터와 무관, 1회만 계산)
+        from app.alpha.interval import is_intraday
+        if not is_intraday(self._interval):
+            train_data = compute_forward_returns(train_data, periods=1)
+            if val_data is not None:
+                val_data = compute_forward_returns(val_data, periods=1)
+
+        # 4. 진화 3-Phase 파이프라인
+        import time as _time
+        from app.alpha.evaluator import compute_ic_series_batch
+        from app.alpha.interval import default_round_trip_cost
+
         offspring_target = self._population_size - len(elites)
         offspring: list[ScoredFactor] = []
         new_discovered: list[DiscoveredFactor] = []
+        cpcv_candidates: list[ScoredFactor] = []
+
+        funnel = {
+            "operator_null": 0,
+            "eval_success": 0,
+            "ic_pass": 0,
+            "wf_tested": 0,
+            "wf_overfit": 0,
+            "sharpe_fail": 0,
+        }
+
+        _t_phase0 = _time.perf_counter()
+
+        # ── Phase 1: 식 생성 (AST 즉시, LLM 지연) ──
+        _GeneratedChild = tuple  # (expr, op_name, parent, parent_ids)
+        ast_children: list[tuple] = []
+        llm_coros: list[tuple] = []  # (op_name, parent, parent_ids, coro)
 
         for i in range(offspring_target):
-            if progress_cb and i % 10 == 0:
-                pct = 10 + int(80 * i / max(offspring_target, 1))
-                await progress_cb(pct, 100, f"세대 {self._generation}: {i}/{offspring_target} 개체 진화 중")
-
-            # 4a. 연산자 선택
             op_name = self._operator_registry.select()
+            parents = tournament_select(
+                population,
+                k=min(settings.ALPHA_TOURNAMENT_K, len(population)),
+                n_select=2,
+                parsimony=True,
+            )
+            if not parents:
+                funnel["operator_null"] += 1
+                continue
+            parent = parents[0]
+            parent_ids = [parent.factor_id] if parent.factor_id else []
 
-            # 4b. 부모 선택 + 연산자 적용
-            child = await self._apply_operator(population, op_name, train_data)
+            if op_name.startswith("llm_"):
+                coro = self._llm_seed() if op_name == "llm_seed" else self._llm_mutate(parent)
+                llm_coros.append((op_name, parent, parent_ids, coro))
+            else:
+                child_expr = self._apply_ast_op(parents, op_name)
+                if child_expr is not None:
+                    if op_name == "ast_crossover" and len(parents) >= 2 and parents[1].factor_id:
+                        parent_ids = parent_ids + [parents[1].factor_id]
+                    ast_children.append((child_expr, op_name, parent, parent_ids))
+                else:
+                    self._operator_registry.update(op_name, delta_fitness=0.0)
+                    funnel["operator_null"] += 1
 
-            if child is not None:
-                offspring.append(child)
+        _t_phase1 = _time.perf_counter()
 
-                # IC 기준 통과 확인
-                if child.ic_mean >= self._ic_threshold:
-                    # Walk-Forward 검증
-                    if val_data is not None and val_data.height > 30:
-                        val_ic = self._evaluate_on_data(child.expression, val_data)
-                        if self._is_overfit(child.ic_mean, val_ic):
-                            continue  # 과적합 → 모집단에는 넣되 discovered에서 제외
+        if progress_cb:
+            await progress_cb(
+                20, 100,
+                f"세대 {self._generation}: {len(ast_children)} AST + {len(llm_coros)} LLM 생성 완료"
+            )
 
-                    # discovered 팩터로 추가 (ScoredFactor의 실제 메트릭 사용)
+        # ── Phase 2: LLM 호출 동시 실행 (retry + 폴백) ──
+        llm_success_count = 0
+        if llm_coros:
+            sem = asyncio.Semaphore(settings.ALPHA_LLM_MAX_CONCURRENT)
+
+            async def _fire_llm(op_name, parent, parent_ids, coro):
+                async with sem:
+                    last_err = None
+                    active_coro = coro
+                    for attempt in range(settings.ALPHA_LLM_RETRY_MAX + 1):
+                        try:
+                            expr = await active_coro
+                            if expr is None:
+                                self._operator_registry.update(op_name, delta_fitness=0.0)
+                                return None
+                            sympy_to_polars(expr)  # 변환 검증
+                            return (expr, op_name, parent, parent_ids)
+                        except Exception as e:
+                            err_name = type(e).__name__
+                            is_rate_limit = "RateLimit" in err_name or "rate_limit" in str(e).lower()
+                            is_timeout = "Timeout" in err_name or "timeout" in str(e).lower()
+
+                            if is_rate_limit or is_timeout:
+                                # 429 또는 타임아웃: 재시도 가치 있음
+                                retry_after = None
+                                if hasattr(e, "response") and hasattr(e.response, "headers"):
+                                    retry_after = e.response.headers.get("retry-after")
+                                wait = (
+                                    float(retry_after) if retry_after
+                                    else settings.ALPHA_LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                                )
+                                logger.warning(
+                                    "LLM %s %s (attempt %d/%d): waiting %.1fs",
+                                    op_name, err_name, attempt + 1,
+                                    settings.ALPHA_LLM_RETRY_MAX + 1, wait,
+                                )
+                                await asyncio.sleep(wait)
+                                # 코루틴 재생성 (await된 코루틴은 재사용 불가)
+                                active_coro = (
+                                    self._llm_seed() if op_name == "llm_seed"
+                                    else self._llm_mutate(parent)
+                                )
+                                last_err = e
+                            else:
+                                # 파싱/변환 에러: 재시도 의미 없음
+                                self._operator_registry.update(op_name, delta_fitness=0.0)
+                                self._operator_registry.record_llm_failure()
+                                return None
+
+                    # 모든 재시도 실패
+                    logger.warning(
+                        "LLM %s failed after %d attempts: %s",
+                        op_name, settings.ALPHA_LLM_RETRY_MAX + 1, last_err,
+                    )
+                    self._operator_registry.update(op_name, delta_fitness=0.0)
+                    self._operator_registry.record_llm_failure()
+                    return None
+
+            llm_results = await asyncio.gather(
+                *[_fire_llm(*t) for t in llm_coros],
+                return_exceptions=True,
+            )
+            for r in llm_results:
+                if r is not None and not isinstance(r, Exception):
+                    ast_children.append(r)
+                    llm_success_count += 1
+                else:
+                    funnel["operator_null"] += 1
+
+            # LLM 전멸 폴백: AST 연산자로 부족분 보충
+            if llm_success_count == 0 and len(llm_coros) > 0:
+                shortfall = len(llm_coros)
+                logger.warning(
+                    "All %d LLM calls failed → generating %d extra AST children as fallback",
+                    shortfall, shortfall,
+                )
+                _fallback_ops = ["ast_mutate_feature", "ast_mutate_operator", "ast_crossover"]
+                for _ in range(shortfall):
+                    fb_op = random.choice(_fallback_ops)
+                    fb_parents = tournament_select(
+                        population,
+                        k=min(settings.ALPHA_TOURNAMENT_K, len(population)),
+                        n_select=2, parsimony=True,
+                    )
+                    if fb_parents:
+                        fb_expr = self._apply_ast_op(fb_parents, fb_op)
+                        if fb_expr is not None:
+                            fb_parent = fb_parents[0]
+                            fb_pids = [fb_parent.factor_id] if fb_parent.factor_id else []
+                            ast_children.append((fb_expr, fb_op, fb_parent, fb_pids))
+
+        _t_phase2 = _time.perf_counter()
+        all_children = ast_children
+
+        if progress_cb:
+            await progress_cb(
+                30, 100,
+                f"세대 {self._generation}: LLM 완료, {len(all_children)}개 평가 시작"
+            )
+
+        # ── Phase 3: 배치 Polars 평가 (폴백 포함) ──
+        _BATCH_SIZE = settings.ALPHA_EVAL_BATCH_SIZE
+        _is_intraday = is_intraday(self._interval)
+        _rtc = default_round_trip_cost(self._interval)
+
+        for batch_start in range(0, len(all_children), _BATCH_SIZE):
+            batch = all_children[batch_start:batch_start + _BATCH_SIZE]
+
+            if progress_cb:
+                pct = 30 + int(50 * batch_start / max(len(all_children), 1))
+                await progress_cb(
+                    pct, 100,
+                    f"세대 {self._generation}: 배치 평가 {batch_start}/{len(all_children)}"
+                )
+
+            # Step 1: 배치 with_columns (유효 식만)
+            valid_batch: list[tuple[int, tuple]] = []
+            factor_exprs: list[pl.Expr] = []
+            for i, child_tuple in enumerate(batch):
+                child_expr = child_tuple[0]
+                try:
+                    pe = sympy_to_polars(child_expr)
+                    factor_exprs.append(pe.alias(f"_bf_{i}"))
+                    valid_batch.append((i, child_tuple))
+                except (ASTConversionError, Exception):
+                    op_name = child_tuple[1]
+                    self._operator_registry.update(op_name, delta_fitness=0.0)
+                    funnel["operator_null"] += 1
+
+            if not valid_batch:
+                continue
+
+            # Step 2: 배치 with_columns (실패 시 per-factor 폴백)
+            try:
+                df_batch = train_data.with_columns(factor_exprs)
+            except Exception as e:
+                logger.warning(
+                    "Batch with_columns failed (size=%d): %s → per-factor fallback",
+                    len(factor_exprs), e,
+                )
+                for i, child_tuple in valid_batch:
+                    child_expr, op_name, parent, parent_ids = child_tuple
+                    metrics = self._evaluate_on_data_full(child_expr, train_data)
+                    scored = self._build_scored_factor(
+                        child_expr, op_name, parent, parent_ids, metrics, funnel,
+                    )
+                    if scored is not None:
+                        offspring.append(scored)
+                continue
+
+            # Step 3: 분봉/일봉 분기
+            if _is_intraday:
+                for i, child_tuple in valid_batch:
+                    child_expr, op_name, parent, parent_ids = child_tuple
+                    metrics = self._evaluate_on_data_full(child_expr, train_data)
+                    scored = self._build_scored_factor(
+                        child_expr, op_name, parent, parent_ids, metrics, funnel,
+                    )
+                    if scored is not None:
+                        offspring.append(scored)
+            else:
+                # 배치 IC 계산 (실패 시 per-factor 폴백)
+                factor_cols = [f"_bf_{i}" for i, _ in valid_batch]
+                try:
+                    ic_dict = compute_ic_series_batch(df_batch, factor_cols)
+                except Exception as e:
+                    logger.warning("Batch IC failed: %s → per-factor fallback", e)
+                    ic_dict = {}
+                    for col in factor_cols:
+                        try:
+                            ic_dict[col] = compute_ic_series(df_batch, factor_col=col)
+                        except Exception:
+                            ic_dict[col] = []
+
+                for i, child_tuple in valid_batch:
+                    child_expr, op_name, parent, parent_ids = child_tuple
+                    col = f"_bf_{i}"
+                    ic_series = ic_dict.get(col, [])
+                    ls_returns = compute_quantile_returns(df_batch, factor_col=col)
+                    metrics = compute_factor_metrics(
+                        ic_series, ls_returns=ls_returns,
+                        annualize=252.0,
+                        round_trip_cost=_rtc,
+                    )
+                    scored = self._build_scored_factor(
+                        child_expr, op_name, parent, parent_ids, metrics, funnel,
+                    )
+                    if scored is not None:
+                        offspring.append(scored)
+
+        _t_phase3 = _time.perf_counter()
+
+        # Phase 3b: IC 통과 → Walk-Forward + CPCV 후보 수집
+        for scored in offspring:
+            if scored.ic_mean >= self._ic_threshold:
+                funnel["ic_pass"] += 1
+
+                if val_data is not None and val_data.height > 30:
+                    funnel["wf_tested"] += 1
+                    val_ic = self._evaluate_on_data(scored.expression, val_data)
+                    if self._is_overfit(scored.ic_mean, val_ic):
+                        funnel["wf_overfit"] += 1
+                        if funnel["wf_overfit"] <= 3:
+                            logger.info(
+                                "WF overfit sample: expr=%s, train_ic=%.4f, val_ic=%.4f (threshold=%.4f)",
+                                str(scored.expression)[:60],
+                                scored.ic_mean, val_ic, self._ic_threshold * 0.5,
+                            )
+                        continue
+
+                if scored.sharpe < settings.ALPHA_SHARPE_THRESHOLD:
+                    funnel["sharpe_fail"] += 1
+                    continue
+
+                cpcv_candidates.append(scored)
+
+        # 4c. CPCV 2단계 검증: top-K 후보만
+        if cpcv_candidates:
+            from app.alpha.cpcv import cpcv_validate
+
+            cpcv_candidates.sort(key=lambda c: c.fitness_composite, reverse=True)
+            cpcv_top_k = min(20, len(cpcv_candidates))
+
+            if progress_cb:
+                await progress_cb(85, 100, f"세대 {self._generation}: CPCV 검증 {cpcv_top_k}개")
+
+            for child in cpcv_candidates[:cpcv_top_k]:
+                cpcv_result = cpcv_validate(
+                    self._data, child.expression,
+                    ic_threshold=self._ic_threshold,
+                )
+                if cpcv_result.passed:
                     disc_metrics = FactorMetrics(
                         ic_mean=child.ic_mean,
                         ic_std=child.ic_std,
@@ -213,6 +538,35 @@ class EvolutionEngine:
                         parent_ids=child.parent_ids,
                     )
                     new_discovered.append(df)
+                    logger.info(
+                        "CPCV passed: %s (mean_ic=%.4f, pbo=%.2f)",
+                        child.expression_str[:50], cpcv_result.mean_ic, cpcv_result.pbo,
+                    )
+                else:
+                    logger.debug(
+                        "CPCV rejected: %s (reason=%s, mean_ic=%.4f, pbo=%.2f)",
+                        child.expression_str[:50], cpcv_result.reason,
+                        cpcv_result.mean_ic, cpcv_result.pbo,
+                    )
+
+        # 퍼널 + 타이밍 로그
+        sharpe_pass = funnel["ic_pass"] - funnel["wf_overfit"] - funnel["sharpe_fail"]
+        logger.warning(
+            "세대 %d 퍼널: attempted=%d → eval_ok=%d → IC≥%.2f=%d "
+            "→ WF_tested=%d (overfit=%d) → Sharpe≥%.1f=%d → CPCV=%d → discovered=%d",
+            self._generation,
+            offspring_target, funnel["eval_success"],
+            self._ic_threshold, funnel["ic_pass"],
+            funnel["wf_tested"], funnel["wf_overfit"],
+            settings.ALPHA_SHARPE_THRESHOLD, max(sharpe_pass, 0),
+            len(cpcv_candidates), len(new_discovered),
+        )
+        logger.warning(
+            "세대 %d 타이밍: 생성=%.1fs, LLM=%.1fs, 평가=%.1fs, 총=%.1fs",
+            self._generation,
+            _t_phase1 - _t_phase0, _t_phase2 - _t_phase1,
+            _t_phase3 - _t_phase2, _t_phase3 - _t_phase0,
+        )
 
         # 5. 중복 제거
         all_new = elites + offspring
@@ -221,6 +575,21 @@ class EvolutionEngine:
         # 6. 모집단 크기 제한
         all_new.sort(key=lambda f: f.fitness_composite, reverse=True)
         final_population = all_new[:self._population_size]
+
+        # 6.5. 벡터 메모리에 경험 저장
+        if self._vector_memory and new_discovered:
+            for disc in new_discovered:
+                try:
+                    await self._vector_memory.add(
+                        db=self._db,
+                        expression_str=disc.expression_str,
+                        hypothesis=disc.hypothesis or "",
+                        ic_mean=disc.metrics.ic_mean if disc.metrics else 0.0,
+                        generation=self._generation,
+                        success=True,
+                    )
+                except Exception as e:
+                    logger.debug("Failed to save experience: %s", e)
 
         # 7. DB 업데이트
         await self._persist_population(final_population)
@@ -236,6 +605,14 @@ class EvolutionEngine:
                 "elite_count": len(elites),
                 "new_discovered": len(new_discovered),
                 "operator_stats": self._operator_registry.to_dict(),
+                "funnel": {
+                    "attempted": offspring_target,
+                    "eval_ok": funnel["eval_success"],
+                    "ic_pass": funnel["ic_pass"],
+                    "wf_overfit": funnel["wf_overfit"],
+                    "sharpe_fail": funnel["sharpe_fail"],
+                    "cpcv_candidates": len(cpcv_candidates),
+                },
             })
 
         return new_discovered
@@ -271,8 +648,9 @@ class EvolutionEngine:
     async def _seed_population(self, count: int) -> list[ScoredFactor]:
         """초기 모집단 생성: 간단한 수식 시드."""
         seeds: list[ScoredFactor] = []
-        # 기본 수식 템플릿
+        # 기본 수식 템플릿 (확장 피처 포함)
         templates = [
+            # 기존
             "rsi",
             "volume_ratio",
             "macd_hist",
@@ -293,6 +671,27 @@ class EvolutionEngine:
             "macd_hist / atr_14",
             "log(volume_ratio) * macd_hist",
             "rsi / 100 * volume_ratio",
+            # 멀티 윈도우 추세
+            "sma_5 / sma_60 - 1",
+            "ema_5 / ema_20 - 1",
+            "(sma_5 - sma_20) / atr_14",
+            # 멀티 RSI
+            "rsi_7 - rsi_21",
+            "(100 - rsi_7) * volume_ratio",
+            # 모멘텀 + 변동성
+            "return_5d / atr_7",
+            "return_20d * volume_ratio",
+            "return_5d - return_20d",
+            # 시차 기반 평균회귀
+            "close / close_lag_5 - 1",
+            "(close - close_lag_20) / atr_21",
+            "log(volume / volume_lag_5)",
+            # 밴드 위치
+            "bb_position * rsi / 100",
+            "bb_position * volume_ratio",
+            # 복합
+            "(ema_10 - sma_60) / atr_14 * volume_ratio",
+            "abs(return_5d) / atr_7 * rsi_7 / 100",
         ]
 
         train_data, _ = self._split_train_val()
@@ -312,13 +711,20 @@ class EvolutionEngine:
                     turnover=metrics.turnover,
                     tree_depth=depth,
                     tree_size=size,
+                    sharpe=metrics.sharpe,
+                    max_drawdown=metrics.max_drawdown,
                 )
 
                 seeds.append(ScoredFactor(
                     expression=expr,
                     expression_str=tmpl,
-                    hypothesis=f"Seed factor {i}",
+                    hypothesis=generate_hypothesis_korean(expr, "initial"),
                     ic_mean=metrics.ic_mean,
+                    ic_std=metrics.ic_std,
+                    icir=metrics.icir,
+                    turnover=metrics.turnover,
+                    sharpe=metrics.sharpe,
+                    max_drawdown=metrics.max_drawdown,
                     generation=self._generation,
                     fitness_composite=fitness,
                     tree_depth=depth,
@@ -328,6 +734,21 @@ class EvolutionEngine:
                 ))
             except (ASTConversionError, Exception) as e:
                 logger.debug("Seed %s failed: %s", tmpl, e)
+
+        # 시드 결과 로깅
+        logger.warning(
+            "시드 모집단: %d/%d 성공 (실패=%d)",
+            len(seeds), count, count - len(seeds),
+        )
+        if seeds:
+            ic_values = [s.ic_mean for s in seeds]
+            logger.warning(
+                "시드 IC 분포: min=%.4f, max=%.4f, mean=%.4f, IC≥%.2f=%d개",
+                min(ic_values), max(ic_values),
+                sum(ic_values) / len(ic_values),
+                self._ic_threshold,
+                sum(1 for ic in ic_values if ic >= self._ic_threshold),
+            )
 
         return seeds
 
@@ -394,6 +815,13 @@ class EvolutionEngine:
             # 평가
             metrics = self._evaluate_on_data_full(child_expr, train_data)
             if metrics is None:
+                if self._eval_fail_logged < 3:
+                    self._eval_fail_logged += 1
+                    logger.warning(
+                        "eval_full → None (sample %d/3): op=%s, expr=%s",
+                        self._eval_fail_logged, operator_name,
+                        str(child_expr)[:80],
+                    )
                 self._operator_registry.update(operator_name, delta_fitness=0.0)
                 return None
 
@@ -405,6 +833,8 @@ class EvolutionEngine:
                 turnover=metrics.turnover,
                 tree_depth=depth,
                 tree_size=size,
+                sharpe=metrics.sharpe,
+                max_drawdown=metrics.max_drawdown,
             )
 
             # UCB1 업데이트
@@ -414,7 +844,7 @@ class EvolutionEngine:
             return ScoredFactor(
                 expression=child_expr,
                 expression_str=str(child_expr),
-                hypothesis=f"Evolved from {parent.expression_str[:50]}",
+                hypothesis=generate_hypothesis_korean(child_expr, operator_name),
                 ic_mean=metrics.ic_mean,
                 ic_std=metrics.ic_std,
                 icir=metrics.icir,
@@ -437,6 +867,113 @@ class EvolutionEngine:
                 self._operator_registry.record_llm_failure()
             return None
 
+    def _apply_ast_op(
+        self, parents: list[ScoredFactor], operator_name: str,
+    ) -> sympy.Basic | None:
+        """AST 연산자 적용 (동기, ~1ms). LLM 연산자는 처리하지 않는다."""
+        try:
+            parent = parents[0]
+            if operator_name == "ast_crossover":
+                if len(parents) >= 2:
+                    children = crossover(parent.expression, parents[1].expression)
+                    return children[0] if children else None
+                return None
+            elif operator_name == "ast_hoist":
+                return hoist_mutation(parent.expression)
+            elif operator_name == "ast_ephemeral_constant":
+                return ephemeral_constant_mutation(parent.expression)
+            elif operator_name == "ast_mutate_operator":
+                from app.alpha.evolution import _mutate_operator
+                return _mutate_operator(parent.expression)
+            elif operator_name == "ast_mutate_constant":
+                from app.alpha.evolution import _mutate_constant
+                return _mutate_constant(parent.expression)
+            elif operator_name == "ast_mutate_feature":
+                from app.alpha.evolution import _mutate_feature
+                return _mutate_feature(parent.expression)
+            elif operator_name == "ast_mutate_function":
+                from app.alpha.evolution import _mutate_function
+                return _mutate_function(parent.expression)
+            else:
+                return mutate(parent.expression)
+        except Exception as e:
+            logger.debug("AST operator %s failed: %s", operator_name, e)
+            return None
+
+    def _build_scored_factor(
+        self,
+        child_expr: sympy.Basic,
+        op_name: str,
+        parent: ScoredFactor,
+        parent_ids: list[str],
+        metrics: FactorMetrics | None,
+        funnel: dict,
+    ) -> ScoredFactor | None:
+        """메트릭으로 ScoredFactor 생성 + UCB1 업데이트. 실패 시 None."""
+        if metrics is None or not metrics.ic_series:
+            if self._eval_fail_logged < 3:
+                self._eval_fail_logged += 1
+                logger.warning(
+                    "eval_full → None (sample %d/3): op=%s, expr=%s",
+                    self._eval_fail_logged, op_name, str(child_expr)[:80],
+                )
+            self._operator_registry.update(op_name, delta_fitness=0.0)
+            return None
+
+        depth = calc_tree_depth(child_expr)
+        size = calc_tree_size(child_expr)
+        fitness = compute_composite_fitness(
+            ic_mean=metrics.ic_mean,
+            icir=metrics.icir,
+            turnover=metrics.turnover,
+            tree_depth=depth,
+            tree_size=size,
+            sharpe=metrics.sharpe,
+            max_drawdown=metrics.max_drawdown,
+        )
+
+        delta = fitness - parent.fitness_composite
+        self._operator_registry.update(op_name, delta_fitness=delta)
+        funnel["eval_success"] += 1
+
+        return ScoredFactor(
+            expression=child_expr,
+            expression_str=str(child_expr),
+            hypothesis=generate_hypothesis_korean(child_expr, op_name),
+            ic_mean=metrics.ic_mean,
+            ic_std=metrics.ic_std,
+            icir=metrics.icir,
+            turnover=metrics.turnover,
+            sharpe=metrics.sharpe,
+            max_drawdown=metrics.max_drawdown,
+            generation=self._generation,
+            parent_ids=parent_ids,
+            fitness_composite=fitness,
+            tree_depth=depth,
+            tree_size=size,
+            expression_hash=expression_hash(child_expr),
+            operator_origin=op_name,
+        )
+
+    # eval 실패 샘플 로깅 카운터 (세대당 리셋)
+    _eval_fail_logged: int = 0
+
+    # 확장된 피처 목록 (LLM 프롬프트용)
+    _FEATURE_LIST = (
+        "close, open, high, low, volume, "
+        "sma_5, sma_10, sma_20, sma_60, ema_5, ema_10, ema_20, ema_60, "
+        "rsi, rsi_7, rsi_21, "
+        "volume_ratio, atr_7, atr_14, atr_21, "
+        "macd_hist, bb_upper, bb_lower, bb_width, bb_position, "
+        "price_change_pct, "
+        "close_lag_1, close_lag_5, close_lag_20, "
+        "volume_lag_1, volume_lag_5, "
+        "return_5d, return_20d, "
+        "rank_close, rank_volume, zscore_close, zscore_volume, "
+        "foreign_net_norm, inst_net_norm, retail_net_norm, "
+        "eps, bps, operating_margin, debt_to_equity, earnings_yield, book_yield"
+    )
+
     async def _llm_seed(self) -> sympy.Basic | None:
         """Claude API로 새 수식 생성."""
         try:
@@ -445,13 +982,22 @@ class EvolutionEngine:
             client = AsyncAnthropic()
             prompt = (
                 "Generate a single alpha factor formula using these variables: "
-                "close, open, high, low, volume, sma_20, ema_20, rsi, "
-                "volume_ratio, atr_14, macd_hist, bb_upper, bb_lower, price_change_pct.\n"
+                f"{self._FEATURE_LIST}.\n"
                 "Use only: +, -, *, /, log(), sqrt(), abs().\n"
                 "Return ONLY the formula, nothing else."
             )
+
+            # RAG 경험 추가
+            if self._vector_memory:
+                rag = self._vector_memory.format_rag_context(
+                    self._context or "alpha factor for Korean equities"
+                )
+                if rag and rag != "아직 탐색 이력이 없습니다.":
+                    prompt += f"\n\nPast experience:\n{rag}"
+
+            # 구조화된 피드백이 context에 포함된 경우 RAG 뒤에 배치
             if self._context:
-                prompt += f"\nContext: {self._context}"
+                prompt += f"\n\n{self._context}"
 
             response = await client.messages.create(
                 model=settings.AGENT_MODEL,
@@ -465,7 +1011,7 @@ class EvolutionEngine:
             return None
 
     async def _llm_mutate(self, parent: ScoredFactor) -> sympy.Basic | None:
-        """Claude API로 기존 수식 변이."""
+        """Claude API로 기존 수식 변이 (다차원 메트릭 피드백)."""
         try:
             from anthropic import AsyncAnthropic
 
@@ -473,13 +1019,23 @@ class EvolutionEngine:
             prompt = (
                 f"Mutate this alpha factor formula to improve it:\n"
                 f"{parent.expression_str}\n"
-                f"Current IC: {parent.ic_mean:.4f}\n"
-                "Use only these variables: close, open, high, low, volume, "
-                "sma_20, ema_20, rsi, volume_ratio, atr_14, macd_hist, "
-                "bb_upper, bb_lower, price_change_pct.\n"
+                f"Current metrics:\n"
+                f"  IC: {parent.ic_mean:.4f} (target: >= {self._ic_threshold})\n"
+                f"  Sharpe: {parent.sharpe:.3f} (target: >= {settings.ALPHA_SHARPE_THRESHOLD})\n"
+                f"  Turnover: {parent.turnover:.3f} (lower is better)\n"
+                f"  Complexity: depth={parent.tree_depth}, size={parent.tree_size}\n"
+                f"Use only these variables: {self._FEATURE_LIST}.\n"
                 "Use only: +, -, *, /, log(), sqrt(), abs().\n"
                 "Return ONLY the new formula, nothing else."
             )
+
+            # RAG: 유사한 과거 시도
+            if self._vector_memory:
+                rag = self._vector_memory.format_rag_context(
+                    parent.expression_str
+                )
+                if rag and rag != "아직 탐색 이력이 없습니다.":
+                    prompt += f"\n\nSimilar past attempts:\n{rag}"
 
             response = await client.messages.create(
                 model=settings.AGENT_MODEL,
@@ -493,17 +1049,27 @@ class EvolutionEngine:
             return None
 
     def _evaluate_on_data(self, expr: sympy.Basic, data: pl.DataFrame) -> float:
-        """수식의 IC mean을 계산 (간략 버전)."""
+        """수식의 IC mean을 계산 (간략 버전 — Walk-Forward 검증용)."""
         try:
             polars_expr = sympy_to_polars(expr)
             df = data.with_columns(polars_expr.alias("alpha_factor"))
-            df = compute_forward_returns(df, periods=1)
-            df = df.filter(
-                pl.col("alpha_factor").is_not_null()
-                & pl.col("alpha_factor").is_not_nan()
-                & pl.col("fwd_return").is_not_null()
-                & pl.col("fwd_return").is_not_nan()
-            )
+
+            from app.alpha.interval import is_intraday
+
+            if is_intraday(self._interval):
+                from app.alpha.evaluator import _collapse_to_daily
+                df = _collapse_to_daily(df, factor_col="alpha_factor")
+                df = df.drop_nulls(subset=["alpha_factor", "fwd_return"])
+            else:
+                if "fwd_return" not in df.columns:
+                    df = compute_forward_returns(df, periods=1)
+                df = df.filter(
+                    pl.col("alpha_factor").is_not_null()
+                    & pl.col("alpha_factor").is_not_nan()
+                    & pl.col("fwd_return").is_not_null()
+                    & pl.col("fwd_return").is_not_nan()
+                )
+
             ic_series = compute_ic_series(df, factor_col="alpha_factor")
             if not ic_series:
                 return 0.0
@@ -515,21 +1081,37 @@ class EvolutionEngine:
     def _evaluate_on_data_full(
         self, expr: sympy.Basic, data: pl.DataFrame,
     ) -> FactorMetrics | None:
-        """수식의 전체 메트릭 계산."""
+        """수식의 전체 메트릭 계산 (evaluate_factor()와 동일한 방법론)."""
         try:
             polars_expr = sympy_to_polars(expr)
             df = data.with_columns(polars_expr.alias("alpha_factor"))
-            df = compute_forward_returns(df, periods=1)
-            df = df.filter(
-                pl.col("alpha_factor").is_not_null()
-                & pl.col("alpha_factor").is_not_nan()
-                & pl.col("fwd_return").is_not_null()
-                & pl.col("fwd_return").is_not_nan()
-            )
+
+            from app.alpha.interval import default_round_trip_cost, is_intraday
+
+            if is_intraday(self._interval):
+                from app.alpha.evaluator import _collapse_to_daily
+                df = _collapse_to_daily(df, factor_col="alpha_factor")
+                df = df.drop_nulls(subset=["alpha_factor", "fwd_return"])
+            else:
+                if "fwd_return" not in df.columns:
+                    df = compute_forward_returns(df, periods=1)
+                df = df.filter(
+                    pl.col("alpha_factor").is_not_null()
+                    & pl.col("alpha_factor").is_not_nan()
+                    & pl.col("fwd_return").is_not_null()
+                    & pl.col("fwd_return").is_not_nan()
+                )
+
             if df.height < 10:
                 return None
+
             ic_series = compute_ic_series(df, factor_col="alpha_factor")
-            return compute_factor_metrics(ic_series)
+            ls_returns = compute_quantile_returns(df, factor_col="alpha_factor")
+            return compute_factor_metrics(
+                ic_series, ls_returns=ls_returns,
+                annualize=252.0,  # 항상 일별 기준 (분봉은 _collapse_to_daily로 일별화)
+                round_trip_cost=default_round_trip_cost(self._interval),
+            )
         except Exception as e:
             logger.debug("Evaluation failed: %s", e)
             return None

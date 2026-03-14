@@ -141,6 +141,8 @@ class TestConfigEvolutionSettings:
         total = (
             settings.ALPHA_FITNESS_W_IC
             + settings.ALPHA_FITNESS_W_ICIR
+            + settings.ALPHA_FITNESS_W_SHARPE
+            + settings.ALPHA_FITNESS_W_MDD
             + settings.ALPHA_FITNESS_W_TURNOVER
             + settings.ALPHA_FITNESS_W_COMPLEXITY
         )
