@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import math
 import random
@@ -212,11 +213,21 @@ class EvolutionEngine:
         if progress_cb:
             await progress_cb(10, 100, f"세대 {self._generation}: 모집단 {len(population)}개 로드")
 
+        # 1.5. 세대 시작 시 상태 즉시 보고 (프론트엔드 대시보드 표시용)
+        if iteration_cb:
+            await iteration_cb({
+                "type": "generation_start",
+                "generation": self._generation,
+                "population_size": len(population),
+            })
+
         # 2. 엘리트 보존
         elites = self._select_elites(population)
+        logger.info("세대 %d: 엘리트 %d개 선택, Train/Val 분할 시작", self._generation, len(elites))
 
         # 3. Train/Val 분할
         train_data, val_data = self._split_train_val()
+        logger.info("세대 %d: Train/Val 분할 완료 (train=%d, val=%s)", self._generation, train_data.height, val_data.height if val_data is not None else "None")
 
         # 3.5. fwd_return 사전 계산 (일봉: 팩터와 무관, 1회만 계산)
         from app.alpha.interval import is_intraday
@@ -227,13 +238,8 @@ class EvolutionEngine:
 
         # 4. 진화 3-Phase 파이프라인
         import time as _time
-        from app.alpha.evaluator import compute_ic_series_batch
-        from app.alpha.interval import default_round_trip_cost
 
         offspring_target = self._population_size - len(elites)
-        offspring: list[ScoredFactor] = []
-        new_discovered: list[DiscoveredFactor] = []
-        cpcv_candidates: list[ScoredFactor] = []
 
         funnel = {
             "operator_null": 0,
@@ -245,6 +251,7 @@ class EvolutionEngine:
         }
 
         _t_phase0 = _time.perf_counter()
+        logger.info("세대 %d: Phase 1 시작 (offspring_target=%d)", self._generation, offspring_target)
 
         # ── Phase 1: 식 생성 (AST 즉시, LLM 지연) ──
         _GeneratedChild = tuple  # (expr, op_name, parent, parent_ids)
@@ -279,6 +286,7 @@ class EvolutionEngine:
                     funnel["operator_null"] += 1
 
         _t_phase1 = _time.perf_counter()
+        logger.info("세대 %d: Phase 1 완료 (%.1fs) — AST %d개, LLM %d개", self._generation, _t_phase1 - _t_phase0, len(ast_children), len(llm_coros))
 
         if progress_cb:
             await progress_cb(
@@ -379,6 +387,7 @@ class EvolutionEngine:
 
         _t_phase2 = _time.perf_counter()
         all_children = ast_children
+        logger.info("세대 %d: Phase 2 완료 (%.1fs) — 총 %d개 자식, to_thread 시작", self._generation, _t_phase2 - _t_phase1, len(all_children))
 
         if progress_cb:
             await progress_cb(
@@ -386,20 +395,174 @@ class EvolutionEngine:
                 f"세대 {self._generation}: LLM 완료, {len(all_children)}개 평가 시작"
             )
 
-        # ── Phase 3: 배치 Polars 평가 (폴백 포함) ──
+        # 생성된 후보 수식 샘플을 프론트엔드에 전송 (Phase 3 전, OOM 크래시 전)
+        if iteration_cb and all_children:
+            import random as _rand
+            sample_indices = _rand.sample(range(len(all_children)), min(8, len(all_children)))
+            candidate_samples = []
+            for idx in sample_indices:
+                child_tuple = all_children[idx]
+                expr = child_tuple[0]       # sympy expression
+                op_name = child_tuple[1]    # operator name
+                candidate_samples.append({
+                    "expression": str(expr)[:80],
+                    "operator": op_name,
+                })
+            # 연산자별 집계
+            op_counts: dict[str, int] = {}
+            for child_tuple in all_children:
+                op = child_tuple[1]
+                op_counts[op] = op_counts.get(op, 0) + 1
+
+            await iteration_cb({
+                "type": "candidates_ready",
+                "generation": self._generation,
+                "total": len(all_children),
+                "samples": candidate_samples,
+                "operator_breakdown": op_counts,
+            })
+
+        # ── Phase 3: CPU-bound 평가를 별도 스레드에서 실행 (이벤트 루프 해방) ──
+        offspring, new_discovered, funnel = await asyncio.to_thread(
+            self._evaluate_batch_sync,
+            all_children, train_data, val_data,
+            offspring_target, funnel,
+            _t_phase0, _t_phase1, _t_phase2,
+        )
+
+        logger.info("세대 %d: Phase 3 to_thread 완료 — offspring %d개", self._generation, len(offspring))
+
+        if progress_cb:
+            await progress_cb(90, 100, f"세대 {self._generation}: 평가 완료")
+
+        # Phase 3 결과 상세 이벤트 (프론트엔드 라이브 피드용)
+        if iteration_cb:
+            # IC 통과 상위 팩터 샘플 (최대 5개)
+            ic_passed = [
+                o for o in offspring
+                if hasattr(o, "ic_mean") and o.ic_mean >= self._ic_threshold
+            ]
+            ic_passed.sort(key=lambda o: o.ic_mean, reverse=True)
+            top_samples = [
+                {
+                    "expression": o.expression_str[:60],
+                    "ic": round(o.ic_mean, 4),
+                    "sharpe": round(o.sharpe, 2) if hasattr(o, "sharpe") else 0,
+                    "operator": getattr(o, "operator_origin", ""),
+                }
+                for o in ic_passed[:5]
+            ]
+            # IC 미달 샘플 (최근 3개)
+            ic_failed = [
+                o for o in offspring
+                if hasattr(o, "ic_mean") and o.ic_mean < self._ic_threshold
+            ]
+            fail_samples = [
+                {
+                    "expression": o.expression_str[:60],
+                    "ic": round(o.ic_mean, 4),
+                }
+                for o in ic_failed[-3:]
+            ]
+            await iteration_cb({
+                "type": "eval_complete",
+                "generation": self._generation,
+                "total_evaluated": len(offspring),
+                "ic_pass_count": len(ic_passed),
+                "ic_threshold": self._ic_threshold,
+                "cpcv_candidates": len(cpcv_candidates),
+                "discovered_count": len(new_discovered),
+                "top_samples": top_samples,
+                "fail_samples": fail_samples,
+                "discovered": [
+                    {
+                        "name": d.name,
+                        "expression": d.expression_str[:60],
+                        "ic": round(d.metrics.ic_mean, 4) if d.metrics else 0,
+                        "sharpe": round(d.metrics.sharpe, 2) if d.metrics else 0,
+                    }
+                    for d in new_discovered
+                ],
+            })
+
+        # 5. 중복 제거
+        all_new = elites + offspring
+        all_new = self._deduplicate(all_new)
+
+        # 6. 모집단 크기 제한
+        all_new.sort(key=lambda f: f.fitness_composite, reverse=True)
+        final_population = all_new[:self._population_size]
+
+        # 6.5. 벡터 메모리에 경험 저장
+        if self._vector_memory and new_discovered:
+            for disc in new_discovered:
+                try:
+                    await self._vector_memory.add(
+                        db=self._db,
+                        expression_str=disc.expression_str,
+                        hypothesis=disc.hypothesis or "",
+                        ic_mean=disc.metrics.ic_mean if disc.metrics else 0.0,
+                        generation=self._generation,
+                        success=True,
+                    )
+                except Exception as e:
+                    logger.debug("Failed to save experience: %s", e)
+
+        # 7. DB 업데이트
+        await self._persist_population(final_population)
+
+        if progress_cb:
+            await progress_cb(100, 100, f"세대 {self._generation} 완료: {len(new_discovered)}개 발견")
+
+        if iteration_cb:
+            await iteration_cb({
+                "type": "generation_complete",
+                "generation": self._generation,
+                "population_size": len(final_population),
+                "elite_count": len(elites),
+                "new_discovered": len(new_discovered),
+                "operator_stats": self._operator_registry.to_dict(),
+                "funnel": {
+                    "attempted": offspring_target,
+                    "eval_ok": funnel["eval_success"],
+                    "ic_pass": funnel["ic_pass"],
+                    "wf_overfit": funnel["wf_overfit"],
+                    "sharpe_fail": funnel["sharpe_fail"],
+                    "cpcv_candidates": len(cpcv_candidates),
+                },
+            })
+
+        return new_discovered
+
+    def _evaluate_batch_sync(
+        self,
+        all_children: list[tuple],
+        train_data: pl.DataFrame,
+        val_data: pl.DataFrame | None,
+        offspring_target: int,
+        funnel: dict,
+        t_phase0: float,
+        t_phase1: float,
+        t_phase2: float,
+    ) -> tuple[list, list, dict]:
+        """Phase 3: 배치 평가 + Walk-Forward + CPCV (CPU-bound, 별도 스레드에서 실행).
+
+        Returns (offspring, new_discovered, funnel)
+        """
+        import time as _time
+        from app.alpha.evaluator import compute_ic_series_batch
+        from app.alpha.interval import default_round_trip_cost, is_intraday
+
+        offspring: list[ScoredFactor] = []
+        new_discovered: list[DiscoveredFactor] = []
+        cpcv_candidates: list[ScoredFactor] = []
+
         _BATCH_SIZE = settings.ALPHA_EVAL_BATCH_SIZE
         _is_intraday = is_intraday(self._interval)
         _rtc = default_round_trip_cost(self._interval)
 
         for batch_start in range(0, len(all_children), _BATCH_SIZE):
             batch = all_children[batch_start:batch_start + _BATCH_SIZE]
-
-            if progress_cb:
-                pct = 30 + int(50 * batch_start / max(len(all_children), 1))
-                await progress_cb(
-                    pct, 100,
-                    f"세대 {self._generation}: 배치 평가 {batch_start}/{len(all_children)}"
-                )
 
             # Step 1: 배치 with_columns (유효 식만)
             valid_batch: list[tuple[int, tuple]] = []
@@ -418,7 +581,32 @@ class EvolutionEngine:
             if not valid_batch:
                 continue
 
-            # Step 2: 배치 with_columns (실패 시 per-factor 폴백)
+            # Step 2+3: 분봉/일봉 분기
+            if _is_intraday:
+                # 분봉: per-factor 개별 평가 (배치 with_columns 불필요 — 메모리 절약)
+                # 필요 컬럼만 선택해서 메모리 압축 (32컬럼 → 최소 컬럼)
+                _eval_cols = {"symbol", "dt", "open", "high", "low", "close", "volume", "fwd_return"}
+                for i, child_tuple in valid_batch:
+                    child_expr, op_name, parent, parent_ids = child_tuple
+                    # 수식에 필요한 피처 컬럼 추출 + 기본 컬럼만 선택
+                    try:
+                        needed = set(str(child_expr).replace("(", " ").replace(")", " ").replace(",", " ").split())
+                        needed = {c for c in needed if c in train_data.columns}
+                    except Exception:
+                        needed = set()
+                    select_cols = list((_eval_cols | needed) & set(train_data.columns))
+                    slim_data = train_data.select(select_cols)
+                    metrics = self._evaluate_on_data_full(child_expr, slim_data)
+                    del slim_data
+                    scored = self._build_scored_factor(
+                        child_expr, op_name, parent, parent_ids, metrics, funnel,
+                    )
+                    if scored is not None:
+                        offspring.append(scored)
+                    gc.collect()
+                continue
+
+            # 일봉: 배치 with_columns + 배치 IC (실패 시 per-factor 폴백)
             try:
                 df_batch = train_data.with_columns(factor_exprs)
             except Exception as e:
@@ -436,45 +624,38 @@ class EvolutionEngine:
                         offspring.append(scored)
                 continue
 
-            # Step 3: 분봉/일봉 분기
-            if _is_intraday:
-                for i, child_tuple in valid_batch:
-                    child_expr, op_name, parent, parent_ids = child_tuple
-                    metrics = self._evaluate_on_data_full(child_expr, train_data)
-                    scored = self._build_scored_factor(
-                        child_expr, op_name, parent, parent_ids, metrics, funnel,
-                    )
-                    if scored is not None:
-                        offspring.append(scored)
-            else:
-                # 배치 IC 계산 (실패 시 per-factor 폴백)
-                factor_cols = [f"_bf_{i}" for i, _ in valid_batch]
-                try:
-                    ic_dict = compute_ic_series_batch(df_batch, factor_cols)
-                except Exception as e:
-                    logger.warning("Batch IC failed: %s → per-factor fallback", e)
-                    ic_dict = {}
-                    for col in factor_cols:
-                        try:
-                            ic_dict[col] = compute_ic_series(df_batch, factor_col=col)
-                        except Exception:
-                            ic_dict[col] = []
+            # 배치 IC 계산 (실패 시 per-factor 폴백)
+            factor_cols = [f"_bf_{i}" for i, _ in valid_batch]
+            try:
+                ic_dict = compute_ic_series_batch(df_batch, factor_cols)
+            except Exception as e:
+                logger.warning("Batch IC failed: %s → per-factor fallback", e)
+                ic_dict = {}
+                for col in factor_cols:
+                    try:
+                        ic_dict[col] = compute_ic_series(df_batch, factor_col=col)
+                    except Exception:
+                        ic_dict[col] = []
 
-                for i, child_tuple in valid_batch:
-                    child_expr, op_name, parent, parent_ids = child_tuple
-                    col = f"_bf_{i}"
-                    ic_series = ic_dict.get(col, [])
-                    ls_returns = compute_quantile_returns(df_batch, factor_col=col)
-                    metrics = compute_factor_metrics(
-                        ic_series, ls_returns=ls_returns,
-                        annualize=252.0,
-                        round_trip_cost=_rtc,
-                    )
-                    scored = self._build_scored_factor(
-                        child_expr, op_name, parent, parent_ids, metrics, funnel,
-                    )
-                    if scored is not None:
-                        offspring.append(scored)
+            for i, child_tuple in valid_batch:
+                child_expr, op_name, parent, parent_ids = child_tuple
+                col = f"_bf_{i}"
+                ic_series = ic_dict.get(col, [])
+                ls_returns = compute_quantile_returns(df_batch, factor_col=col)
+                metrics = compute_factor_metrics(
+                    ic_series, ls_returns=ls_returns,
+                    annualize=252.0,
+                    round_trip_cost=_rtc,
+                )
+                scored = self._build_scored_factor(
+                    child_expr, op_name, parent, parent_ids, metrics, funnel,
+                )
+                if scored is not None:
+                    offspring.append(scored)
+
+            # 배치 완료 후 임시 DataFrame 해제 + GC
+            del df_batch
+            gc.collect()
 
         _t_phase3 = _time.perf_counter()
 
@@ -502,15 +683,12 @@ class EvolutionEngine:
 
                 cpcv_candidates.append(scored)
 
-        # 4c. CPCV 2단계 검증: top-K 후보만
+        # CPCV 2단계 검증: top-K 후보만
         if cpcv_candidates:
             from app.alpha.cpcv import cpcv_validate
 
             cpcv_candidates.sort(key=lambda c: c.fitness_composite, reverse=True)
             cpcv_top_k = min(20, len(cpcv_candidates))
-
-            if progress_cb:
-                await progress_cb(85, 100, f"세대 {self._generation}: CPCV 검증 {cpcv_top_k}개")
 
             for child in cpcv_candidates[:cpcv_top_k]:
                 cpcv_result = cpcv_validate(
@@ -564,58 +742,11 @@ class EvolutionEngine:
         logger.warning(
             "세대 %d 타이밍: 생성=%.1fs, LLM=%.1fs, 평가=%.1fs, 총=%.1fs",
             self._generation,
-            _t_phase1 - _t_phase0, _t_phase2 - _t_phase1,
-            _t_phase3 - _t_phase2, _t_phase3 - _t_phase0,
+            t_phase1 - t_phase0, t_phase2 - t_phase1,
+            _t_phase3 - t_phase2, _t_phase3 - t_phase0,
         )
 
-        # 5. 중복 제거
-        all_new = elites + offspring
-        all_new = self._deduplicate(all_new)
-
-        # 6. 모집단 크기 제한
-        all_new.sort(key=lambda f: f.fitness_composite, reverse=True)
-        final_population = all_new[:self._population_size]
-
-        # 6.5. 벡터 메모리에 경험 저장
-        if self._vector_memory and new_discovered:
-            for disc in new_discovered:
-                try:
-                    await self._vector_memory.add(
-                        db=self._db,
-                        expression_str=disc.expression_str,
-                        hypothesis=disc.hypothesis or "",
-                        ic_mean=disc.metrics.ic_mean if disc.metrics else 0.0,
-                        generation=self._generation,
-                        success=True,
-                    )
-                except Exception as e:
-                    logger.debug("Failed to save experience: %s", e)
-
-        # 7. DB 업데이트
-        await self._persist_population(final_population)
-
-        if progress_cb:
-            await progress_cb(100, 100, f"세대 {self._generation} 완료: {len(new_discovered)}개 발견")
-
-        if iteration_cb:
-            await iteration_cb({
-                "type": "generation_complete",
-                "generation": self._generation,
-                "population_size": len(final_population),
-                "elite_count": len(elites),
-                "new_discovered": len(new_discovered),
-                "operator_stats": self._operator_registry.to_dict(),
-                "funnel": {
-                    "attempted": offspring_target,
-                    "eval_ok": funnel["eval_success"],
-                    "ic_pass": funnel["ic_pass"],
-                    "wf_overfit": funnel["wf_overfit"],
-                    "sharpe_fail": funnel["sharpe_fail"],
-                    "cpcv_candidates": len(cpcv_candidates),
-                },
-            })
-
-        return new_discovered
+        return offspring, new_discovered, funnel
 
     def _select_elites(self, population: list[ScoredFactor]) -> list[ScoredFactor]:
         """상위 elite_pct% 개체를 엘리트로 보존."""
@@ -636,8 +767,8 @@ class EvolutionEngine:
         split_idx = int(len(date_list) * self._train_ratio)
         split_date = date_list[split_idx]
 
-        train = self._data.filter(pl.col("dt") <= split_date)
-        val = self._data.filter(pl.col("dt") > split_date)
+        train = self._data.filter(pl.col("dt") <= split_date).rechunk().shrink_to_fit()
+        val = self._data.filter(pl.col("dt") > split_date).rechunk().shrink_to_fit()
 
         return train, val if val.height > 0 else None
 

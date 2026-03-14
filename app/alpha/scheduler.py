@@ -80,7 +80,6 @@ class AlphaFactoryScheduler:
         ic_threshold: float | None = None,
         orthogonality_threshold: float = 0.7,
         enable_crossover: bool | None = None,
-        enable_causal: bool = False,
         max_cycles: int | None = None,
     ) -> bool:
         """스케줄러 시작. 이미 실행 중이면 False 반환."""
@@ -93,8 +92,14 @@ class AlphaFactoryScheduler:
             threshold = ic_threshold if ic_threshold is not None else settings.ALPHA_IC_THRESHOLD_PASS
             crossover = enable_crossover if enable_crossover is not None else settings.ALPHA_FACTORY_CROSSOVER_ENABLED
 
+            # 이전 상태에서 누적값 보존 (컨테이너 재시작/watchdog 복구 시)
+            prev_cycles = self._state.cycles_completed
+            prev_total = self._state.factors_discovered_total
+
             self._state = _FactoryState(
                 running=True,
+                cycles_completed=prev_cycles,
+                factors_discovered_total=prev_total,
                 started_at=datetime.utcnow().isoformat(),
                 config={
                     "context": context,
@@ -107,7 +112,6 @@ class AlphaFactoryScheduler:
                     "ic_threshold": threshold,
                     "orthogonality_threshold": orthogonality_threshold,
                     "enable_crossover": crossover,
-                    "enable_causal": enable_causal,
                     "max_cycles": max_cycles,
                 },
             )
@@ -157,6 +161,10 @@ class AlphaFactoryScheduler:
 
     def get_status(self) -> dict:
         """현재 상태 반환."""
+        # task가 죽었는데 running 플래그만 True인 좀비 상태 감지
+        if self._state.running and self._task and self._task.done():
+            self._state.running = False
+            logger.warning("Alpha factory task dead but running=True detected, resetting")
         return {
             "running": self._state.running,
             "cycles_completed": self._state.cycles_completed,
@@ -179,35 +187,41 @@ class AlphaFactoryScheduler:
         interval_seconds = config["interval_minutes"] * 60
         max_cycles = config.get("max_cycles")
 
-        while self._state.running:
-            try:
-                await self._run_cycle()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.exception("Alpha factory cycle failed: %s", e)
-                await manager.broadcast("alpha:factory", {
-                    "type": "cycle_error",
-                    "error": str(e)[:200],
-                })
-
-            if not self._state.running:
-                break
-
-            # max_cycles 도달 시 자동 중지
-            if max_cycles and self._state.cycles_completed >= max_cycles:
-                logger.info("Alpha factory reached max_cycles=%d, stopping", max_cycles)
-                self._state.running = False
-                break
-
-            if interval_seconds > 0:
+        try:
+            while self._state.running:
                 try:
-                    await asyncio.sleep(interval_seconds)
+                    await self._run_cycle()
                 except asyncio.CancelledError:
                     break
+                except Exception as e:
+                    logger.exception("Alpha factory cycle failed: %s", e)
+                    await manager.broadcast("alpha:factory", {
+                        "type": "cycle_error",
+                        "error": str(e)[:200],
+                    })
 
-        # 루프 종료 → 프론트에 알림
-        await manager.broadcast("alpha:factory", {"type": "factory_stopped"})
+                if not self._state.running:
+                    break
+
+                # max_cycles 도달 시 자동 중지
+                if max_cycles and self._state.cycles_completed >= max_cycles:
+                    logger.info("Alpha factory reached max_cycles=%d, stopping", max_cycles)
+                    self._state.running = False
+                    break
+
+                if interval_seconds > 0:
+                    try:
+                        await asyncio.sleep(interval_seconds)
+                    except asyncio.CancelledError:
+                        break
+        finally:
+            # 좀비 방지: 루프 종료 시 반드시 running=False
+            self._state.running = False
+            # 루프 종료 → 프론트에 알림
+            try:
+                await manager.broadcast("alpha:factory", {"type": "factory_stopped"})
+            except Exception:
+                pass
 
     async def _run_cycle(self) -> None:
         """단일 마이닝 사이클 실행."""
@@ -217,6 +231,7 @@ class AlphaFactoryScheduler:
         discovered: list[DiscoveredFactor] = []
         run_id: uuid.UUID | None = None
         _last_funnel: dict = {}  # 퍼널 데이터 (텔레그램 보고용)
+        _cycle_start = datetime.utcnow()  # 소요시간 측정용
 
         await manager.broadcast("alpha:factory", {
             "type": "cycle_start",
@@ -274,7 +289,11 @@ class AlphaFactoryScheduler:
 
                 async def iteration_cb(event: dict) -> None:
                     nonlocal _last_funnel  # 메서드 레벨 변수 참조
-                    if event.get("type") == "generation_complete":
+                    etype = event.get("type")
+                    if etype == "generation_start":
+                        self._state.population_size = event.get("population_size", 0)
+                        self._state.generation = event.get("generation", self._state.generation)
+                    elif etype == "generation_complete":
                         self._state.population_size = event.get("population_size", 0)
                         self._state.elite_count = event.get("elite_count", 0)
                         _last_funnel = event.get("funnel", {})
@@ -383,7 +402,7 @@ class AlphaFactoryScheduler:
                 cycle_num, len(discovered), self._state.factors_discovered_total,
             )
 
-            # 텔레그램 진행 보고 (5사이클마다 또는 팩터 발견 시)
+            # 텔레그램 진행 보고 (처음 3사이클, 5의 배수, 팩터 발견 시)
             try:
                 from app.telegram.bot import send_message as tg_send
 
@@ -395,26 +414,47 @@ class AlphaFactoryScheduler:
                 if should_report:
                     f = _last_funnel
                     total = self._state.factors_discovered_total
+                    gen = self._state.generation
+
+                    # 소요시간 계산
+                    elapsed = datetime.utcnow() - _cycle_start
+                    elapsed_min = int(elapsed.total_seconds() // 60)
+                    elapsed_sec = int(elapsed.total_seconds() % 60)
+                    elapsed_str = f"{elapsed_min}분 {elapsed_sec}초" if elapsed_min > 0 else f"{elapsed_sec}초"
 
                     # 상태 이모지
                     if len(discovered) >= 5:
-                        status_emoji = "🔥"
+                        status_emoji = "\U0001f525"  # fire
                     elif len(discovered) > 0:
-                        status_emoji = "✅"
+                        status_emoji = "\u2705"  # check
                     else:
-                        status_emoji = "🔍"
+                        status_emoji = "\U0001f50d"  # magnifier
 
-                    # 발견 팩터 요약 (있으면)
-                    factor_lines = ""
+                    # --- 헤더 ---
+                    msg = (
+                        f"{status_emoji} <b>마이닝 사이클 {cycle_num} 완료</b> ({elapsed_str} 소요)\n\n"
+                    )
+
+                    # --- 결과 ---
+                    msg += (
+                        f"\U0001f4ca <b>결과</b>\n"
+                        f"  이번 사이클: <b>{len(discovered)}개</b> 팩터 발견\n"
+                        f"  누적 발견: <b>{total}개</b>\n"
+                    )
+
+                    # --- 발견 팩터 상세 (있으면) ---
                     if discovered:
+                        msg += f"\n\U0001f3c6 <b>발견 팩터 (상위 3개)</b>\n"
                         top = sorted(discovered, key=lambda d: d.metrics.ic_mean if d.metrics else 0, reverse=True)[:3]
                         for i, d in enumerate(top, 1):
                             ic = d.metrics.ic_mean if d.metrics else 0
                             sh = d.metrics.sharpe if d.metrics else 0
-                            factor_lines += f"  {i}. <code>{d.expression_str[:40]}</code> (IC {ic:.3f}, Sharpe {sh:.1f})\n"
+                            msg += (
+                                f"  {i}. <code>{d.expression_str[:40]}</code>\n"
+                                f"     IC {ic:.3f} (예측력) / Sharpe {sh:.1f} (수익 안정성)\n"
+                            )
 
-                    # 퍼널 해설
-                    funnel_detail = ""
+                    # --- 진화 퍼널 상세 ---
                     if f:
                         attempted = f.get('attempted', 0)
                         eval_ok = f.get('eval_ok', 0)
@@ -426,25 +466,46 @@ class AlphaFactoryScheduler:
                         eval_pct = int(eval_ok / attempted * 100) if attempted else 0
                         ic_pct = int(ic_pass / max(eval_ok, 1) * 100)
 
-                        funnel_detail = (
-                            f"\n<b>진화 상세</b>\n"
-                            f"  후보 생성: {attempted}개 중 {eval_ok}개 유효 ({eval_pct}%)\n"
-                            f"  IC 기준 통과: {ic_pass}개 ({ic_pct}%)\n"
+                        msg += (
+                            f"\n\U0001f52c <b>진화 과정</b>\n"
+                            f"  후보 수식 생성: {attempted}개\n"
+                            f"  \u251c 계산 가능: {eval_ok}개 ({eval_pct}%)\n"
+                            f"  \u251c 수익 예측력(IC) 통과: {ic_pass}개 ({ic_pct}%)\n"
                         )
                         if wf_overfit > 0:
-                            funnel_detail += f"  과적합 탈락: {wf_overfit}개\n"
+                            msg += f"  \u251c 과적합 탈락: {wf_overfit}개\n"
                         if sharpe_fail > 0:
-                            funnel_detail += f"  Sharpe 미달: {sharpe_fail}개\n"
-                        funnel_detail += f"  최종 검증(CPCV) 통과: {cpcv_cands}개"
+                            msg += f"  \u251c Sharpe 미달: {sharpe_fail}개\n"
+                        msg += f"  \u2514 최종 검증 통과: {cpcv_cands}개\n"
+                    else:
+                        # 퍼널 데이터가 없어도 기본 정보 표시
+                        pop_size = self._state.population_size or settings.ALPHA_POPULATION_SIZE
+                        msg += (
+                            f"\n\U0001f52c <b>진화 과정</b>\n"
+                            f"  모집단 크기: {pop_size}개 수식\n"
+                            f"  (상세 퍼널 데이터 미수신)\n"
+                        )
 
-                    msg = (
-                        f"{status_emoji} <b>마이닝 사이클 {cycle_num} 완료</b>\n\n"
-                        f"이번 사이클: <b>{len(discovered)}개</b> 팩터 발견\n"
-                        f"누적 발견: <b>{total}개</b>\n"
-                    )
-                    if factor_lines:
-                        msg += f"\n<b>발견 팩터 (상위 3개)</b>\n{factor_lines}"
-                    msg += funnel_detail
+                    # --- 해석 ---
+                    if len(discovered) == 0:
+                        ic_thr = config.get("ic_threshold", 0.03)
+                        msg += (
+                            f"\n\U0001f4a1 <b>해석</b>\n"
+                            f"  수학 공식들로 주가 예측을 시도했지만,\n"
+                            f"  기준(IC>{ic_thr})을 넘는 공식이 없었습니다.\n"
+                            f"  세대가 쌓일수록 더 좋은 공식이 진화합니다.\n"
+                        )
+                    else:
+                        msg += (
+                            f"\n\U0001f4a1 <b>해석</b>\n"
+                            f"  IC = 주가 예측력 (0.03 이상이면 유의미)\n"
+                            f"  Sharpe = 수익 대비 위험 (1.0 이상이면 우수)\n"
+                        )
+
+                    # --- 설정 정보 ---
+                    universe_code = config.get("universe", "KOSPI200")
+                    data_interval = config.get("data_interval", "1d")
+                    msg += f"\n\u2699\ufe0f {universe_code} / {data_interval} / 세대 {gen}"
 
                     await tg_send(msg)
             except Exception as e:

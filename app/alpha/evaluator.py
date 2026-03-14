@@ -138,7 +138,7 @@ def compute_ic_series(
 # 배치 IC 계산 (EvolutionEngine 최적화용)
 # ---------------------------------------------------------------------------
 
-_BATCH_IC_CHUNK_SIZE = 50
+_BATCH_IC_CHUNK_SIZE = 5  # 5분봉 대규모 데이터 OOM 방지 (rank().over() 메모리 비례)
 
 
 def compute_ic_series_batch(

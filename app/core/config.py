@@ -43,8 +43,12 @@ class Settings(BaseSettings):
     # 실시간 데이터 소스 (true=개발용 시뮬레이터, false=키움 ZMQ 대기)
     USE_SIMULATOR: bool = False
 
-    # AI (Claude API for backtest strategy generation)
+    # AI — Anthropic (에이전트, 전략, 알파)
     ANTHROPIC_API_KEY: str = ""
+
+    # AI — Gemini (뉴스 감성분석 등 비용 민감 작업)
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3-flash-preview"
 
     # Agent (다중 턴 대화형 전략 수립)
     AGENT_SESSION_TTL_MINUTES: int = 30
@@ -74,7 +78,6 @@ class Settings(BaseSettings):
     ALPHA_PYSR_PARSIMONY: float = 0.03
 
     # Phase 2: Causal Inference
-    CAUSAL_AUTO_VALIDATE: bool = True
     CAUSAL_PLACEBO_THRESHOLD: float = 0.05
     CAUSAL_RANDOM_CAUSE_THRESHOLD: float = 0.05
     CAUSAL_NUM_SIMULATIONS: int = 20
@@ -100,7 +103,7 @@ class Settings(BaseSettings):
     ALPHA_LLM_MAX_CONCURRENT: int = 20       # LLM 동시 호출 수 (Tier 3 기준)
     ALPHA_LLM_RETRY_MAX: int = 2             # 429/timeout 최대 재시도
     ALPHA_LLM_RETRY_BASE_DELAY: float = 2.0  # 지수 백오프 기본 대기(초)
-    ALPHA_EVAL_BATCH_SIZE: int = 50           # 배치 평가 크기
+    ALPHA_EVAL_BATCH_SIZE: int = 5            # 배치 평가 크기 (5분봉 대규모 데이터 OOM 방지)
 
     # Phase 3: Alpha Factory
     ALPHA_FACTORY_AUTO_START: bool = False
@@ -119,13 +122,13 @@ class Settings(BaseSettings):
     SIMULATION_LLM_CALL_INTERVAL: int = 20
 
     # Phase 4: MCP Data Bus
-    MCP_ENABLED: bool = False
+    MCP_ENABLED: bool = True
     MCP_SSE_PORT: int = 8008
     MCP_MAX_ORDER_QTY: int = 1000
     MCP_HUMAN_APPROVAL_REAL: bool = True
 
     # Daily Scheduler (일일 배치 수집)
-    DAILY_SCHEDULER_ENABLED: bool = False
+    DAILY_SCHEDULER_ENABLED: bool = True
     DAILY_COLLECT_HOUR: int = 16
     DAILY_COLLECT_MINUTE: int = 30
     DAILY_PYKRX_THROTTLE_SEC: float = 1.0
@@ -135,11 +138,11 @@ class Settings(BaseSettings):
     TICK_ROTATION_INTERVAL_MIN: int = 10
 
     # Program Trading Collector (KIS 프로그램 매매 수집)
-    PGM_TRADING_ENABLED: bool = False
+    PGM_TRADING_ENABLED: bool = True
     PGM_TRADING_COLLECT_INTERVAL_MINUTES: int = 5
 
     # Workflow Orchestrator (일일 자동매매 워크플로우)
-    WORKFLOW_ENABLED: bool = False
+    WORKFLOW_ENABLED: bool = True
     WORKFLOW_TRADING_MODE: str = "paper"  # "paper" | "real"
     WORKFLOW_INITIAL_CAPITAL: float = 100_000_000
     WORKFLOW_MAX_POSITIONS: int = 10
@@ -165,8 +168,8 @@ class Settings(BaseSettings):
     WORKFLOW_FEEDBACK_RETIRE_DAYS: int = 30
     WORKFLOW_FEEDBACK_IC_DROP_THRESHOLD: float = 0.5
 
-    # Parameter Auto-Tuning (파라미터 자동 튜닝 — 기본 비활성)
-    WORKFLOW_PARAM_EVAL_ENABLED: bool = False
+    # Parameter Auto-Tuning (파라미터 자동 튜닝)
+    WORKFLOW_PARAM_EVAL_ENABLED: bool = True
     WORKFLOW_PARAM_EVAL_LOOKBACK_DAYS: int = 7
     WORKFLOW_PARAM_EVAL_MIN_TRADES: int = 20
     WORKFLOW_PARAM_EVAL_MIN_CONFIDENCE: float = 0.6
