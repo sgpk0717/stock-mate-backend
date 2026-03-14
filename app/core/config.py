@@ -74,23 +74,33 @@ class Settings(BaseSettings):
     ALPHA_PYSR_PARSIMONY: float = 0.03
 
     # Phase 2: Causal Inference
-    CAUSAL_AUTO_VALIDATE: bool = False
+    CAUSAL_AUTO_VALIDATE: bool = True
     CAUSAL_PLACEBO_THRESHOLD: float = 0.05
     CAUSAL_RANDOM_CAUSE_THRESHOLD: float = 0.05
-    CAUSAL_NUM_SIMULATIONS: int = 100
+    CAUSAL_NUM_SIMULATIONS: int = 20
+    CAUSAL_USE_FAST_ENGINE: bool = True  # NumPy 고속 엔진 (False → DoWhy 레거시)
 
     # Evolution Engine (진화형 팩토리)
     ALPHA_POPULATION_SIZE: int = 500
     ALPHA_ELITE_PCT: float = 0.05
     ALPHA_AST_MUTATION_RATIO: float = 0.92
     ALPHA_LLM_MUTATION_RATIO: float = 0.08
-    ALPHA_FITNESS_W_IC: float = 0.40
-    ALPHA_FITNESS_W_ICIR: float = 0.30
-    ALPHA_FITNESS_W_TURNOVER: float = 0.15
+    ALPHA_FITNESS_W_IC: float = 0.30
+    ALPHA_FITNESS_W_ICIR: float = 0.20
+    ALPHA_FITNESS_W_SHARPE: float = 0.20
+    ALPHA_FITNESS_W_MDD: float = 0.05
+    ALPHA_FITNESS_W_TURNOVER: float = 0.10
     ALPHA_FITNESS_W_COMPLEXITY: float = 0.15
+    ALPHA_SHARPE_THRESHOLD: float = 0.3  # discovered 최소 Sharpe 기준
     ALPHA_MAX_TREE_DEPTH: int = 10
     ALPHA_MAX_TREE_SIZE: int = 30
     ALPHA_TOURNAMENT_K: int = 5
+
+    # Evolution Engine 병렬화
+    ALPHA_LLM_MAX_CONCURRENT: int = 20       # LLM 동시 호출 수 (Tier 3 기준)
+    ALPHA_LLM_RETRY_MAX: int = 2             # 429/timeout 최대 재시도
+    ALPHA_LLM_RETRY_BASE_DELAY: float = 2.0  # 지수 백오프 기본 대기(초)
+    ALPHA_EVAL_BATCH_SIZE: int = 50           # 배치 평가 크기
 
     # Phase 3: Alpha Factory
     ALPHA_FACTORY_AUTO_START: bool = False
@@ -99,6 +109,10 @@ class Settings(BaseSettings):
     ALPHA_FACTORY_CROSSOVER_ENABLED: bool = True
     ALPHA_FACTORY_TOURNAMENT_K: int = 3
     ALPHA_FACTORY_ORTHOGONALITY_THRESHOLD: float = 0.7
+    ALPHA_FACTORY_MAX_CYCLES: int = 10  # 야간 마이닝 최대 사이클 수 (API 비용 예산)
+
+    # Backtest
+    BACKTEST_TIMEOUT_SECONDS: int = 1800  # 30분
 
     # Phase 4: Simulation (ABM)
     SIMULATION_DEFAULT_STEPS: int = 1000
@@ -109,6 +123,73 @@ class Settings(BaseSettings):
     MCP_SSE_PORT: int = 8008
     MCP_MAX_ORDER_QTY: int = 1000
     MCP_HUMAN_APPROVAL_REAL: bool = True
+
+    # Daily Scheduler (일일 배치 수집)
+    DAILY_SCHEDULER_ENABLED: bool = False
+    DAILY_COLLECT_HOUR: int = 16
+    DAILY_COLLECT_MINUTE: int = 30
+    DAILY_PYKRX_THROTTLE_SEC: float = 1.0
+    DAILY_NEWS_TOP_N: int = 200
+    TICK_ROTATION_SCHEDULE_FILE: str = "tick_rotation_schedule.json"
+    TICK_ROTATION_BATCH_SIZE: int = 200
+    TICK_ROTATION_INTERVAL_MIN: int = 10
+
+    # Program Trading Collector (KIS 프로그램 매매 수집)
+    PGM_TRADING_ENABLED: bool = False
+    PGM_TRADING_COLLECT_INTERVAL_MINUTES: int = 5
+
+    # Workflow Orchestrator (일일 자동매매 워크플로우)
+    WORKFLOW_ENABLED: bool = False
+    WORKFLOW_TRADING_MODE: str = "paper"  # "paper" | "real"
+    WORKFLOW_INITIAL_CAPITAL: float = 100_000_000
+    WORKFLOW_MAX_POSITIONS: int = 10
+    WORKFLOW_STOP_LOSS_PCT: float = 5.0
+    WORKFLOW_MAX_DRAWDOWN_PCT: float = 10.0
+    WORKFLOW_UNIVERSE: str = "KOSPI200"
+    WORKFLOW_MIN_FACTOR_SHARPE: float = 0.3
+    WORKFLOW_MIN_FACTOR_IC: float = 0.03
+    WORKFLOW_REQUIRE_CAUSAL: bool = False
+    WORKFLOW_FACTOR_MAX_AGE_DAYS: int = 30
+    WORKFLOW_DATA_INTERVAL: str = "5m"  # 분봉 단타 (1m/3m/5m)
+
+    # AutoSelector 가중치 (6요소 — 설계서 §8.2)
+    WORKFLOW_SCORE_W_IC: float = 0.25
+    WORKFLOW_SCORE_W_SHARPE: float = 0.20
+    WORKFLOW_SCORE_W_ICIR: float = 0.15
+    WORKFLOW_SCORE_W_MDD: float = 0.15
+    WORKFLOW_SCORE_W_CAUSAL: float = 0.15
+    WORKFLOW_SCORE_W_RECENCY: float = 0.10
+
+    # Feedback Loop (피드백 루프)
+    WORKFLOW_FEEDBACK_STALE_DAYS: int = 7
+    WORKFLOW_FEEDBACK_RETIRE_DAYS: int = 30
+    WORKFLOW_FEEDBACK_IC_DROP_THRESHOLD: float = 0.5
+
+    # Parameter Auto-Tuning (파라미터 자동 튜닝 — 기본 비활성)
+    WORKFLOW_PARAM_EVAL_ENABLED: bool = False
+    WORKFLOW_PARAM_EVAL_LOOKBACK_DAYS: int = 7
+    WORKFLOW_PARAM_EVAL_MIN_TRADES: int = 20
+    WORKFLOW_PARAM_EVAL_MIN_CONFIDENCE: float = 0.6
+
+    # Divergence Detector (팩터 라이브-백테스트 다이버전스 자동 감지)
+    WORKFLOW_DIVERGENCE_CHECK_ENABLED: bool = True
+    WORKFLOW_DIVERGENCE_HALT_THRESHOLD: float = -10.0   # 누적 pnl% 자동 정지
+    WORKFLOW_DIVERGENCE_WARN_THRESHOLD: float = -5.0    # 누적 pnl% 경고
+    WORKFLOW_DIVERGENCE_MIN_DAYS: int = 2               # 최소 실매매 일수
+
+    # Telegram (OpenClaw 독립 알림용 폴백)
+    TELEGRAM_BOT_TOKEN: str = ""
+    TELEGRAM_CHAT_ID: str = ""
+
+    # OpenClaw
+    OPENCLAW_HEALTH_URL: str = "http://host.docker.internal:18789/health"
+    OPENCLAW_MAX_MEMORY_MB: int = 2048
+
+    # Worker Mode ("inline" | "external" | "worker")
+    # inline: 기존 동작 (팩토리+인과검증 API 내 실행)
+    # external: API는 DB 경유 위임 (REST만 서빙)
+    # worker: 워커 프로세스 (팩토리+인과검증 실행, 명령큐 소비)
+    WORKER_MODE: str = "inline"
 
     # CORS
     CORS_ORIGINS: list[str] = ["*"]

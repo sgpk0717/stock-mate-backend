@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import async_session
 from app.core.stock_master import load_stock_cache
-from app.routers import accounts, agents, alpha, backtest, health, mcp, news, orders, paper, positions, sector, simulation, stocks, trading, ws
+from app.routers import accounts, agents, alpha, backtest, health, mcp, news, orders, paper, positions, scheduler, sector, simulation, stocks, trading, workflow, ws
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -49,8 +49,8 @@ async def lifespan(app: FastAPI):
         zmq_sub.on_message(handle_zmq_message)
         tasks.append(asyncio.create_task(zmq_sub.start()))
 
-    # Phase 3: 알파 팩토리 자동 시작
-    if settings.ALPHA_FACTORY_AUTO_START:
+    # Phase 3: 알파 팩토리 자동 시작 (inline 모드에서만)
+    if settings.ALPHA_FACTORY_AUTO_START and settings.WORKER_MODE == "inline":
         from app.alpha.scheduler import get_scheduler
 
         factory = get_scheduler()
@@ -62,24 +62,86 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Alpha factory auto-started")
 
+    # Daily Scheduler (일일 배치 수집)
+    if settings.DAILY_SCHEDULER_ENABLED:
+        from app.scheduler.daily_scheduler import get_daily_scheduler
+
+        daily = get_daily_scheduler()
+        await daily.start()
+        logger.info("Daily scheduler auto-started")
+
+    # 프로그램 매매 수집기
+    if settings.PGM_TRADING_ENABLED:
+        from app.services.program_trading_collector import start_collector
+
+        tasks.append(asyncio.create_task(start_collector()))
+        logger.info("Program trading collector started")
+
+    # 인과 검증 스케줄러 (1시간 주기, 미검증 상위 30% 팩터) — inline 모드에서만
+    if settings.CAUSAL_AUTO_VALIDATE and settings.WORKER_MODE == "inline":
+        from app.alpha.causal_scheduler import start_causal_scheduler
+
+        tasks.append(start_causal_scheduler())
+        logger.info("Causal validation scheduler started (1h interval)")
+
+    # TradingContext DB 복원
+    from app.trading.context import load_active_contexts_from_db
+    await load_active_contexts_from_db()
+
+    # 활성 매매 세션 복구 (C2: 서버 재시작 시 LiveSession 자동 재개)
+    from app.trading.live_runner import restore_sessions_from_db
+    restored = await restore_sessions_from_db()
+    if restored:
+        logger.info("활성 매매 세션 %d개 복구됨", restored)
+
+    # 워크플로우 오케스트레이터
+    if settings.WORKFLOW_ENABLED:
+        from app.workflow.orchestrator import get_orchestrator
+        wf = get_orchestrator()
+        await wf.setup_scheduler()
+        logger.info("Workflow orchestrator started (APScheduler)")
+
     # Phase 4: MCP 서버 시작
     if settings.MCP_ENABLED:
         from app.mcp.bridge import start_mcp_server
 
         await start_mcp_server()
 
+    # Telegram Bot (명령어 핸들러 + 인라인 키보드)
+    from app.telegram.bot import start_bot as start_telegram_bot
+    await start_telegram_bot()
+
     yield
 
     # Shutdown
-    # Phase 3: 알파 팩토리 중지
-    try:
-        from app.alpha.scheduler import get_scheduler as _get_scheduler
+    # 워크플로우 스케줄러 중지
+    if settings.WORKFLOW_ENABLED:
+        try:
+            from app.workflow.orchestrator import get_orchestrator as _get_wf
+            await _get_wf().shutdown_scheduler()
+        except Exception as e:
+            logger.warning("Workflow scheduler stop failed: %s", e)
 
-        factory = _get_scheduler()
-        if factory.get_status()["running"]:
-            await factory.stop()
+    # Phase 3: 알파 팩토리 중지 (inline 모드에서만 직접 중지)
+    if settings.WORKER_MODE == "inline":
+        try:
+            from app.alpha.scheduler import get_scheduler as _get_scheduler
+
+            factory = _get_scheduler()
+            if factory.get_status()["running"]:
+                await factory.stop()
+        except Exception as e:
+            logger.warning("Alpha factory stop failed during shutdown: %s", e)
+
+    # Daily Scheduler 중지
+    try:
+        from app.scheduler.daily_scheduler import get_daily_scheduler as _get_daily
+
+        daily = _get_daily()
+        if daily.get_status()["running"]:
+            await daily.stop()
     except Exception as e:
-        logger.warning("Alpha factory stop failed during shutdown: %s", e)
+        logger.warning("Daily scheduler stop failed during shutdown: %s", e)
 
     # Phase 4: MCP 서버 중지
     try:
@@ -88,6 +150,28 @@ async def lifespan(app: FastAPI):
         await stop_mcp_server()
     except Exception as e:
         logger.warning("MCP server stop failed during shutdown: %s", e)
+
+    # Telegram Bot 중지
+    try:
+        from app.telegram.bot import stop_bot as stop_telegram_bot
+        await stop_telegram_bot()
+    except Exception as e:
+        logger.warning("Telegram bot stop failed: %s", e)
+
+    # 인과 검증 스케줄러 중지 (inline 모드에서만)
+    if settings.WORKER_MODE == "inline":
+        try:
+            from app.alpha.causal_scheduler import stop_causal_scheduler
+
+            stop_causal_scheduler()
+        except Exception as e:
+            logger.warning("Causal scheduler stop failed: %s", e)
+
+    # 프로그램 매매 수집기 중지
+    if settings.PGM_TRADING_ENABLED:
+        from app.services.program_trading_collector import stop_collector
+
+        stop_collector()
 
     await stop_writer()
 
@@ -131,6 +215,8 @@ app.include_router(sector.router)
 app.include_router(trading.router)
 app.include_router(simulation.router)
 app.include_router(mcp.router)
+app.include_router(scheduler.router)
+app.include_router(workflow.router)
 
 
 @app.get("/")

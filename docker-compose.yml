@@ -6,6 +6,7 @@ services:
     container_name: stockmate-api
     ports:
       - "${PORT:-8007}:8007"
+      - "${MCP_SSE_PORT:-8009}:${MCP_SSE_PORT:-8009}"
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -16,9 +17,50 @@ services:
       - USE_SIMULATOR=${USE_SIMULATOR:-false}
       - ZMQ_HOST=host.docker.internal
       - ZMQ_PORT=${ZMQ_PORT:-5555}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KIS_APP_KEY=${KIS_APP_KEY:-}
+      - KIS_APP_SECRET=${KIS_APP_SECRET:-}
+      - KIS_ACCOUNT_NO=${KIS_ACCOUNT_NO:-}
+      - DART_API_KEY=${DART_API_KEY:-}
+      - WORKFLOW_ENABLED=${WORKFLOW_ENABLED:-false}
+      - WORKFLOW_TRADING_MODE=${WORKFLOW_TRADING_MODE:-paper}
+      - WORKFLOW_DATA_INTERVAL=${WORKFLOW_DATA_INTERVAL:-5m}
+      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_SSE_PORT=${MCP_SSE_PORT:-8009}
+      - PGM_TRADING_ENABLED=${PGM_TRADING_ENABLED:-false}
+      - PGM_TRADING_COLLECT_INTERVAL_MINUTES=${PGM_TRADING_COLLECT_INTERVAL_MINUTES:-5}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - WORKER_MODE=${WORKER_MODE:-inline}
     volumes:
       - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stockmate-worker
+    profiles: [worker]
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-stockmate}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
+      - POSTGRES_DB=${POSTGRES_DB:-stockmate}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - WORKER_MODE=worker
+      - ALPHA_FACTORY_AUTO_START=${ALPHA_FACTORY_AUTO_START:-false}
+      - CAUSAL_AUTO_VALIDATE=${CAUSAL_AUTO_VALIDATE:-true}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - .:/app
+    command: python worker.py
     depends_on:
       postgres:
         condition: service_healthy
