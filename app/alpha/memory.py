@@ -68,6 +68,7 @@ class ExperienceVectorMemory:
     def __init__(self) -> None:
         self._cache: list[CachedExperience] = []
         self._embeddings: np.ndarray | None = None  # shape (N, 768)
+        self._pending_embeddings: list[np.ndarray] = []  # lazy rebuild용
 
     async def load_cache(self, db: AsyncSession) -> None:
         """DB에서 모든 경험을 메모리로 로드."""
@@ -96,6 +97,7 @@ class ExperienceVectorMemory:
             )
             embeddings_list.append(exp.embedding)
 
+        self._pending_embeddings.clear()
         if embeddings_list:
             self._embeddings = np.array(embeddings_list, dtype=np.float32)
         else:
@@ -117,6 +119,7 @@ class ExperienceVectorMemory:
         success: bool,
         factor_id: uuid.UUID | None = None,
         parent_ids: list[str] | None = None,
+        failure_reason: str | None = None,
     ) -> None:
         """경험을 DB에 저장하고 인메모리 캐시를 업데이트."""
         text = f"{hypothesis} {expression_str}"
@@ -131,6 +134,7 @@ class ExperienceVectorMemory:
             success=success,
             generation=generation,
             parent_ids=parent_ids,
+            failure_reason=failure_reason,
         )
         db.add(exp)
         await db.flush()
@@ -152,10 +156,18 @@ class ExperienceVectorMemory:
         self._cache.append(cached)
 
         emb_arr = np.array(embedding, dtype=np.float32).reshape(1, -1)
+        self._pending_embeddings.append(emb_arr)
+
+    def _rebuild_embeddings_if_needed(self) -> None:
+        """pending embeddings를 메인 배열에 병합."""
+        if not self._pending_embeddings:
+            return
+        parts: list[np.ndarray] = []
         if self._embeddings is not None:
-            self._embeddings = np.vstack([self._embeddings, emb_arr])
-        else:
-            self._embeddings = emb_arr
+            parts.append(self._embeddings)
+        parts.extend(self._pending_embeddings)
+        self._embeddings = np.vstack(parts)
+        self._pending_embeddings.clear()
 
     def retrieve_similar(
         self,
@@ -164,6 +176,7 @@ class ExperienceVectorMemory:
         success_only: bool | None = None,
     ) -> list[CachedExperience]:
         """코사인 유사도 기반으로 유사 경험을 검색."""
+        self._rebuild_embeddings_if_needed()
         if not self._cache or self._embeddings is None:
             return []
 
@@ -203,6 +216,7 @@ class ExperienceVectorMemory:
 
         cos_sim < threshold이면 True (직교적).
         """
+        self._rebuild_embeddings_if_needed()
         if not self._cache or self._embeddings is None:
             return True
 

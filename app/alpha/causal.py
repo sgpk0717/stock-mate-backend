@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as t_dist
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,44 @@ DAG_EDGES = [
 
 
 _MIN_SAMPLES = 100  # 6변수 선형회귀에 최소 100개 (≈ 변수당 15-17개)
+
+# 교란변수 + 처리변수 컬럼 순서 (OLS 디자인 행렬)
+_CONFOUNDER_COLS = ["market_return", "market_volatility", "base_rate", "sector_id"]
+
+
+def _fast_ols(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """NumPy 고속 OLS — β 계수와 p-value를 반환.
+
+    statsmodels OLS.fit()과 수학적으로 동일한 연산을 수행하되,
+    불필요한 진단 통계 계산과 Python 객체 생성 오버헤드를 제거한다.
+
+    Parameters
+    ----------
+    X : (n, k) 디자인 행렬 (절편 포함)
+    y : (n,) 종속변수
+
+    Returns
+    -------
+    beta : (k,) 회귀 계수
+    p_values : (k,) 양측 t-검정 p-value
+    """
+    n, k = X.shape
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    residuals = y - X @ beta
+    dof = n - k
+    if dof <= 0:
+        return beta, np.ones(k)
+    mse = np.dot(residuals, residuals) / dof
+    try:
+        XtX_inv = np.linalg.inv(X.T @ X)
+    except np.linalg.LinAlgError:
+        XtX_inv = np.linalg.pinv(X.T @ X)
+    var_beta = mse * XtX_inv
+    se = np.sqrt(np.maximum(np.diag(var_beta), 0.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_stats = np.where(se > 0, beta / se, 0.0)
+    p_values = 2.0 * (1.0 - t_dist.cdf(np.abs(t_stats), df=dof))
+    return beta, p_values
 
 
 def _sanitize(value: float, default: float = 0.0) -> float:
@@ -121,6 +160,8 @@ class CausalValidationResult:
     regime_ate_first_half: float = 0.0
     regime_ate_second_half: float = 0.0
     dag_edges: list[dict] = field(default_factory=lambda: list(DAG_EDGES))
+    # H4: 실패 분류 (PASSED, LOW_IC, CONFOUNDED, FRAGILE, REGIME_SHIFT)
+    failure_type: str = "PASSED"
 
 
 class FactorMirageFilter:
@@ -131,10 +172,12 @@ class FactorMirageFilter:
         placebo_threshold: float = 0.05,
         random_cause_threshold: float = 0.05,
         num_simulations: int = 100,
+        use_fast_engine: bool = True,
     ):
         self.placebo_threshold = placebo_threshold
         self.random_cause_threshold = random_cause_threshold
         self.num_simulations = num_simulations
+        self.use_fast_engine = use_fast_engine
 
     def validate(
         self,
@@ -168,7 +211,9 @@ class FactorMirageFilter:
             )
 
         try:
-            return self._run_dowhy(factor_values, forward_returns, confounders_df)
+            if self.use_fast_engine:
+                return self._run_fast(factor_values, forward_returns, confounders_df)
+            return self._run_dowhy_legacy(factor_values, forward_returns, confounders_df)
         except Exception as e:
             logger.exception("Causal validation failed: %s", e)
             return CausalValidationResult(
@@ -254,13 +299,13 @@ class FactorMirageFilter:
         )
         return passed, ate_first, ate_second
 
-    def _run_dowhy(
+    def _run_dowhy_legacy(
         self,
         factor_values: np.ndarray,
         forward_returns: np.ndarray,
         confounders_df: pd.DataFrame,
     ) -> CausalValidationResult:
-        """DoWhy 4단계 인과 검증 실행."""
+        """DoWhy 4단계 인과 검증 — 레거시 (폴백용 보존)."""
         import dowhy
 
         n = min(len(factor_values), len(forward_returns), len(confounders_df))
@@ -372,9 +417,21 @@ class FactorMirageFilter:
 
         is_robust = placebo_passed and random_passed and regime_passed
 
+        # H4: 실패 분류
+        if is_robust:
+            failure_type = "PASSED"
+        elif not placebo_passed:
+            failure_type = "CONFOUNDED"
+        elif not random_passed:
+            failure_type = "FRAGILE"
+        elif not regime_passed:
+            failure_type = "REGIME_SHIFT"
+        else:
+            failure_type = "LOW_IC"
+
         logger.info(
             "Causal validation: ATE=%.6f, p=%.4f, placebo=%.6f(%s), "
-            "random_delta=%.6f(%s), regime=%s(%.6f/%.6f) → %s",
+            "random_delta=%.6f(%s), regime=%s(%.6f/%.6f) → %s [%s]",
             ate, p_value, placebo_effect,
             "PASS" if placebo_passed else "FAIL",
             random_delta,
@@ -382,6 +439,7 @@ class FactorMirageFilter:
             "PASS" if regime_passed else "FAIL",
             ate_first, ate_second,
             "ROBUST" if is_robust else "MIRAGE",
+            failure_type,
         )
 
         return CausalValidationResult(
@@ -395,4 +453,182 @@ class FactorMirageFilter:
             regime_shift_passed=regime_passed,
             regime_ate_first_half=ate_first,
             regime_ate_second_half=ate_second,
+            failure_type=failure_type,
         )
+
+    # ── Fast Engine (NumPy 직접 구현) ───────────────────────────
+
+    def _run_fast(
+        self,
+        factor_values: np.ndarray,
+        forward_returns: np.ndarray,
+        confounders_df: pd.DataFrame,
+    ) -> CausalValidationResult:
+        """NumPy 고속 인과 검증 — DoWhy와 수학적으로 동일한 연산.
+
+        statsmodels/DoWhy 객체 생성 오버헤드를 제거하고,
+        동일한 OLS 회귀 + 플라시보/랜덤원인/체제변화 검증을 수행한다.
+        """
+        n = min(len(factor_values), len(forward_returns), len(confounders_df))
+        if n < _MIN_SAMPLES:
+            logger.warning(
+                "Insufficient data for causal validation: %d rows (min %d)",
+                n, _MIN_SAMPLES,
+            )
+            return CausalValidationResult(
+                is_causally_robust=False,
+                causal_effect_size=0.0,
+                p_value=1.0,
+                placebo_passed=False,
+                placebo_effect=0.0,
+                random_cause_passed=False,
+                random_cause_delta=0.0,
+            )
+
+        # 데이터 통합 DataFrame 구축 (기존 _run_dowhy와 동일)
+        data = confounders_df.iloc[:n].copy().reset_index(drop=True)
+        data["alpha_factor"] = factor_values[:n]
+        data["forward_return"] = forward_returns[:n]
+
+        if "sector_id" not in data.columns:
+            data["sector_id"] = 0
+
+        required_cols = [*_CONFOUNDER_COLS, "alpha_factor", "forward_return"]
+        data = data.dropna(subset=required_cols)
+
+        if "dt" in data.columns:
+            data = data.drop(columns=["dt"])
+
+        if len(data) < _MIN_SAMPLES:
+            logger.warning(
+                "Insufficient clean data for causal validation: %d rows (min %d)",
+                len(data), _MIN_SAMPLES,
+            )
+            return CausalValidationResult(
+                is_causally_robust=False,
+                causal_effect_size=0.0,
+                p_value=1.0,
+                placebo_passed=False,
+                placebo_effect=0.0,
+                random_cause_passed=False,
+                random_cause_delta=0.0,
+            )
+
+        # NumPy 배열 추출
+        y = data["forward_return"].values.astype(np.float64)
+        X_conf = data[_CONFOUNDER_COLS].values.astype(np.float64)
+        treatment = data["alpha_factor"].values.astype(np.float64)
+
+        # 절편 + 교란변수 행렬 (모든 검증에서 재사용)
+        ones = np.ones((len(y), 1))
+        X_base = np.column_stack([ones, X_conf])  # (n, 5)
+        X_full = np.column_stack([X_base, treatment])  # (n, 6)
+
+        # ── Step 3: ATE 추정 (backdoor linear regression) ──
+        beta, p_values = _fast_ols(X_full, y)
+        ate = _sanitize(float(beta[-1]))
+        p_value = _sanitize(float(p_values[-1]), default=1.0)
+
+        # ── Step 4a: 플라시보 검증 (treatment 셔플) ──
+        placebo_effects = np.empty(self.num_simulations)
+        for i in range(self.num_simulations):
+            perm_treatment = np.random.permutation(treatment)
+            X_perm = np.column_stack([X_base, perm_treatment])
+            beta_perm, _ = _fast_ols(X_perm, y)
+            placebo_effects[i] = beta_perm[-1]
+        placebo_effect = _sanitize(float(np.mean(placebo_effects)))
+        placebo_passed = abs(placebo_effect) < self.placebo_threshold
+
+        # ── Step 4b: 랜덤 원인 검증 (랜덤 교란변수 추가) ──
+        random_effects = np.empty(self.num_simulations)
+        for i in range(self.num_simulations):
+            random_confounder = np.random.normal(size=len(y))
+            X_random = np.column_stack([X_full, random_confounder])
+            beta_random, _ = _fast_ols(X_random, y)
+            # treatment는 인덱스 5 (마지막에서 두 번째)
+            random_effects[i] = beta_random[-2]
+        random_effect = _sanitize(float(np.mean(random_effects)))
+        random_delta = abs(random_effect - ate)
+        random_passed = random_delta < self.random_cause_threshold
+
+        # ── Step 5: 체제 변화 검증 (전반/후반 ATE 부호 일관성) ──
+        regime_passed, ate_first, ate_second = self._fast_regime_split(
+            X_base, treatment, y,
+        )
+
+        is_robust = placebo_passed and random_passed and regime_passed
+
+        # 실패 분류
+        if is_robust:
+            failure_type = "PASSED"
+        elif not placebo_passed:
+            failure_type = "CONFOUNDED"
+        elif not random_passed:
+            failure_type = "FRAGILE"
+        elif not regime_passed:
+            failure_type = "REGIME_SHIFT"
+        else:
+            failure_type = "LOW_IC"
+
+        logger.info(
+            "Causal validation [fast]: ATE=%.6f, p=%.4f, placebo=%.6f(%s), "
+            "random_delta=%.6f(%s), regime=%s(%.6f/%.6f) → %s [%s]",
+            ate, p_value, placebo_effect,
+            "PASS" if placebo_passed else "FAIL",
+            random_delta,
+            "PASS" if random_passed else "FAIL",
+            "PASS" if regime_passed else "FAIL",
+            ate_first, ate_second,
+            "ROBUST" if is_robust else "MIRAGE",
+            failure_type,
+        )
+
+        return CausalValidationResult(
+            is_causally_robust=is_robust,
+            causal_effect_size=ate,
+            p_value=p_value,
+            placebo_passed=placebo_passed,
+            placebo_effect=placebo_effect,
+            random_cause_passed=random_passed,
+            random_cause_delta=random_delta,
+            regime_shift_passed=regime_passed,
+            regime_ate_first_half=ate_first,
+            regime_ate_second_half=ate_second,
+            failure_type=failure_type,
+        )
+
+    @staticmethod
+    def _fast_regime_split(
+        X_base: np.ndarray,
+        treatment: np.ndarray,
+        y: np.ndarray,
+    ) -> tuple[bool, float, float]:
+        """데이터를 전반/후반으로 분할하여 ATE 부호 일관성을 검증한다."""
+        mid = len(y) // 2
+        if mid < _MIN_SAMPLES:
+            logger.warning(
+                "Insufficient data for regime split: %d rows (need %d per half)",
+                len(y), _MIN_SAMPLES,
+            )
+            return True, 0.0, 0.0
+
+        # 전반부
+        X_first = np.column_stack([X_base[:mid], treatment[:mid]])
+        beta_first, _ = _fast_ols(X_first, y[:mid])
+        ate_first = _sanitize(float(beta_first[-1]))
+
+        # 후반부
+        X_second = np.column_stack([X_base[mid:], treatment[mid:]])
+        beta_second, _ = _fast_ols(X_second, y[mid:])
+        ate_second = _sanitize(float(beta_second[-1]))
+
+        if abs(ate_first) < 1e-8 or abs(ate_second) < 1e-8:
+            passed = True
+        else:
+            passed = (ate_first > 0) == (ate_second > 0)
+
+        logger.info(
+            "Regime split [fast]: ATE_first=%.6f, ATE_second=%.6f → %s",
+            ate_first, ate_second, "PASS" if passed else "FAIL",
+        )
+        return passed, ate_first, ate_second
