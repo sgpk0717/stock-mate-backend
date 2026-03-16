@@ -678,6 +678,7 @@ class DailyWorkflowOrchestrator:
                 run.review_summary = {"status": "error", "error": str(e)}
 
             # FeedbackEngine으로 mining_context 생성 (기존 외부 피드백 보존)
+            adj_result = None  # 텔레그램 보고용
             try:
                 from app.workflow.feedback_engine import FeedbackEngine
                 engine = FeedbackEngine()
@@ -701,6 +702,7 @@ class DailyWorkflowOrchestrator:
                         )
                     except Exception as e:
                         logger.warning("ParameterAdjuster 실행 실패: %s", e)
+                        adj_result = {"applied": [], "skipped": [], "error": str(e)}
 
                 # 구조화된 마이닝 프롬프트 생성
                 structured_context = engine.format_mining_prompt(structured_feedback)
@@ -755,6 +757,40 @@ class DailyWorkflowOrchestrator:
             await self._set_step(session, run, "review", "completed")
             await self._log_event(session, run, "review_complete", "리뷰 + 피드백 완료")
             await session.commit()
+
+        # 텔레그램: 일일 리뷰 종합 보고
+        try:
+            from app.telegram.bot import send_message as tg_send
+
+            trade_count = run.trade_count or 0
+            pnl_pct = run.pnl_pct or 0.0
+            pnl_emoji = "\U0001f4c8" if pnl_pct >= 0 else "\U0001f4c9"
+
+            tg_msg = (
+                f"\U0001f4cb <b>일일 리뷰 완료</b> ({run.date})\n\n"
+                f"{pnl_emoji} 매매: {trade_count}건, 손익 {pnl_pct:+.2f}%\n"
+            )
+
+            # 파라미터 조정 결과
+            if adj_result and adj_result.get("applied"):
+                tg_msg += f"\n\U0001f4d0 <b>파라미터 자동 조정</b>\n"
+                for a in adj_result["applied"]:
+                    tg_msg += (
+                        f"  \u2705 {a['param']}: {a['old_value']} \u2192 {a['new_value']} "
+                        f"({a['assessment']}, 신뢰도 {a['confidence']:.0%})\n"
+                    )
+                for s in (adj_result.get("skipped") or []):
+                    tg_msg += f"  \u23ed {s['param']}: 변경 없음 ({s['reason']})\n"
+            elif adj_result and adj_result.get("error"):
+                tg_msg += f"\n\u26a0\ufe0f 파라미터 조정 실패: {adj_result['error'][:100]}\n"
+            elif adj_result:
+                tg_msg += f"\n\U0001f4d0 파라미터 조정: 변경 불필요 (전 항목 적정)\n"
+            elif not settings.WORKFLOW_PARAM_EVAL_ENABLED:
+                tg_msg += f"\nℹ\ufe0f 파라미터 자동 조정: 비활성 상태\n"
+
+            await tg_send(tg_msg, category="review_report", caller="workflow.orchestrator")
+        except Exception as e:
+            logger.debug("리뷰 텔레그램 보고 실패: %s", e)
 
         # 리뷰 완료 → 즉시 마이닝 시작 (18:00까지 기다리지 않음)
         try:

@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import settings
 from app.workflow.feedback_types import ParameterAssessment
@@ -134,6 +135,7 @@ class ParameterAdjuster:
                 param_adj[a["param"]] = a["new_value"]
             config["param_adjustments"] = param_adj
             run.config = config
+            flag_modified(run, "config")  # SQLAlchemy JSON 필드 변경 감지
 
             # 감사 로그
             event = WorkflowEvent(
