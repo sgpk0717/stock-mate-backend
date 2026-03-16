@@ -142,7 +142,6 @@ class AlphaFactoryStartRequest(BaseModel):
     ic_threshold: float = Field(0.03, ge=0.0, le=1.0)
     orthogonality_threshold: float = Field(0.7, ge=0.0, le=1.0)
     enable_crossover: bool = True
-    enable_causal: bool = False
     max_cycles: int | None = Field(None, ge=1, le=1000)
 
 
@@ -160,6 +159,7 @@ class AlphaFactoryStatusResponse(BaseModel):
     generation: int = 0
     operator_stats: dict | None = None
     last_funnel: dict | None = None
+    user_stopped: bool = False
 
 
 class CompositeFactorBuildRequest(BaseModel):
