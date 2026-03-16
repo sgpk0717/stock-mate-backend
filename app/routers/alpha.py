@@ -324,35 +324,36 @@ async def backtest_with_factor(
     # symbols가 비어 있으면 마이닝 유니버스에서 가져옴
     symbols = data.symbols if data.symbols else None
     if not symbols:
-        if not run_config or not run_config.get("universe"):
-            raise HTTPException(
-                400,
-                "종목 리스트가 비어 있고, 마이닝 run에 유니버스 설정이 없습니다. "
-                "symbols를 직접 지정해 주세요.",
-            )
+        universe_code = None
+        if run_config and run_config.get("universe"):
+            universe_code = run_config["universe"]
+        else:
+            # mining_run_id 없는 팩터 (진화 모집단 등): 기본 유니버스 폴백
+            universe_code = "KOSPI200"
+            logger.info("팩터 백테스트: mining_run 없음, 기본 유니버스 KOSPI200 사용")
 
         from app.alpha.universe import Universe, resolve_universe
 
-        symbols = await resolve_universe(Universe(run_config["universe"]))
+        symbols = await resolve_universe(Universe(universe_code))
         if not symbols:
             raise HTTPException(
                 500,
-                f"유니버스 '{run_config['universe']}' 리졸브 결과가 비어 있습니다.",
+                f"유니버스 '{universe_code}' 리졸브 결과가 비어 있습니다.",
             )
         logger.info(
-            "팩터 백테스트: 마이닝 유니버스 '%s' 사용 (%d종목)",
-            run_config["universe"],
+            "팩터 백테스트: 유니버스 '%s' 사용 (%d종목)",
+            universe_code,
             len(symbols),
         )
 
-    # 날짜 범위: 요청값 → 마이닝 config 폴백
+    # 날짜 범위: 요청값 → 마이닝 config 폴백 → 기본값 (최근 1년)
     start_str = data.start_date or (run_config.get("start_date") if run_config else None)
     end_str = data.end_date or (run_config.get("end_date") if run_config else None)
     if not start_str or not end_str:
-        raise HTTPException(
-            400,
-            "백테스트 날짜 범위가 지정되지 않았고 마이닝 run에도 날짜 설정이 없습니다.",
-        )
+        from datetime import timedelta
+        end_str = end_str or date.today().isoformat()
+        start_str = start_str or (date.today() - timedelta(days=365)).isoformat()
+        logger.info("팩터 백테스트: 날짜 범위 미지정, 기본값 사용 (%s ~ %s)", start_str, end_str)
 
     from app.backtest.cost_model import CostConfig, default_cost_config
     from app.backtest.models import BacktestRun
@@ -525,7 +526,6 @@ async def start_factory(data: AlphaFactoryStartRequest):
         ic_threshold=data.ic_threshold,
         orthogonality_threshold=data.orthogonality_threshold,
         enable_crossover=data.enable_crossover,
-        enable_causal=data.enable_causal,
         max_cycles=data.max_cycles,
     )
 
@@ -593,6 +593,7 @@ async def build_composite(
         sharpe=result.metrics.sharpe,
         max_drawdown=result.metrics.max_drawdown,
         status="discovered",
+        interval=data.interval if hasattr(data, "interval") else "1d",
     )
     db.add(composite)
     await db.commit()
