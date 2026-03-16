@@ -95,6 +95,12 @@ async def send_message(
     caller: str = "",
 ) -> dict | None:
     """메시지 전송 + DB 로깅."""
+    # KST 타임스탬프 자동 추가
+    from datetime import datetime, timezone, timedelta
+    _KST = timezone(timedelta(hours=9))
+    _ts = datetime.now(_KST).strftime("[%Y-%m-%d %H:%M:%S KST]")
+    text = f"{_ts}\n{text}"
+
     cid = chat_id or settings.TELEGRAM_CHAT_ID
     if not cid:
         await _log_message(category, caller, text, "", "skipped", "chat_id 없음")
