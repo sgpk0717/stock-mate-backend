@@ -93,6 +93,7 @@ class EvolutionEngine:
         self._generation = generation
         self._train_ratio = train_ratio
         self._interval = interval
+        self._current_run_id: str | None = None  # scheduler에서 설정
 
         # 데이터 전처리
         self._data = ensure_alpha_features(self._data)
@@ -227,14 +228,19 @@ class EvolutionEngine:
 
         # 3. Train/Val 분할
         train_data, val_data = self._split_train_val()
-        logger.info("세대 %d: Train/Val 분할 완료 (train=%d, val=%s)", self._generation, train_data.height, val_data.height if val_data is not None else "None")
+        logger.info("세대 %d: Train/Val 분할 완료 (train=%d×%d, val=%s)", self._generation, train_data.height, train_data.width, val_data.height if val_data is not None else "None")
 
-        # 3.5. fwd_return 사전 계산 (일봉: 팩터와 무관, 1회만 계산)
-        from app.alpha.interval import is_intraday
-        if not is_intraday(self._interval):
-            train_data = compute_forward_returns(train_data, periods=1)
-            if val_data is not None:
-                val_data = compute_forward_returns(val_data, periods=1)
+        # CPCV 검증에 전체 데이터가 필요하므로 참조 보존
+        full_data = self._data
+
+        # train/val 복사 완료 → 원본 해제 (scheduler._cached_data도 None이므로 참조 0 → GC 대상)
+        self._data = None  # type: ignore[assignment]
+        gc.collect()
+
+        # 3.5. fwd_return 사전 계산 (팩터와 무관, 1회만 계산)
+        train_data = compute_forward_returns(train_data, periods=1)
+        if val_data is not None:
+            val_data = compute_forward_returns(val_data, periods=1)
 
         # 4. 진화 3-Phase 파이프라인
         import time as _time
@@ -428,6 +434,7 @@ class EvolutionEngine:
             all_children, train_data, val_data,
             offspring_target, funnel,
             _t_phase0, _t_phase1, _t_phase2,
+            full_data,
         )
 
         logger.info("세대 %d: Phase 3 to_thread 완료 — offspring %d개", self._generation, len(offspring))
@@ -470,7 +477,7 @@ class EvolutionEngine:
                 "total_evaluated": len(offspring),
                 "ic_pass_count": len(ic_passed),
                 "ic_threshold": self._ic_threshold,
-                "cpcv_candidates": len(cpcv_candidates),
+                "cpcv_candidates": funnel.get("cpcv_candidates", 0),
                 "discovered_count": len(new_discovered),
                 "top_samples": top_samples,
                 "fail_samples": fail_samples,
@@ -528,7 +535,7 @@ class EvolutionEngine:
                     "ic_pass": funnel["ic_pass"],
                     "wf_overfit": funnel["wf_overfit"],
                     "sharpe_fail": funnel["sharpe_fail"],
-                    "cpcv_candidates": len(cpcv_candidates),
+                    "cpcv_candidates": funnel.get("cpcv_candidates", 0),
                 },
             })
 
@@ -544,6 +551,7 @@ class EvolutionEngine:
         t_phase0: float,
         t_phase1: float,
         t_phase2: float,
+        full_data: pl.DataFrame | None = None,
     ) -> tuple[list, list, dict]:
         """Phase 3: 배치 평가 + Walk-Forward + CPCV (CPU-bound, 별도 스레드에서 실행).
 
@@ -586,12 +594,18 @@ class EvolutionEngine:
                 # 분봉: per-factor 개별 평가 (배치 with_columns 불필요 — 메모리 절약)
                 # 필요 컬럼만 선택해서 메모리 압축 (32컬럼 → 최소 컬럼)
                 _eval_cols = {"symbol", "dt", "open", "high", "low", "close", "volume", "fwd_return"}
-                for i, child_tuple in valid_batch:
+                for idx, (i, child_tuple) in enumerate(valid_batch):
                     child_expr, op_name, parent, parent_ids = child_tuple
-                    # 수식에 필요한 피처 컬럼 추출 + 기본 컬럼만 선택
+                    # 수식에 필요한 피처 컬럼 추출 (SymPy 변수명 → Polars 컬럼명 변환)
                     try:
-                        needed = set(str(child_expr).replace("(", " ").replace(")", " ").replace(",", " ").split())
-                        needed = {c for c in needed if c in train_data.columns}
+                        from app.alpha.ast_converter import _ALL_VARIABLES
+                        sym_names = {str(s) for s in child_expr.free_symbols}
+                        # SymPy 변수명을 Polars 컬럼명으로 변환 (e.g. earnings_per_share → eps)
+                        needed = set()
+                        for name in sym_names:
+                            col = _ALL_VARIABLES.get(name, name)
+                            needed.add(col)
+                        needed &= set(train_data.columns)
                     except Exception:
                         needed = set()
                     select_cols = list((_eval_cols | needed) & set(train_data.columns))
@@ -603,7 +617,10 @@ class EvolutionEngine:
                     )
                     if scored is not None:
                         offspring.append(scored)
+                    # 메모리 회수: GC + OS에 회수 시간 부여
                     gc.collect()
+                    if idx % 3 == 2:
+                        _time.sleep(0.2)
                 continue
 
             # 일봉: 배치 with_columns + 배치 IC (실패 시 per-factor 폴백)
@@ -692,7 +709,7 @@ class EvolutionEngine:
 
             for child in cpcv_candidates[:cpcv_top_k]:
                 cpcv_result = cpcv_validate(
-                    self._data, child.expression,
+                    full_data, child.expression,
                     ic_threshold=self._ic_threshold,
                 )
                 if cpcv_result.passed:
@@ -727,6 +744,9 @@ class EvolutionEngine:
                         cpcv_result.mean_ic, cpcv_result.pbo,
                     )
 
+        # cpcv_candidates 수를 funnel에 기록 (run_generation의 iteration_cb에서 참조)
+        funnel["cpcv_candidates"] = len(cpcv_candidates)
+
         # 퍼널 + 타이밍 로그
         sharpe_pass = funnel["ic_pass"] - funnel["wf_overfit"] - funnel["sharpe_fail"]
         logger.warning(
@@ -746,6 +766,7 @@ class EvolutionEngine:
             _t_phase3 - t_phase2, _t_phase3 - t_phase0,
         )
 
+        del full_data
         return offspring, new_discovered, funnel
 
     def _select_elites(self, population: list[ScoredFactor]) -> list[ScoredFactor]:
@@ -1215,15 +1236,21 @@ class EvolutionEngine:
         """수식의 전체 메트릭 계산 (evaluate_factor()와 동일한 방법론)."""
         try:
             polars_expr = sympy_to_polars(expr)
-            df = data.with_columns(polars_expr.alias("alpha_factor"))
 
             from app.alpha.interval import default_round_trip_cost, is_intraday
 
             if is_intraday(self._interval):
                 from app.alpha.evaluator import _collapse_to_daily
+                # with_columns + select 체이닝: 큰 중간 DataFrame 방지
+                df = (
+                    data.with_columns(polars_expr.alias("alpha_factor"))
+                    .select(["symbol", "dt", "close", "alpha_factor"])
+                )
+                del data  # 호출자의 slim_data 참조 해제 촉진
                 df = _collapse_to_daily(df, factor_col="alpha_factor")
                 df = df.drop_nulls(subset=["alpha_factor", "fwd_return"])
             else:
+                df = data.with_columns(polars_expr.alias("alpha_factor"))
                 if "fwd_return" not in df.columns:
                     df = compute_forward_returns(df, periods=1)
                 df = df.filter(
@@ -1244,7 +1271,9 @@ class EvolutionEngine:
                 round_trip_cost=default_round_trip_cost(self._interval),
             )
         except Exception as e:
-            logger.debug("Evaluation failed: %s", e)
+            if self._eval_fail_logged < 5:
+                logger.warning("Evaluation failed (sample %d/5): %s: %s", self._eval_fail_logged + 1, type(e).__name__, e)
+                self._eval_fail_logged += 1
             return None
 
     def _deduplicate(self, population: list[ScoredFactor]) -> list[ScoredFactor]:
@@ -1291,11 +1320,13 @@ class EvolutionEngine:
                         max_drawdown=factor.max_drawdown,
                         is_elite=is_elite_now,
                         birth_generation=factor.generation,
+                        interval=self._interval,
                     )
                 )
             else:
                 # 신규 팩터 삽입
                 new_factor = AlphaFactor(
+                    mining_run_id=uuid.UUID(self._current_run_id) if self._current_run_id else None,
                     name=f"evo_g{self._generation}",
                     expression_str=factor.expression_str,
                     expression_sympy=str(factor.expression),
@@ -1317,6 +1348,7 @@ class EvolutionEngine:
                     is_elite=is_elite_now,
                     birth_generation=self._generation,
                     status="population",
+                    interval=self._interval,
                     parent_ids=factor.parent_ids if factor.parent_ids else None,
                 )
                 self._db.add(new_factor)

@@ -140,6 +140,7 @@ class Settings(BaseSettings):
     # Program Trading Collector (KIS 프로그램 매매 수집)
     PGM_TRADING_ENABLED: bool = True
     PGM_TRADING_COLLECT_INTERVAL_MINUTES: int = 5
+    PGM_TRADING_SYMBOLS_LIMIT: int = 200  # 수집 대상 종목 수 (시총 상위)
 
     # Workflow Orchestrator (일일 자동매매 워크플로우)
     WORKFLOW_ENABLED: bool = True
