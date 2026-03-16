@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Generic, TypeVar
 
 from fastapi import APIRouter, Query
@@ -148,37 +148,49 @@ async def _count_query(session: Any, table: str, where: str, params: dict) -> in
 
 @router.get("/collection-status", response_model=list[CollectionStatusItem])
 async def collection_status():
-    """6개 테이블의 데이터 수집 현황."""
-    queries: list[tuple[str, str, str]] = [
-        ("stock_candles_1d", "일봉 캔들",
-         "SELECT COUNT(*), MIN(dt), MAX(dt), MAX(collected_at) FROM stock_candles WHERE interval = '1d'"),
-        ("stock_candles_1m", "분봉 캔들",
-         "SELECT COUNT(*), MIN(dt), MAX(dt), MAX(collected_at) FROM stock_candles WHERE interval = '1m'"),
-        ("investor_trading", "투자자별 매매동향",
-         "SELECT COUNT(*), MIN(dt), MAX(dt), MAX(collected_at) FROM investor_trading"),
-        ("margin_short_daily", "신용잔고/공매도",
-         "SELECT COUNT(*), MIN(dt), MAX(dt), MAX(collected_at) FROM margin_short_daily"),
-        ("dart_financials", "DART 재무",
-         "SELECT COUNT(*), MIN(disclosure_date), MAX(disclosure_date), MAX(collected_at) FROM dart_financials"),
-        ("program_trading", "프로그램 매매",
-         "SELECT COUNT(*), MIN(dt), MAX(dt), MAX(collected_at) FROM program_trading"),
-        ("news_articles", "뉴스 기사",
-         "SELECT COUNT(*), MIN(published_at), MAX(published_at), MAX(created_at) FROM news_articles"),
-    ]
-    items: list[CollectionStatusItem] = []
+    """7개 테이블의 데이터 수집 현황 (UNION ALL 단일 쿼리)."""
+    sql = """
+    SELECT 'stock_candles_1d' AS tbl, '일봉 캔들' AS disp,
+           COUNT(*), MIN(dt), MAX(dt), MAX(collected_at)
+    FROM stock_candles WHERE interval = '1d'
+    UNION ALL
+    SELECT 'stock_candles_1m', '분봉 캔들',
+           COUNT(*), MIN(dt), MAX(dt), MAX(collected_at)
+    FROM stock_candles WHERE interval = '1m'
+    UNION ALL
+    SELECT 'investor_trading', '투자자별 매매동향',
+           COUNT(*), MIN(dt), MAX(dt), MAX(collected_at)
+    FROM investor_trading
+    UNION ALL
+    SELECT 'margin_short_daily', '신용잔고/공매도',
+           COUNT(*), MIN(dt), MAX(dt), MAX(collected_at)
+    FROM margin_short_daily
+    UNION ALL
+    SELECT 'dart_financials', 'DART 재무',
+           COUNT(*), MIN(disclosure_date), MAX(disclosure_date), MAX(collected_at)
+    FROM dart_financials
+    UNION ALL
+    SELECT 'program_trading', '프로그램 매매',
+           COUNT(*), MIN(dt), MAX(dt), MAX(collected_at)
+    FROM program_trading
+    UNION ALL
+    SELECT 'news_articles', '뉴스 기사',
+           COUNT(*), MIN(published_at), MAX(published_at), MAX(created_at)
+    FROM news_articles
+    """
     async with async_session() as session:
-        for table_name, display_name, sql in queries:
-            result = await session.execute(text(sql))
-            row = result.fetchone()
-            total_rows = row[0] if row and row[0] else 0
-            items.append(CollectionStatusItem(
-                table_name=table_name, display_name=display_name,
-                total_rows=total_rows,
-                earliest_date=_fmt_date(row[1]) if row else None,
-                latest_date=_fmt_date(row[2]) if row else None,
-                last_collected_at=_fmt_date(row[3]) if row else None,
-            ))
-    return items
+        result = await session.execute(text(sql))
+        rows = result.fetchall()
+
+    return [
+        CollectionStatusItem(
+            table_name=r[0], display_name=r[1],
+            total_rows=r[2] or 0,
+            earliest_date=_fmt_date(r[3]),
+            latest_date=_fmt_date(r[4]),
+            last_collected_at=_fmt_date(r[5]),
+        ) for r in rows
+    ]
 
 
 @router.get("/investor-trading")
@@ -196,10 +208,10 @@ async def get_investor_trading(
         params["symbol"] = symbol
     if start:
         clauses.append("t.dt >= :start")
-        params["start"] = start.isoformat()
+        params["start"] = start
     if end:
         clauses.append("t.dt <= :end")
-        params["end"] = end.isoformat()
+        params["end"] = end
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     offset = page * limit
@@ -246,10 +258,10 @@ async def get_margin_short(
         params["symbol"] = symbol
     if start:
         clauses.append("t.dt >= :start")
-        params["start"] = start.isoformat()
+        params["start"] = start
     if end:
         clauses.append("t.dt <= :end")
-        params["end"] = end.isoformat()
+        params["end"] = end
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     offset = page * limit
@@ -335,11 +347,12 @@ async def get_program_trading(
         clauses.append("t.symbol = :symbol")
         params["symbol"] = symbol
     if start:
+        # program_trading.dt는 DateTime → 날짜 범위를 timestamp으로 변환 (인덱스 활용)
         clauses.append("t.dt >= :start")
-        params["start"] = start.isoformat()
+        params["start"] = start
     if end:
-        clauses.append("t.dt <= :end")
-        params["end"] = end.isoformat()
+        clauses.append("t.dt < :end_next")
+        params["end_next"] = end + timedelta(days=1)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     offset = page * limit
@@ -371,14 +384,24 @@ async def get_program_trading(
 @router.get("/news")
 async def get_news(
     symbol: str | None = Query(None),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
     page: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ) -> PagedResponse[NewsExplorerRow]:
     clauses: list[str] = []
     params: dict = {}
     if symbol:
-        clauses.append("n.symbols::text LIKE :sym_like")
-        params["sym_like"] = f"%{symbol}%"
+        # symbols는 JSON 배열 → JSONB 캐스팅 + GIN 인덱스(@> 연산자) 활용
+        clauses.append("n.symbols::jsonb @> :sym_json::jsonb")
+        params["sym_json"] = json.dumps([symbol])
+    if start:
+        # published_at은 DateTime → 범위 비교로 인덱스 활용
+        clauses.append("n.published_at >= :start")
+        params["start"] = start
+    if end:
+        clauses.append("n.published_at < :end_next")
+        params["end_next"] = end + timedelta(days=1)
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     offset = page * limit
@@ -387,17 +410,20 @@ async def get_news(
 
     async with async_session() as session:
         total = await _count_query(session, "news_articles n", where, {k: v for k, v in params.items() if k not in ("limit", "offset")})
-        name_result = await session.execute(text("SELECT symbol, name FROM stock_masters"))
-        name_map: dict[str, str] = {r[0]: r[1] for r in name_result.fetchall()}
 
         sql = (
             f"SELECT n.id, n.symbols, n.source, n.title, n.url, n.published_at, "
             f"n.sentiment_score, n.market_impact "
-            f"FROM news_articles n {where} "
+            f"FROM news_articles n "
+            f"{where} "
             f"ORDER BY n.published_at DESC LIMIT :limit OFFSET :offset"
         )
         result = await session.execute(text(sql), params)
         rows = result.fetchall()
+
+        # stock_masters 이름 캐시 (한 번만 조회)
+        name_result = await session.execute(text("SELECT symbol, name FROM stock_masters"))
+        name_map: dict[str, str] = {r[0]: r[1] for r in name_result.fetchall()}
 
     items: list[NewsExplorerRow] = []
     for r in rows:
@@ -417,7 +443,6 @@ async def get_news(
             source=r[2], title=r[3], url=r[4],
             published_at=_fmt_date(r[5]), sentiment_score=r[6], market_impact=r[7],
         ))
-
     return PagedResponse(items=items, total=total, page=page, limit=limit)
 
 

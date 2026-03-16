@@ -799,7 +799,6 @@ async def start_alpha_mining(
     data_interval: str = "5m",
     max_cycles: int = 10,
     interval_minutes: int = 0,
-    enable_causal: bool = True,
 ) -> str:
     """알파 팩토리 마이닝을 시작한다. 이미 실행 중이면 현재 상태를 반환한다.
 
@@ -809,7 +808,6 @@ async def start_alpha_mining(
         data_interval: 데이터 간격 (1d, 5m, 1h 등)
         max_cycles: 최대 사이클 수 (0이면 무제한)
         interval_minutes: 사이클 간 대기(분) (0이면 연속 실행)
-        enable_causal: 발견 후 인과검증 자동 실행 여부
     """
     start_ms = time.monotonic()
     params = {
@@ -818,7 +816,6 @@ async def start_alpha_mining(
         "data_interval": data_interval,
         "max_cycles": max_cycles,
         "interval_minutes": interval_minutes,
-        "enable_causal": enable_causal,
     }
 
     from app.alpha.factory_client import get_factory_client
@@ -854,7 +851,6 @@ async def start_alpha_mining(
         end_date=end_date.isoformat(),
         data_interval=data_interval,
         interval_minutes=interval_minutes,
-        enable_causal=enable_causal,
         max_cycles=max_cycles if max_cycles > 0 else None,
     )
     started = fc_result["started"]
@@ -873,7 +869,6 @@ async def start_alpha_mining(
                 "end_date": end_date.isoformat(),
                 "max_cycles": max_cycles,
                 "interval_minutes": interval_minutes,
-                "enable_causal": enable_causal,
             },
         }
         await audit_log(

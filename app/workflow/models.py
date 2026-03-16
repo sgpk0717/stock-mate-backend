@@ -168,6 +168,9 @@ class WorkflowRun(Base):
     pnl_amount: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
 
+    # 단계별 수행 상태 (중복 실행/누락 감지)
+    step_status: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # 마이닝 컨텍스트
     mining_context: Mapped[str | None] = mapped_column(Text, nullable=True)
 

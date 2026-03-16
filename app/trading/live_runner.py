@@ -299,21 +299,24 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
     today = date_cls.today()
     today_str = today.strftime("%Y%m%d")
 
-    # DB에 오늘 해당 interval 캔들이 있는지 빠르게 체크
+    # DB에 최근 1분봉이 있는지 체크 (장중 지속 수집 보장)
     try:
         from app.core.database import async_session
         from sqlalchemy import text
+        now_kst = datetime.now(KST)
+        # 최근 10분 이내 데이터가 있으면 충분 (장중 지속 수집)
+        recent_cutoff = now_kst - timedelta(minutes=10)
         async with async_session() as db:
             row = await db.execute(
                 text(
-                    "SELECT count(*) FROM stock_candles "
-                    "WHERE interval = :iv AND dt >= :start"
+                    "SELECT count(DISTINCT symbol) FROM stock_candles "
+                    "WHERE interval = '1m' AND dt >= :cutoff"
                 ),
-                {"iv": interval, "start": datetime.combine(today, datetime.min.time()).replace(tzinfo=KST)},
+                {"cutoff": recent_cutoff.replace(tzinfo=None)},
             )
-            cnt = row.scalar() or 0
-            if cnt > 0:
-                return 0  # 이미 존재
+            recent_sym_count = row.scalar() or 0
+            if recent_sym_count >= len(symbols) // 4:
+                return 0  # 최근 데이터 충분
     except Exception as e:
         logger.warning("당일 캔들 존재 체크 실패: %s", e)
         return 0
@@ -333,7 +336,7 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
         now_kst = datetime.now(KST)
         hour_str = now_kst.strftime("%H%M%S")
 
-        for symbol in symbols[:50]:  # rate limit 고려, 최대 50종목
+        for symbol in symbols:  # Token Bucket(15req/s)이 rate limit 관리
             try:
                 raw_candles, _, _ = await client.get_minute_candles(
                     symbol, today_str, hour_str,
@@ -362,16 +365,10 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
                 if not one_min:
                     continue
 
-                # 리샘플링 (1m → interval_min 분봉)
-                if interval_min == 1:
-                    resampled = one_min
-                else:
-                    resampled = _resample_candles(one_min, interval_min)
-
-                # DB 저장
+                # 1분봉 원본을 DB에 저장 (load_candles가 1m → Nm 리샘플링하므로)
                 from app.services.candle_writer import write_candles_bulk
-                await write_candles_bulk(symbol, resampled, interval)
-                total_written += len(resampled)
+                await write_candles_bulk(symbol, one_min, "1m")
+                total_written += len(one_min)
 
             except Exception as e:
                 logger.warning("KIS 분봉 수집 실패 (%s): %s", symbol, e)
@@ -459,10 +456,9 @@ async def _paper_loop_tick(
     """
     from datetime import date, timedelta
 
-    # 종목 리스트 결정
+    # 종목 리스트 결정 (보유 종목 + 유니버스 전체)
     universe = ctx.symbols or []
-    scan_limit = max(ctx.max_positions * 5, 50)
-    scan_symbols = list(set(list(session.positions.keys()) + universe[:scan_limit]))
+    scan_symbols = list(set(list(session.positions.keys()) + universe))
 
     if not scan_symbols:
         return
@@ -496,14 +492,13 @@ async def _paper_loop_tick(
 
     last_dt = getattr(session, "_last_processed_dt", None)
 
-    # 오늘 장 시작 시각 (09:00 KST) — 오늘 봉만 추출하기 위한 기준
-    from datetime import time as time_type, timezone as tz
-    KST = tz(timedelta(hours=9))
-    today_market_open = datetime.combine(end, time_type(9, 0), tzinfo=KST)
+    # 오늘 장 시작 시각 (09:00 KST, naive) — DB의 dt가 KST naive이므로 맞춤
+    from datetime import time as time_type
+    today_market_open = datetime.combine(end, time_type(9, 0))
 
     logger.info(
-        "paper_tick: 캔들 로딩 완료 (height=%d, interval=%s, symbols=%d, market_open=%s)",
-        df.height, interval, len(scan_symbols), today_market_open.isoformat(),
+        "paper_tick: 캔들 로딩 완료 (height=%d, interval=%s, symbols=%d)",
+        df.height, interval, len(scan_symbols),
     )
 
     # 종목별로 시그널 생성 → 오늘 장중 봉 추출
@@ -530,17 +525,18 @@ async def _paper_loop_tick(
 
         if last_dt is None:
             # 첫 호출: 오늘 장 시작 이후 모든 봉을 워크스루
-            # (5분봉 ~78봉, 1분봉 ~390봉)
             rows = []
             for r in all_rows:
                 dt_val = r.get("dt")
                 if dt_val is None:
                     continue
-                # naive datetime이면 UTC로 간주
-                if hasattr(dt_val, "tzinfo") and dt_val.tzinfo is None:
-                    dt_val = dt_val.replace(tzinfo=tz(timedelta(0)))
-                if dt_val >= today_market_open:
-                    rows.append(r)
+                try:
+                    if dt_val >= today_market_open:
+                        rows.append(r)
+                except TypeError:
+                    # 타입 불일치 시 문자열 비교 폴백
+                    if str(dt_val) >= str(today_market_open):
+                        rows.append(r)
         else:
             # 이후 호출: 마지막 처리 봉 이후 새 봉만
             rows = [
@@ -552,6 +548,7 @@ async def _paper_loop_tick(
             sym_frames[sym] = rows
         else:
             _no_today += 1
+            pass
 
     if not sym_frames:
         logger.info(
@@ -1143,6 +1140,10 @@ def _log_trade(
     # DB 영속화 (fire-and-forget — 실패해도 메모리 로그는 보존)
     asyncio.create_task(_persist_trade(session.context.id, entry))
 
+    # 텔레그램 알림 (fire-and-forget — 매매 성능에 영향 없음)
+    if result.get("success"):
+        asyncio.create_task(_send_trade_telegram(entry))
+
     logger.info(
         "매매 기록: %s %s %s %d주 @ %s — %s (%s)%s",
         side, symbol, step, qty, f"{price:,.0f}",
@@ -1196,6 +1197,87 @@ async def _persist_trade(context_id: str, entry: dict) -> None:
             await db.commit()
     except Exception as e:
         logger.warning("LiveTrade DB 저장 실패: %s", e)
+
+
+async def _send_trade_telegram(entry: dict) -> None:
+    """매매 체결 텔레그램 알림 (fire-and-forget)."""
+    try:
+        from app.telegram.bot import send_message
+
+        symbol = entry.get("symbol", "")
+        name = entry.get("name", symbol)
+        side = entry.get("side", "")
+        step = entry.get("step", "")
+        qty = entry.get("qty", 0)
+        price = entry.get("price", 0)
+        total = round(price * qty, 0)
+        ts = entry.get("timestamp", "")
+        reason = entry.get("reason", "")
+
+        if side == "BUY":
+            sizing = entry.get("sizing") or {}
+            cash_before = sizing.get("cash_before", 0)
+            cash_after = cash_before - total if cash_before else 0
+            alloc_pct = sizing.get("position_size_pct", 0) * 100
+
+            msg = (
+                f"\U0001f4c8 <b>매수</b> | {name} ({symbol})\n"
+                f"  수량: {qty:,}주 @ {price:,.0f}원\n"
+                f"  총액: {total:,.0f}원\n"
+            )
+            if alloc_pct:
+                msg += f"  배분: 자본의 {alloc_pct:.0f}%"
+                if cash_before:
+                    msg += f" (현금 {cash_before:,.0f} \u2192 {cash_after:,.0f})"
+                msg += "\n"
+            if reason:
+                msg += f"  사유: {reason[:80]}\n"
+            msg += f"  시각: {ts[:19]}"
+
+        elif side == "SELL":
+            pnl_pct = entry.get("pnl_pct")
+            pnl_amount = entry.get("pnl_amount")
+            holding = entry.get("holding_minutes")
+            pos_ctx = entry.get("position_context") or {}
+            avg_price = pos_ctx.get("avg_price", 0)
+
+            step_label = ""
+            if step == "S-STOP":
+                step_label = " [손절]"
+            elif step == "S-TRAIL":
+                step_label = " [트레일링]"
+            elif step == "S-HALF":
+                step_label = " [부분익절]"
+
+            pnl_emoji = "\U0001f534" if (pnl_pct or 0) < 0 else "\U0001f7e2"
+
+            msg = (
+                f"\U0001f4c9 <b>매도</b> | {name} ({symbol}){step_label}\n"
+                f"  수량: {qty:,}주 @ {price:,.0f}원\n"
+                f"  총액: {total:,.0f}원\n"
+            )
+            if pnl_pct is not None:
+                msg += f"  {pnl_emoji} PnL: {pnl_pct:+.2f}%"
+                if pnl_amount is not None:
+                    msg += f" ({pnl_amount:+,.0f}원)"
+                msg += "\n"
+            if avg_price:
+                msg += f"  평단: {avg_price:,.0f}원 \u2192 매도 {price:,.0f}원\n"
+            if holding is not None:
+                if holding >= 60:
+                    h, m = divmod(int(holding), 60)
+                    msg += f"  보유: {h}시간 {m}분\n"
+                else:
+                    msg += f"  보유: {int(holding)}분\n"
+            if reason:
+                msg += f"  사유: {reason[:80]}\n"
+            msg += f"  시각: {ts[:19]}"
+        else:
+            return
+
+        await send_message(msg, category="trade", caller="live_runner")
+    except Exception:
+        pass  # 발송 실패가 매매에 영향 주면 안 됨
 
 
 async def _save_session_state(session: LiveSession) -> None:

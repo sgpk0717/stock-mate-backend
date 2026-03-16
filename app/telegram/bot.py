@@ -53,19 +53,64 @@ async def _api(method: str, **kwargs) -> dict | None:
         return None
 
 
+# ── 발송 로깅 ──
+
+
+async def _log_message(
+    category: str,
+    caller: str,
+    text: str,
+    chat_id: str,
+    status: str,
+    error_message: str | None = None,
+    telegram_message_id: int | None = None,
+) -> None:
+    """DB에 텔레그램 발송 내역 기록. 실패해도 발송에 영향 없음."""
+    try:
+        from app.core.database import async_session
+        from app.telegram.models import TelegramMessageLog
+
+        async with async_session() as db:
+            log = TelegramMessageLog(
+                category=category,
+                caller=caller,
+                text=text[:4000],
+                chat_id=chat_id,
+                status=status,
+                error_message=error_message,
+                telegram_message_id=telegram_message_id,
+            )
+            db.add(log)
+            await db.commit()
+    except Exception as e:
+        logger.debug("Telegram log DB write failed: %s", e)
+
+
 async def send_message(
     text: str,
     chat_id: str = "",
     reply_markup: dict | None = None,
+    *,
+    category: str = "system",
+    caller: str = "",
 ) -> dict | None:
-    """메시지 전송."""
+    """메시지 전송 + DB 로깅."""
     cid = chat_id or settings.TELEGRAM_CHAT_ID
     if not cid:
+        await _log_message(category, caller, text, "", "skipped", "chat_id 없음")
         return None
     kwargs = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
-    return await _api("sendMessage", **kwargs)
+    result = await _api("sendMessage", **kwargs)
+    if result:
+        await _log_message(
+            category, caller, text, cid, "success",
+            telegram_message_id=result.get("message_id"),
+        )
+    else:
+        await _log_message(category, caller, text, cid, "failed", "API 호출 실패")
+    return result
 
 
 async def request_approval(
@@ -93,6 +138,8 @@ async def request_approval(
     await send_message(
         f"<b>[승인 필요]</b>\n{description}",
         reply_markup=markup,
+        category="approval",
+        caller="bot.request_approval",
     )
 
     try:
@@ -100,7 +147,11 @@ async def request_approval(
         return result
     except asyncio.TimeoutError:
         logger.info("Approval timeout for task %s", task_id)
-        await send_message(f"[타임아웃] 승인 요청 만료: {description[:50]}")
+        await send_message(
+            f"[타임아웃] 승인 요청 만료: {description[:50]}",
+            category="approval",
+            caller="bot.request_approval",
+        )
         return False
     finally:
         _approval_queue.pop(f"approve:{task_id}", None)
@@ -137,7 +188,7 @@ async def _handle_status(chat_id: str) -> None:
         f"PnL: -\n"
     )
     text += f"마이닝: {'실행중' if mining else '중지'}"
-    await send_message(text, chat_id)
+    await send_message(text, chat_id, category="command_response", caller="bot._handle_status")
 
 
 async def _handle_stop(chat_id: str) -> None:
@@ -148,9 +199,16 @@ async def _handle_stop(chat_id: str) -> None:
         await send_message(
             f"긴급 정지 완료. 이전 상태: {result.get('previous')}\n전량 청산 실행됨.",
             chat_id,
+            category="command_response",
+            caller="bot._handle_stop",
         )
     else:
-        await send_message(f"정지 실패: {result.get('message')}", chat_id)
+        await send_message(
+            f"정지 실패: {result.get('message')}",
+            chat_id,
+            category="command_response",
+            caller="bot._handle_stop",
+        )
 
 
 async def _handle_resume(chat_id: str) -> None:
@@ -158,9 +216,19 @@ async def _handle_resume(chat_id: str) -> None:
     orch = get_orchestrator()
     result = await orch.handle_resume()
     if result.get("success"):
-        await send_message("정지 해제 → IDLE 복귀.", chat_id)
+        await send_message(
+            "정지 해제 → IDLE 복귀.",
+            chat_id,
+            category="command_response",
+            caller="bot._handle_resume",
+        )
     else:
-        await send_message(f"실패: {result.get('message')}", chat_id)
+        await send_message(
+            f"실패: {result.get('message')}",
+            chat_id,
+            category="command_response",
+            caller="bot._handle_resume",
+        )
 
 
 async def _handle_skip(chat_id: str) -> None:
@@ -170,6 +238,8 @@ async def _handle_skip(chat_id: str) -> None:
     await send_message(
         f"오늘 매매 스킵. ({result.get('previous', '?')} → IDLE)",
         chat_id,
+        category="command_response",
+        caller="bot._handle_skip",
     )
 
 
@@ -185,7 +255,12 @@ async def _handle_report(chat_id: str) -> None:
         run = result.scalar_one_or_none()
 
     if not run:
-        await send_message("오늘 워크플로우 기록 없음.", chat_id)
+        await send_message(
+            "오늘 워크플로우 기록 없음.",
+            chat_id,
+            category="command_response",
+            caller="bot._handle_report",
+        )
         return
 
     review = run.review_summary or {}
@@ -204,7 +279,7 @@ async def _handle_report(chat_id: str) -> None:
         f"PnL: -\n"
     )
     text += f"승률: {win_rate}%"
-    await send_message(text, chat_id)
+    await send_message(text, chat_id, category="command_response", caller="bot._handle_report")
 
 
 async def _handle_factors(chat_id: str) -> None:
@@ -215,7 +290,12 @@ async def _handle_factors(chat_id: str) -> None:
         factors = await select_best_factors(session, limit=5)
 
     if not factors:
-        await send_message("매매 가능 팩터 없음.", chat_id)
+        await send_message(
+            "매매 가능 팩터 없음.",
+            chat_id,
+            category="command_response",
+            caller="bot._handle_factors",
+        )
         return
 
     lines = ["<b>Top 팩터</b>"]
@@ -226,7 +306,12 @@ async def _handle_factors(chat_id: str) -> None:
             f"   IC={factor.ic_mean:.4f} Sharpe={factor.sharpe:.2f} "
             f"Score={f['score']:.4f}"
         )
-    await send_message("\n".join(lines), chat_id)
+    await send_message(
+        "\n".join(lines),
+        chat_id,
+        category="command_response",
+        caller="bot._handle_factors",
+    )
 
 
 _COMMANDS = {
@@ -256,7 +341,11 @@ async def _process_update(update: dict) -> None:
             entry["future"].set_result(approved)
             answer_text = "승인됨" if approved else "거부됨"
             await _api("answerCallbackQuery", callback_query_id=cb_id, text=answer_text)
-            await send_message(f"[{answer_text}] {entry['desc'][:50]}")
+            await send_message(
+                f"[{answer_text}] {entry['desc'][:50]}",
+                category="approval",
+                caller="bot._process_update",
+            )
         else:
             await _api("answerCallbackQuery", callback_query_id=cb_id, text="만료됨")
         return
@@ -282,7 +371,12 @@ async def _process_update(update: dict) -> None:
             await handler(chat_id)
         except Exception as e:
             logger.error("Telegram command %s error: %s", cmd, e)
-            await send_message(f"명령어 실행 실패: {e}", chat_id)
+            await send_message(
+                f"명령어 실행 실패: {e}",
+                chat_id,
+                category="error",
+                caller="bot._process_update",
+            )
     elif text.startswith("/"):
         await send_message(
             "사용 가능한 명령어:\n"
@@ -293,6 +387,8 @@ async def _process_update(update: dict) -> None:
             "/report — 일일 리포트\n"
             "/factors — 최고 팩터",
             chat_id,
+            category="command_response",
+            caller="bot._process_update",
         )
 
 

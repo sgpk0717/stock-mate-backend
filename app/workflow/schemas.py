@@ -13,6 +13,7 @@ class WorkflowRunOut(BaseModel):
     date: date
     phase: str
     status: str
+    step_status: dict | None = None
     config: dict | None = None
     mining_run_id: str | None = None
     selected_factor_id: str | None = None
@@ -36,6 +37,7 @@ class WorkflowStatusOut(BaseModel):
     phase: str
     date: Optional[date] = None
     status: str = "NO_RUN"
+    step_status: dict | None = None
     selected_factor_name: str | None = None
     selected_factor_ic: float | None = None
     selected_factor_sharpe: float | None = None

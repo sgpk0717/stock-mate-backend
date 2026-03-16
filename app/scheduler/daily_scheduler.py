@@ -26,6 +26,15 @@ KST = timezone(timedelta(hours=9))
 JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial")
 
 
+async def _send_collection_telegram(msg: str) -> None:
+    """수집 보고 텔레그램 발송 (fire-and-forget)."""
+    try:
+        from app.telegram.bot import send_message
+        await send_message(msg, category="daily_collect", caller="daily_scheduler")
+    except Exception:
+        pass
+
+
 # ── 상태 ────────────────────────────────────────────────
 
 
@@ -161,7 +170,7 @@ class DailyScheduler:
         from app.core.database import async_session
         from sqlalchemy import text
 
-        today = _now_kst().strftime("%Y-%m-%d")
+        today = _now_kst().date()
         try:
             async with async_session() as session:
                 result = await session.execute(
@@ -263,6 +272,17 @@ class DailyScheduler:
         """일봉 → 분봉 → 뉴스 순차 실행."""
         logger.info("=== 일일 수집 사이클 시작 (date=%s) ===", date)
         self._state.last_run_date = date
+        _cycle_start = _now_kst()
+
+        # 텔레그램: 사이클 시작
+        _JOB_DISPLAY = {
+            "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
+            "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
+        }
+        await _send_collection_telegram(
+            f"\U0001f4e6 <b>일일 수집 시작</b> ({date})\n"
+            f"대상: {', '.join(_JOB_DISPLAY.get(j, j) for j in JOB_NAMES)}"
+        )
 
         for job_name in JOB_NAMES:
             if not self._state.running:
@@ -270,6 +290,46 @@ class DailyScheduler:
             await self._run_single_job(job_name, date)
 
         self._state.current_job = None
+
+        # 텔레그램: 종합 리포트
+        _cycle_end = _now_kst()
+        _total_sec = (_cycle_end - _cycle_start).total_seconds()
+        _total_min = int(_total_sec // 60)
+        _total_sec_r = int(_total_sec % 60)
+        _elapsed = f"{_total_min}분 {_total_sec_r}초" if _total_min > 0 else f"{_total_sec_r}초"
+
+        lines = [f"\U0001f4ca <b>일일 수집 완료</b> ({date}, 총 {_elapsed})\n"]
+        for jn in JOB_NAMES:
+            job = self._state.jobs.get(jn)
+            if not job:
+                lines.append(f"  \u2796 {_JOB_DISPLAY.get(jn, jn)}: 미실행")
+                continue
+            dur = f"{int(job.duration_seconds)}초" if job.duration_seconds else ""
+            if job.status == "completed":
+                if job.total > 0:
+                    lines.append(f"  \u2705 {_JOB_DISPLAY.get(jn, jn)}: {job.completed}/{job.total}"
+                                 + (f" ({dur})" if dur else "")
+                                 + (f" \u26a0\ufe0f {job.failed} 실패" if job.failed else ""))
+                else:
+                    lines.append(f"  \u2705 {_JOB_DISPLAY.get(jn, jn)}: 완료 ({dur})")
+            elif job.status == "failed":
+                lines.append(f"  \u274c {_JOB_DISPLAY.get(jn, jn)}: 실패"
+                             + (f" — {job.error[:60]}" if job.error else ""))
+            else:
+                lines.append(f"  \u2796 {_JOB_DISPLAY.get(jn, jn)}: {job.status}")
+
+        # 서킷 브레이커 상태
+        cb_issues = [
+            name for name, cb in self._breakers.items()
+            if cb.state != "CLOSED"
+        ]
+        if cb_issues:
+            lines.append(f"\n\u26a0\ufe0f 서킷 브레이커: {', '.join(cb_issues)} OPEN")
+        else:
+            lines.append(f"\n\u2705 서킷 브레이커: 모두 정상")
+
+        await _send_collection_telegram("\n".join(lines))
+
         logger.info("=== 일일 수집 사이클 완료 (date=%s) ===", date)
         await self._broadcast({"type": "cycle_complete", "date": date})
 
@@ -309,6 +369,21 @@ class DailyScheduler:
                 "type": "job_complete",
                 "job": job.model_dump(),
             })
+
+            # 텔레그램: 작업 완료 알림
+            _display = {
+                "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
+                "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
+            }
+            _name = _display.get(job_name, job_name)
+            _dur = f"{int(job.duration_seconds)}초" if job.duration_seconds else ""
+            if job.status == "completed":
+                _detail = f"{job.completed}/{job.total}" if job.total > 0 else "완료"
+                _fail = f" / {job.failed} 실패" if job.failed else ""
+                _msg = f"\u2705 {_name} 수집 완료 ({_dur})\n  {_detail}{_fail}"
+            else:
+                _msg = f"\u274c {_name} 수집 실패 ({_dur})\n  {job.error[:80] if job.error else '알 수 없는 오류'}"
+            asyncio.create_task(_send_collection_telegram(_msg))
 
     async def _dispatch_job(
         self, job_name: str, date: str, job: JobStatus,

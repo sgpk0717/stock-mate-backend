@@ -241,12 +241,11 @@ async def main() -> None:
         )
         logger.info("알파 팩토리 자동 시작")
 
-    # 인과 검증 자동 스케줄러
-    if settings.CAUSAL_AUTO_VALIDATE:
-        from app.alpha.causal_scheduler import start_causal_scheduler
+    # 인과 검증 자동 스케줄러 (항상 실행)
+    from app.alpha.causal_scheduler import start_causal_scheduler
 
-        tasks.append(start_causal_scheduler())
-        logger.info("인과 검증 스케줄러 시작 (1h 주기)")
+    tasks.append(start_causal_scheduler())
+    logger.info("인과 검증 스케줄러 시작 (1h 주기)")
 
     # 백그라운드 루프 시작
     tasks.append(asyncio.create_task(command_loop()))

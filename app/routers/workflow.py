@@ -72,6 +72,7 @@ async def get_workflow_history(
             date=r.date,
             phase=r.phase,
             status=r.status,
+            step_status=r.step_status,
             config=r.config,
             mining_run_id=str(r.mining_run_id) if r.mining_run_id else None,
             selected_factor_id=str(r.selected_factor_id) if r.selected_factor_id else None,

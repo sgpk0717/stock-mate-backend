@@ -62,3 +62,19 @@ def default_round_trip_cost(interval: str) -> float:
 def is_intraday(interval: str) -> bool:
     """일중(분봉) 인터벌 여부."""
     return interval != "1d"
+
+
+_TARGET_MAX_ROWS = 4_000_000  # 마이닝 메모리 안전 기준 (지표 확장 87cols + per-expr _collapse_to_daily 고려)
+
+
+def max_symbols_for_mining(interval: str, lookback_days: int = 90) -> int:
+    """인터벌별 마이닝 최대 종목 수 (OOM 방지).
+
+    일봉은 사실상 제한 없고, 분봉은 봉 수에 반비례하여 종목 수를 제한한다.
+    """
+    bpd = bars_per_day(interval)
+    bars_per_symbol = int(bpd * lookback_days)
+    if bars_per_symbol <= 0:
+        return 9999
+    limit = _TARGET_MAX_ROWS // bars_per_symbol
+    return max(limit, 50)  # 최소 50종목 보장 (횡단면 IC에 필요)

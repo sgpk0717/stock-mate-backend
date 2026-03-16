@@ -6,6 +6,7 @@ from datetime import date, datetime
 from sqlalchemy import (
     Date,
     DateTime,
+    Index,
     Integer,
     Numeric,
     String,
@@ -20,6 +21,10 @@ from app.models.base import Base
 
 class BacktestRun(Base):
     __tablename__ = "backtest_runs"
+    __table_args__ = (
+        Index("ix_backtest_runs_created_at", "created_at"),
+        Index("ix_backtest_runs_status", "status"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

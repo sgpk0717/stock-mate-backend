@@ -36,7 +36,6 @@ logger = logging.getLogger("test_factory")
 UNIVERSES = ["KOSPI200", "KOSDAQ150", "KRX300", "ALL"]
 IC_THRESHOLDS = [0.0, 0.03, 1.0]
 ENABLE_CROSSOVER = [True, False]
-ENABLE_CAUSAL = [True, False]
 MAX_CYCLES_OPTIONS = [1]  # null은 1로 제한 (무한 루프 방지)
 
 # 날짜 범위
@@ -47,17 +46,16 @@ DATE_RANGES = [
 
 # 빠른 테스트용 (핵심 조합만)
 QUICK_COMBOS = [
-    # (universe, ic_threshold, crossover, causal, start, end, description)
-    ("KOSPI200", 0.03, True, False, "2024-01-01", "2025-12-31", "기본 설정"),
-    ("KOSPI200", 0.0, True, False, "2024-01-01", "2025-12-31", "IC=0 (극히 관대)"),
-    ("KOSPI200", 1.0, True, False, "2024-01-01", "2025-12-31", "IC=1.0 (극히 엄격)"),
-    ("KOSPI200", 0.03, False, False, "2024-01-01", "2025-12-31", "교차 비활성"),
-    ("KOSPI200", 0.03, True, True, "2024-01-01", "2025-12-31", "인과 검증 활성"),
-    ("KOSDAQ150", 0.03, True, False, "2024-01-01", "2025-12-31", "KOSDAQ150"),
-    ("KRX300", 0.03, True, False, "2024-01-01", "2025-12-31", "KRX300"),
-    ("ALL", 0.03, True, False, "2024-01-01", "2025-12-31", "ALL 유니버스"),
-    ("KOSPI200", 0.03, True, False, "2025-11-01", "2025-12-01", "짧은 기간 (30일)"),
-    ("KOSPI200", 0.03, False, True, "2025-11-01", "2025-12-01", "짧은+교차X+인과O"),
+    # (universe, ic_threshold, crossover, start, end, description)
+    ("KOSPI200", 0.03, True, "2024-01-01", "2025-12-31", "기본 설정"),
+    ("KOSPI200", 0.0, True, "2024-01-01", "2025-12-31", "IC=0 (극히 관대)"),
+    ("KOSPI200", 1.0, True, "2024-01-01", "2025-12-31", "IC=1.0 (극히 엄격)"),
+    ("KOSPI200", 0.03, False, "2024-01-01", "2025-12-31", "교차 비활성"),
+    ("KOSDAQ150", 0.03, True, "2024-01-01", "2025-12-31", "KOSDAQ150"),
+    ("KRX300", 0.03, True, "2024-01-01", "2025-12-31", "KRX300"),
+    ("ALL", 0.03, True, "2024-01-01", "2025-12-31", "ALL 유니버스"),
+    ("KOSPI200", 0.03, True, "2025-11-01", "2025-12-01", "짧은 기간 (30일)"),
+    ("KOSPI200", 0.03, False, "2025-11-01", "2025-12-01", "짧은+교차X"),
 ]
 
 
@@ -67,7 +65,6 @@ async def run_single_test(
     universe: str,
     ic_threshold: float,
     enable_crossover: bool,
-    enable_causal: bool,
     start_date: str,
     end_date: str,
     description: str = "",
@@ -75,7 +72,7 @@ async def run_single_test(
     """단일 팩토리 테스트 실행."""
     from app.alpha.scheduler import AlphaFactoryScheduler
 
-    desc = description or f"u={universe} ic={ic_threshold} cx={enable_crossover} ca={enable_causal} {start_date}~{end_date}"
+    desc = description or f"u={universe} ic={ic_threshold} cx={enable_crossover} {start_date}~{end_date}"
     logger.info("=" * 60)
     logger.info("[%d/%d] %s", test_num, total, desc)
     logger.info("=" * 60)
@@ -90,7 +87,6 @@ async def run_single_test(
         "universe": universe,
         "ic_threshold": ic_threshold,
         "enable_crossover": enable_crossover,
-        "enable_causal": enable_causal,
         "start_date": start_date,
         "end_date": end_date,
         "status": "UNKNOWN",
@@ -110,7 +106,6 @@ async def run_single_test(
             ic_threshold=ic_threshold,
             orthogonality_threshold=0.7,
             enable_crossover=enable_crossover,
-            enable_causal=enable_causal,
             max_cycles=1,        # 1사이클만
         )
 
@@ -179,12 +174,12 @@ async def main(quick: bool = False) -> None:
     else:
         # 전체 조합 생성
         all_combos = list(itertools.product(
-            UNIVERSES, IC_THRESHOLDS, ENABLE_CROSSOVER, ENABLE_CAUSAL, DATE_RANGES,
+            UNIVERSES, IC_THRESHOLDS, ENABLE_CROSSOVER, DATE_RANGES,
         ))
         combos = []
-        for i, (univ, ic, cx, ca, (sd, ed)) in enumerate(all_combos):
-            desc = f"u={univ} ic={ic} cx={cx} ca={ca} {sd}~{ed}"
-            combos.append((i + 1, len(all_combos), univ, ic, cx, ca, sd, ed, desc))
+        for i, (univ, ic, cx, (sd, ed)) in enumerate(all_combos):
+            desc = f"u={univ} ic={ic} cx={cx} {sd}~{ed}"
+            combos.append((i + 1, len(all_combos), univ, ic, cx, sd, ed, desc))
 
     total = len(combos)
     logger.info("=" * 60)

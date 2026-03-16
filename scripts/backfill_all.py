@@ -31,6 +31,9 @@ import asyncpg
 
 from app.core.config import settings
 
+# 순환 임포트 방지: 모든 모델을 먼저 로드
+import app.models.base  # noqa: F401
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -414,11 +417,11 @@ async def _run_news(
     gaps: list[date],
     symbols: list[str] | None,
 ) -> dict:
-    """뉴스 백필."""
-    from app.scheduler.circuit_breaker import CircuitBreaker
-    from app.scheduler.collectors.news_batch import collect_news
+    """뉴스 백필 — collect_and_analyze 직접 호출."""
+    all_symbols = symbols or await _get_all_symbols()
+    # 상위 200개 종목만 (전 종목은 과도)
+    top_symbols = all_symbols[:200]
 
-    cb = CircuitBreaker("claude-backfill-news", failure_threshold=3, reset_timeout=120)
     filled = 0
     failed = 0
 
@@ -427,17 +430,22 @@ async def _run_news(
         logger.info("[news] %d/%d gaps — date=%s", gi + 1, len(gaps), date_str)
 
         try:
-            result = await collect_news(date_str, cb=cb)
-            if result.error:
-                failed += 1
-                logger.warning("[news] date=%s error: %s", date_str, result.error)
-            else:
-                filled += 1
-                logger.info("[news] date=%s 완료: completed=%d",
-                            date_str, result.completed)
+            from app.core.database import async_session as get_session
+            from app.news.scheduler import collect_and_analyze
+
+            async with get_session() as session:
+                result = await collect_and_analyze(
+                    session, top_symbols, days=1,
+                )
+                await session.commit()
+            filled += 1
+            logger.info("[news] date=%s 완료: %s", date_str, result)
         except Exception as e:
             failed += 1
             logger.warning("[news] date=%s 예외: %s", date_str, e)
+
+        # 크롤링 쓰로틀링
+        await asyncio.sleep(1)
 
     return {"filled": filled, "failed": failed}
 

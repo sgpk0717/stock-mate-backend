@@ -118,8 +118,14 @@ async def list_backtest_runs(
     db: AsyncSession = Depends(get_db),
 ):
     """최근 백테스트 실행 목록."""
+    from sqlalchemy.orm import defer
     result = await db.execute(
         select(BacktestRun)
+        .options(
+            defer(BacktestRun.equity_curve),
+            defer(BacktestRun.trades_summary),
+            defer(BacktestRun.strategy_json),
+        )
         .order_by(BacktestRun.created_at.desc())
         .limit(limit)
     )
