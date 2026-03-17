@@ -111,6 +111,7 @@ class LiveTrade(Base):
     )  # B1/B2/S-STOP/S-TRAIL/S-HALF
     qty: Mapped[int] = mapped_column(Integer, nullable=False)
     price: Mapped[float] = mapped_column(Float, nullable=False)
+    expected_price: Mapped[float | None] = mapped_column(Float, nullable=True)  # TCA: 시그널 시점 기대가
     pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     pnl_amount: Mapped[float | None] = mapped_column(Numeric(18, 2), nullable=True)
     holding_minutes: Mapped[float | None] = mapped_column(Float, nullable=True)

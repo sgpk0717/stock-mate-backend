@@ -40,12 +40,27 @@ logger = logging.getLogger(__name__)
 # ── 정확도 보강 상수 ──
 MAX_VOLUME_PARTICIPATION = 0.10  # 봉 거래량의 최대 10%만 참여
 MIN_DAILY_TURNOVER = 100_000_000  # 1억원 (일평균 거래대금 필터)
+MAX_ADV_PARTICIPATION = 0.05     # ADV(평균일거래대금)의 최대 5%만 참여
 
 
 def _clamp_qty_by_volume(intended_qty: int, bar_volume: int, price: float) -> int:
     """거래량 참여율 제한. 봉 거래량의 10% 초과 주문은 잘라낸다."""
     max_tradeable = int(bar_volume * MAX_VOLUME_PARTICIPATION)
     return min(intended_qty, max(max_tradeable, 0))
+
+
+def _clamp_qty_by_adv(intended_qty: int, price: float, adv: float) -> int:
+    """ADV 기반 일일 참여율 제한. ADV의 5% 초과 주문은 잘라낸다.
+
+    Parameters
+    ----------
+    adv : 평균 일거래대금 (원 단위)
+    """
+    if adv <= 0 or price <= 0:
+        return intended_qty
+    max_value = adv * MAX_ADV_PARTICIPATION
+    max_qty = int(max_value / price)
+    return min(intended_qty, max(max_qty, 1))
 
 ProgressCallback = Callable[[int, int, str], Awaitable[None]] | None
 
@@ -471,6 +486,19 @@ async def run_factor_backtest(
             metrics={"error": "팩터 값 계산 결과가 비어 있습니다."}
         )
 
+    # ── 2.5. 종목별 ADV (평균일거래대금) 사전 계산 ──
+    adv_by_symbol: dict[str, float] = {}
+    if "volume" in factor_df.columns:
+        from app.alpha.interval import bars_per_day as _bpd_fn
+        _scale = _bpd_fn(interval)
+        _adv_df = factor_df.group_by("symbol").agg(
+            (pl.col("close") * pl.col("volume")).mean().alias("avg_bar_turnover")
+        ).with_columns(
+            (pl.col("avg_bar_turnover") * _scale).alias("adv")
+        )
+        for row in _adv_df.iter_rows(named=True):
+            adv_by_symbol[row["symbol"]] = row["adv"]
+
     if progress_cb:
         await progress_cb(30, 100, "팩터 횡단면 랭킹 완료")
 
@@ -798,6 +826,10 @@ async def run_factor_backtest(
 
                     if has_volume:
                         qty = _clamp_qty_by_volume(qty, _bar_vol, buy_price)
+                    # ADV 참여율 제한 (일일 총 주문이 ADV의 5% 이내)
+                    _sym_adv = adv_by_symbol.get(sym, 0)
+                    if _sym_adv > 0:
+                        qty = _clamp_qty_by_adv(qty, buy_price, _sym_adv)
                     if qty <= 0:
                         continue
 
