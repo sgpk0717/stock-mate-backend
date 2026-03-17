@@ -564,7 +564,8 @@ async def run_factor_backtest(
                 if stop_loss_pct > 0 and not circuit_breaker_triggered:
                     drawdown = (price - pos["avg_price"]) / pos["avg_price"]
                     if drawdown <= -stop_loss_pct:
-                        sell_price = effective_sell_price(price, cost_config)
+                        _sv = today.get(sym, {}).get("volume", 0) if has_volume else 0
+                        sell_price = effective_sell_price(price, cost_config, order_qty=pos["qty"], bar_volume=_sv)
                         pnl = (sell_price - pos["avg_price"]) * pos["qty"]
                         pnl_pct = (sell_price / pos["avg_price"] - 1) * 100
                         holding_days = _calc_holding_days(current_date, pos["entry_date"], intraday)
@@ -614,7 +615,8 @@ async def run_factor_backtest(
                 for sym in list(holdings.keys()):
                     pos = holdings.pop(sym)
                     price = today.get(sym, {}).get("close", pos.get("last_close", pos["avg_price"]))
-                    sell_price = effective_sell_price(price, cost_config)
+                    _sv2 = today.get(sym, {}).get("close_volume", today.get(sym, {}).get("volume", 0)) if has_volume else 0
+                    sell_price = effective_sell_price(price, cost_config, order_qty=pos["qty"], bar_volume=_sv2)
                     pnl = (sell_price - pos["avg_price"]) * pos["qty"]
                     pnl_pct = (sell_price / pos["avg_price"] - 1) * 100 if pos["avg_price"] > 0 else 0
                     cash += sell_price * pos["qty"]
@@ -651,7 +653,7 @@ async def run_factor_backtest(
             for sym in orphan_syms:
                 pos = holdings.pop(sym)
                 last_price = pos.get("last_close", pos["avg_price"])
-                sell_price = effective_sell_price(last_price, cost_config)
+                sell_price = effective_sell_price(last_price, cost_config, order_qty=pos["qty"])
                 pnl = (sell_price - pos["avg_price"]) * pos["qty"]
                 pnl_pct = (sell_price / pos["avg_price"] - 1) * 100 if pos["avg_price"] > 0 else 0
 
@@ -732,7 +734,8 @@ async def run_factor_backtest(
                     holdings[sym] = pos
                     continue
 
-                sell_price = effective_sell_price(today[sym]["open"], cost_config)
+                _sell_vol = today[sym].get("volume", 0) if has_volume else 0
+                sell_price = effective_sell_price(today[sym]["open"], cost_config, order_qty=sell_qty, bar_volume=_sell_vol)
                 actual_pnl = (sell_price - pos["avg_price"]) * sell_qty
                 pnl_pct = (sell_price / pos["avg_price"] - 1) * 100 if pos["avg_price"] > 0 else 0
 
@@ -776,7 +779,17 @@ async def run_factor_backtest(
                 per_stock_budget = cash / max(len(buy_list), 1)
 
                 for sym in buy_list:
-                    buy_price = effective_buy_price(today[sym]["open"], cost_config)
+                    _bar_vol = today[sym].get("volume", 0) if has_volume else 0
+                    # 예비 qty 계산 (고정 슬리피지로 추정)
+                    _est_price = today[sym]["open"] * (1 + cost_config.slippage_pct) * (1 + cost_config.buy_commission)
+                    _est_qty = int(per_stock_budget / _est_price) if _est_price > 0 else 0
+                    if has_volume:
+                        _est_qty = _clamp_qty_by_volume(_est_qty, _bar_vol, _est_price)
+                    # VolumeShare 슬리피지 적용
+                    buy_price = effective_buy_price(
+                        today[sym]["open"], cost_config,
+                        order_qty=_est_qty, bar_volume=_bar_vol,
+                    )
                     if buy_price <= 0:
                         continue
                     qty = int(per_stock_budget / buy_price)
@@ -784,7 +797,7 @@ async def run_factor_backtest(
                         continue
 
                     if has_volume:
-                        qty = _clamp_qty_by_volume(qty, today[sym].get("volume", 0), buy_price)
+                        qty = _clamp_qty_by_volume(qty, _bar_vol, buy_price)
                     if qty <= 0:
                         continue
 
@@ -853,7 +866,7 @@ async def run_factor_backtest(
 
     for sym, pos in list(holdings.items()):
         close_price = last_day.get(sym, {}).get("close", pos.get("last_close", pos["avg_price"]))
-        sell_price = effective_sell_price(close_price, cost_config)
+        sell_price = effective_sell_price(close_price, cost_config, order_qty=pos["qty"])
         pnl = (sell_price - pos["avg_price"]) * pos["qty"]
         pnl_pct = (sell_price / pos["avg_price"] - 1) * 100 if pos["avg_price"] > 0 else 0
 

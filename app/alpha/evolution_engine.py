@@ -880,6 +880,12 @@ class EvolutionEngine:
                     tree_size=size,
                     sharpe=metrics.sharpe,
                     max_drawdown=metrics.max_drawdown,
+                    w_ic=settings.ALPHA_FITNESS_W_IC,
+                    w_icir=settings.ALPHA_FITNESS_W_ICIR,
+                    w_sharpe=settings.ALPHA_FITNESS_W_SHARPE,
+                    w_mdd=settings.ALPHA_FITNESS_W_MDD,
+                    w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
+                    w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
                 )
 
                 seeds.append(ScoredFactor(
@@ -1002,6 +1008,12 @@ class EvolutionEngine:
                 tree_size=size,
                 sharpe=metrics.sharpe,
                 max_drawdown=metrics.max_drawdown,
+                w_ic=settings.ALPHA_FITNESS_W_IC,
+                w_icir=settings.ALPHA_FITNESS_W_ICIR,
+                w_sharpe=settings.ALPHA_FITNESS_W_SHARPE,
+                w_mdd=settings.ALPHA_FITNESS_W_MDD,
+                w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
+                w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
             )
 
             # UCB1 업데이트
@@ -1097,6 +1109,12 @@ class EvolutionEngine:
             tree_size=size,
             sharpe=metrics.sharpe,
             max_drawdown=metrics.max_drawdown,
+            w_ic=settings.ALPHA_FITNESS_W_IC,
+            w_icir=settings.ALPHA_FITNESS_W_ICIR,
+            w_sharpe=settings.ALPHA_FITNESS_W_SHARPE,
+            w_mdd=settings.ALPHA_FITNESS_W_MDD,
+            w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
+            w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
         )
 
         delta = fitness - parent.fitness_composite
@@ -1125,33 +1143,41 @@ class EvolutionEngine:
     # eval 실패 샘플 로깅 카운터 (세대당 리셋)
     _eval_fail_logged: int = 0
 
-    # 확장된 피처 목록 (LLM 프롬프트용)
-    _FEATURE_LIST = (
-        "close, open, high, low, volume, "
-        "sma_5, sma_10, sma_20, sma_60, ema_5, ema_10, ema_20, ema_60, "
-        "rsi, rsi_7, rsi_21, "
-        "volume_ratio, atr_7, atr_14, atr_21, "
-        "macd_hist, bb_upper, bb_lower, bb_width, bb_position, "
-        "price_change_pct, "
-        "close_lag_1, close_lag_5, close_lag_20, "
-        "volume_lag_1, volume_lag_5, "
-        "return_5d, return_20d, "
-        "rank_close, rank_volume, zscore_close, zscore_volume, "
-        "foreign_net_norm, inst_net_norm, retail_net_norm, "
-        "eps, bps, operating_margin, debt_to_equity, earnings_yield, book_yield"
-    )
+    # 피처 목록은 miner._build_available_features()로 동적 생성
+    _FEATURE_LIST: str | None = None  # _init_feature_list()에서 초기화
+
+    def _get_feature_list(self) -> str:
+        """동적 피처 목록 생성 (miner와 통일)."""
+        if self._FEATURE_LIST is None:
+            from app.alpha.miner import _build_available_features
+            data_cols = set(self._data.columns) if self._data is not None else set()
+            self.__class__._FEATURE_LIST = _build_available_features(data_cols)
+        return self._FEATURE_LIST
 
     async def _llm_seed(self) -> sympy.Basic | None:
         """Claude API로 새 수식 생성."""
         try:
+            import random as _random
+
             from anthropic import AsyncAnthropic
+            from app.alpha.miner import _CATEGORY_EXAMPLES, _CATEGORIES
 
             client = AsyncAnthropic()
+            feature_list = self._get_feature_list()
+
+            # 카테고리 지시문: 매 호출마다 랜덤 카테고리
+            category = _random.choice(_CATEGORIES)
+            examples = _CATEGORY_EXAMPLES[category]
+            example_strs = "; ".join(e["formula"] for e in examples[:2])
+
             prompt = (
-                "Generate a single alpha factor formula using these variables: "
-                f"{self._FEATURE_LIST}.\n"
-                "Use only: +, -, *, /, log(), sqrt(), abs().\n"
-                "Return ONLY the formula, nothing else."
+                f"Generate a single alpha factor formula.\n\n"
+                f"{feature_list}\n\n"
+                f"Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
+                f"sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
+                f"Focus on '{category}' type factors. Examples: {example_strs}\n"
+                f"Create a DIFFERENT formula from the examples.\n"
+                f"Return ONLY the formula, nothing else."
             )
 
             # RAG 경험 추가
@@ -1183,6 +1209,7 @@ class EvolutionEngine:
             from anthropic import AsyncAnthropic
 
             client = AsyncAnthropic()
+            feature_list = self._get_feature_list()
             prompt = (
                 f"Mutate this alpha factor formula to improve it:\n"
                 f"{parent.expression_str}\n"
@@ -1191,8 +1218,9 @@ class EvolutionEngine:
                 f"  Sharpe: {parent.sharpe:.3f} (target: >= {settings.ALPHA_SHARPE_THRESHOLD})\n"
                 f"  Turnover: {parent.turnover:.3f} (lower is better)\n"
                 f"  Complexity: depth={parent.tree_depth}, size={parent.tree_size}\n"
-                f"Use only these variables: {self._FEATURE_LIST}.\n"
-                "Use only: +, -, *, /, log(), sqrt(), abs().\n"
+                f"{feature_list}\n"
+                "Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
+                "sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
                 "Return ONLY the new formula, nothing else."
             )
 
