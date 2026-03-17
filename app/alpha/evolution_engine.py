@@ -34,6 +34,8 @@ from app.alpha.evaluator import (
     compute_factor_metrics,
     compute_forward_returns,
     compute_ic_series,
+    compute_long_only_returns,
+    compute_position_turnover,
     compute_quantile_returns,
 )
 from app.alpha.evolution import (
@@ -659,8 +661,13 @@ class EvolutionEngine:
                 col = f"_bf_{i}"
                 ic_series = ic_dict.get(col, [])
                 ls_returns = compute_quantile_returns(df_batch, factor_col=col)
+                lo_returns = compute_long_only_returns(df_batch, factor_col=col)
+                avg_to, to_series = compute_position_turnover(df_batch, factor_col=col)
                 metrics = compute_factor_metrics(
                     ic_series, ls_returns=ls_returns,
+                    long_only_returns=lo_returns,
+                    position_turnover=avg_to,
+                    turnover_series=to_series,
                     annualize=252.0,
                     round_trip_cost=_rtc,
                 )
@@ -713,6 +720,14 @@ class EvolutionEngine:
                     ic_threshold=self._ic_threshold,
                 )
                 if cpcv_result.passed:
+                    # CPCV 통과 후 최종 Sharpe 검증
+                    if child.sharpe < settings.ALPHA_SHARPE_THRESHOLD:
+                        logger.info(
+                            "CPCV 통과했지만 Sharpe %.2f < %.1f → 탈락: %s",
+                            child.sharpe, settings.ALPHA_SHARPE_THRESHOLD,
+                            child.expression_str[:50],
+                        )
+                        continue
                     disc_metrics = FactorMetrics(
                         ic_mean=child.ic_mean,
                         ic_std=child.ic_std,
@@ -1265,9 +1280,14 @@ class EvolutionEngine:
 
             ic_series = compute_ic_series(df, factor_col="alpha_factor")
             ls_returns = compute_quantile_returns(df, factor_col="alpha_factor")
+            lo_returns = compute_long_only_returns(df, factor_col="alpha_factor")
+            avg_turnover, turnover_series = compute_position_turnover(df, factor_col="alpha_factor")
             return compute_factor_metrics(
                 ic_series, ls_returns=ls_returns,
-                annualize=252.0,  # 항상 일별 기준 (분봉은 _collapse_to_daily로 일별화)
+                long_only_returns=lo_returns,
+                position_turnover=avg_turnover,
+                turnover_series=turnover_series,
+                annualize=252.0,
                 round_trip_cost=default_round_trip_cost(self._interval),
             )
         except Exception as e:

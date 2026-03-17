@@ -954,6 +954,19 @@ class DailyWorkflowOrchestrator:
                 if actual_phase == "EMERGENCY_STOP":
                     return
 
+                # 장중 시간대(PRE_MARKET~MARKET_CLOSE)인데 팩토리가 돌고 있으면 즉시 중지
+                # (크론잡 누락 방지 — APScheduler가 오늘 08:30을 건너뛸 수 있음)
+                expected_phase, _ = self._expected_phase_now()
+                if expected_phase in ("PRE_MARKET", "TRADING", "MARKET_CLOSE"):
+                    try:
+                        from app.alpha.factory_client import get_factory_client
+                        factory = get_factory_client()
+                        if (await factory.get_status())["running"]:
+                            await factory.stop()
+                            logger.warning("장중 팩토리 실행 감지 → 강제 중지 (expected=%s)", expected_phase)
+                    except Exception as e:
+                        logger.error("장중 팩토리 강제 중지 실패: %s", e)
+
                 # SKIPPED/STOPPED 상태에서도 마이닝은 허용 (비거래일 상시가동)
                 if actual_status in ("SKIPPED", "STOPPED"):
                     expected_phase, _ = self._expected_phase_now()

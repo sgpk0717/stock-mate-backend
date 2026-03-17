@@ -373,6 +373,13 @@ async def backtest_with_factor(
     if not factor.interval:
         bt_interval = "1d"  # interval 컬럼 추가 이전 레거시 팩터
 
+    # 분봉 백테스트: OOM 방지를 위해 종목 수 제한
+    from app.alpha.interval import max_symbols_for_mining
+    max_sym = max_symbols_for_mining(bt_interval)
+    if len(symbols) > max_sym:
+        symbols = symbols[:max_sym]
+        logger.info("팩터 백테스트: %s — 종목 수 %d 제한 (OOM 방지)", bt_interval, max_sym)
+
     cost_cfg = default_cost_config(bt_interval)
 
     run = BacktestRun(

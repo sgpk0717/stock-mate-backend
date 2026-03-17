@@ -20,6 +20,21 @@ async def lifespan(app: FastAPI):
     async with async_session() as session:
         await load_stock_cache(session)
 
+    # 좀비 RUNNING/PENDING 백테스트 정리 (서버 재시작으로 task 소실)
+    try:
+        from sqlalchemy import text
+        async with async_session() as db:
+            result = await db.execute(text(
+                "UPDATE backtest_runs SET status='FAILED', error_message='서버 재시작으로 중단됨' "
+                "WHERE status IN ('RUNNING', 'PENDING')"
+            ))
+            count = result.rowcount
+            await db.commit()
+            if count:
+                logger.info("좀비 백테스트 %d건 정리 (RUNNING/PENDING → FAILED)", count)
+    except Exception as e:
+        logger.warning("좀비 백테스트 정리 실패: %s", e)
+
     # Agent 세션 TTL 설정
     from app.agents.session import session_store
     session_store._ttl_minutes = settings.AGENT_SESSION_TTL_MINUTES
@@ -96,10 +111,30 @@ async def lifespan(app: FastAPI):
 
     # 워크플로우 오케스트레이터
     if settings.WORKFLOW_ENABLED:
-        from app.workflow.orchestrator import get_orchestrator
-        wf = get_orchestrator()
-        await wf.setup_scheduler()
-        logger.info("Workflow orchestrator started (APScheduler)")
+        # DB에서 EMERGENCY_STOP 상태 확인 — 토글 OFF 시 재시작해도 비활성 유지
+        _wf_skip = False
+        try:
+            from app.core.database import async_session as _wf_session
+            from app.workflow.models import WorkflowRun
+            from sqlalchemy import select as _sel, func as _fn
+            async with _wf_session() as _db:
+                _latest = await _db.execute(
+                    _sel(WorkflowRun.phase)
+                    .order_by(WorkflowRun.date.desc())
+                    .limit(1)
+                )
+                _phase = _latest.scalar_one_or_none()
+                if _phase == "EMERGENCY_STOP":
+                    logger.info("워크플로우: DB에 EMERGENCY_STOP 상태 → 오케스트레이터 시작 안 함")
+                    _wf_skip = True
+        except Exception as _e:
+            logger.warning("워크플로우 상태 확인 실패 (정상 시작): %s", _e)
+
+        if not _wf_skip:
+            from app.workflow.orchestrator import get_orchestrator
+            wf = get_orchestrator()
+            await wf.setup_scheduler()
+            logger.info("Workflow orchestrator started (APScheduler)")
 
     # Phase 4: MCP 서버 시작
     if settings.MCP_ENABLED:
