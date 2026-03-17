@@ -253,29 +253,52 @@ class KISClient:
         return candles, last.get("stck_bsop_date", ""), last.get("stck_cntg_hour", "")
 
     async def inquire_program_trading(self, symbol: str) -> dict[str, Any]:
-        """주식현재가 프로그램매매 조회 (FHKST01010600).
+        """종목별 프로그램매매추이 체결 조회 (FHPPG04600101).
 
         실전 전용 (모의투자 미지원).
+        장시간(09:00~15:30) 최근 30분 데이터 조회.
 
         Returns:
-            프로그램 매수/매도 수량 및 금액
+            프로그램 매수/매도 수량 및 금액 (output 배열의 첫 번째 행)
         """
         data = await self._get(
-            "/uapi/domestic-stock/v1/quotations/inquire-price-pgm",
-            tr_id="FHKST01010600",
+            "/uapi/domestic-stock/v1/quotations/comp-program-trade-today",
+            tr_id="FHPPG04600101",
             params={
                 "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_MRKT_CLS_CODE": "K",
                 "FID_INPUT_ISCD": symbol,
+                "FID_SCTN_CLS_CODE": "",
+                "FID_COND_MRKT_DIV_CODE1": "",
+                "FID_INPUT_HOUR_1": "",
             },
         )
-        output = data.get("output", {})
+        # output이 배열(여러 시간대) — 최신(첫 번째) 행 사용
+        output_list = data.get("output", [])
+        if isinstance(output_list, list) and output_list:
+            output = output_list[0]
+        elif isinstance(output_list, dict):
+            output = output_list
+        else:
+            output = {}
+
+        def _safe_int(val: Any) -> int:
+            try:
+                return int(str(val).replace(",", ""))
+            except (ValueError, TypeError):
+                return 0
+
+        sell_qty = _safe_int(output.get("thtm_ntsl_qty", 0))
+        buy_qty = _safe_int(output.get("thtm_ntby_qty", 0))
+        sell_amt = _safe_int(output.get("thtm_ntsl_tr_pbmn", 0))
+        buy_amt = _safe_int(output.get("thtm_ntby_tr_pbmn", 0))
         return {
-            "pgm_buy_qty": int(output.get("pgtr_ntby_qty", "0")),   # 프로그램 순매수 수량
-            "pgm_sell_qty": int(output.get("pgtr_ntsl_qty", "0")),   # 프로그램 순매도 수량
-            "pgm_net_qty": int(output.get("pgtr_ntby_qty", "0")) - int(output.get("pgtr_ntsl_qty", "0")),
-            "pgm_buy_amount": int(output.get("pgtr_ntby_tr_pbmn", "0")),
-            "pgm_sell_amount": int(output.get("pgtr_ntsl_tr_pbmn", "0")),
-            "pgm_net_amount": int(output.get("pgtr_ntby_tr_pbmn", "0")) - int(output.get("pgtr_ntsl_tr_pbmn", "0")),
+            "pgm_buy_qty": buy_qty,
+            "pgm_sell_qty": sell_qty,
+            "pgm_net_qty": buy_qty - sell_qty,
+            "pgm_buy_amount": buy_amt,
+            "pgm_sell_amount": sell_amt,
+            "pgm_net_amount": buy_amt - sell_amt,
         }
 
     async def inquire_daily_short_sale(
