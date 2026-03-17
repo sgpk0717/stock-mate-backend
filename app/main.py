@@ -20,20 +20,40 @@ async def lifespan(app: FastAPI):
     async with async_session() as session:
         await load_stock_cache(session)
 
-    # 좀비 RUNNING/PENDING 백테스트 정리 (서버 재시작으로 task 소실)
+    # 서버 재시작 시 정리
     try:
         from sqlalchemy import text
         async with async_session() as db:
+            # 좀비 RUNNING/PENDING 백테스트 → FAILED
             result = await db.execute(text(
                 "UPDATE backtest_runs SET status='FAILED', error_message='서버 재시작으로 중단됨' "
                 "WHERE status IN ('RUNNING', 'PENDING')"
             ))
-            count = result.rowcount
+            bt_count = result.rowcount
+
+            # step_status는 유지 (멱등성 보증 — 재시작 후에도 "완료" 상태 보존)
+            # 이전에 NULL 초기화했으나, 이로 인해 watchdog catch-up 시 중복 세션 생성됨
+            wf_count = 0
+
+            # 좀비 트레이딩 세션 정리 (서버 재시작으로 task 소실)
+            # session_state의 status를 stopped로 변경 → 복구 시 task 생성 안 함
+            result3 = await db.execute(text(
+                "UPDATE trading_contexts "
+                "SET session_state = jsonb_set(COALESCE(session_state::jsonb, '{}'::jsonb), '{status}', '\"stopped\"') "
+                "WHERE status = 'active' AND session_state IS NOT NULL "
+                "AND session_state::jsonb->>'status' = 'running'"
+            ))
+            sess_count = result3.rowcount
+
             await db.commit()
-            if count:
-                logger.info("좀비 백테스트 %d건 정리 (RUNNING/PENDING → FAILED)", count)
+            if bt_count:
+                logger.info("좀비 백테스트 %d건 정리 (RUNNING/PENDING → FAILED)", bt_count)
+            if wf_count:
+                logger.info("오늘 워크플로우 step_status 초기화 (서버 재시작)")
+            if sess_count:
+                logger.info("좀비 트레이딩 세션 %d건 정리 (running → stopped)", sess_count)
     except Exception as e:
-        logger.warning("좀비 백테스트 정리 실패: %s", e)
+        logger.warning("서버 시작 정리 실패: %s", e)
 
     # Agent 세션 TTL 설정
     from app.agents.session import session_store
@@ -92,22 +112,22 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(start_collector()))
         logger.info("Program trading collector started")
 
-    # 인과 검증 스케줄러 (1시간 주기, 미검증 상위 30% 팩터) — inline 모드에서만
-    if settings.WORKER_MODE == "inline":
+    # 인과 검증 스케줄러 (1시간 주기, 미검증 상위 30% 팩터)
+    if settings.WORKER_MODE == "inline" and settings.WORKFLOW_ENABLED:
         from app.alpha.causal_scheduler import start_causal_scheduler
 
         tasks.append(start_causal_scheduler())
         logger.info("Causal validation scheduler started (1h interval)")
 
-    # TradingContext DB 복원
-    from app.trading.context import load_active_contexts_from_db
-    await load_active_contexts_from_db()
+    # TradingContext DB 복원 + 매매 세션 복구 (워크플로우 활성 시에만)
+    if settings.WORKFLOW_ENABLED:
+        from app.trading.context import load_active_contexts_from_db
+        await load_active_contexts_from_db()
 
-    # 활성 매매 세션 복구 (C2: 서버 재시작 시 LiveSession 자동 재개)
-    from app.trading.live_runner import restore_sessions_from_db
-    restored = await restore_sessions_from_db()
-    if restored:
-        logger.info("활성 매매 세션 %d개 복구됨", restored)
+        from app.trading.live_runner import restore_sessions_from_db
+        restored = await restore_sessions_from_db()
+        if restored:
+            logger.info("활성 매매 세션 %d개 복구됨", restored)
 
     # 워크플로우 오케스트레이터
     if settings.WORKFLOW_ENABLED:

@@ -261,22 +261,46 @@ class DailyWorkflowOrchestrator:
                 except Exception as e:
                     logger.warning("PRE_MARKET 다이버전스 체크 실패: %s", e)
 
-                # 최적 팩터 선택 (설계서 §8.4 필터)
+                # 최적 팩터 선택 (설계서 §8.4 필터, 멀티 팩터 지원)
+                multi_count = settings.WORKFLOW_MULTI_FACTOR_COUNT
                 best = await select_best_factors(
                     session,
-                    limit=1,
+                    limit=multi_count,
                     min_ic=settings.WORKFLOW_MIN_FACTOR_IC,
                     min_sharpe=settings.WORKFLOW_MIN_FACTOR_SHARPE,
                     require_causal=settings.WORKFLOW_REQUIRE_CAUSAL,
                     interval=settings.WORKFLOW_DATA_INTERVAL,
                 )
                 if best:
+                    # 첫 번째 팩터를 selected_factor_id에 설정 (기존 호환)
                     factor = best[0]["factor"]
                     run.selected_factor_id = factor.id
+
+                    # 전체 선택 팩터 목록도 config에 저장
+                    run.config = run.config or {}
+                    run.config["selected_factors"] = [
+                        {
+                            "factor_id": str(b["factor"].id),
+                            "name": b["factor"].name,
+                            "score": round(b["score"], 4),
+                        }
+                        for b in best
+                    ]
+                    flag_modified(run, "config")
+
+                    factors_desc = ", ".join(
+                        f"{b['factor'].name}({b['score']:.4f})" for b in best
+                    )
                     await self._log_event(
                         session, run, "factor_selected",
-                        f"팩터 선택: {factor.name} (score={best[0]['score']:.4f})",
-                        data=best[0]["breakdown"],
+                        f"팩터 {len(best)}개 선택: {factors_desc}",
+                        data={
+                            "count": len(best),
+                            "factors": [
+                                {"id": str(b["factor"].id), "name": b["factor"].name, "score": round(b["score"], 4)}
+                                for b in best
+                            ],
+                        },
                     )
                 else:
                     await self._log_event(session, run, "no_factor", "매매 가능 팩터 없음")
@@ -284,7 +308,7 @@ class DailyWorkflowOrchestrator:
                 factor_id = str(factor.id) if best else None
                 await self._set_step(
                     session, run, "pre_market", "completed",
-                    detail=f"factor={factor_id}",
+                    detail=f"factor={factor_id}, total={len(best) if best else 0}",
                 )
             except Exception as e:
                 await self._set_step(
@@ -299,6 +323,11 @@ class DailyWorkflowOrchestrator:
                 "phase": "PRE_MARKET",
                 "factor": factor.name if best else None,
                 "score": best[0]["score"] if best else None,
+                "factor_count": len(best) if best else 0,
+                "factors": [
+                    {"name": b["factor"].name, "score": round(b["score"], 4)}
+                    for b in best
+                ] if best else [],
             }
 
     async def handle_market_open(self) -> dict:
@@ -317,12 +346,25 @@ class DailyWorkflowOrchestrator:
                 await session.commit()
                 return {"success": True, "phase": "TRADING", "message": "진행 중"}
 
+            # 기존 실행 중인 세션 확인 (중복 생성 방지)
+            try:
+                from app.trading.live_runner import _sessions
+                if _sessions:
+                    running = [s for s in _sessions.values() if s.status == "running"]
+                    if running:
+                        logger.info("market_open: 이미 %d개 세션 실행 중 — 스킵", len(running))
+                        await session.commit()
+                        return {"success": True, "message": f"기존 {len(running)}개 세션 운영 중"}
+            except Exception:
+                pass
+
             # pre_market이 미실행된 경우 여기서 직접 팩터 선택 (catch-up)
             if run.selected_factor_id is None and run.phase == "IDLE":
                 logger.info("market_open: pre_market 미실행 — 팩터 직접 선택 시도")
+                multi_count = settings.WORKFLOW_MULTI_FACTOR_COUNT
                 best = await select_best_factors(
                     session,
-                    limit=1,
+                    limit=multi_count,
                     min_ic=settings.WORKFLOW_MIN_FACTOR_IC,
                     min_sharpe=settings.WORKFLOW_MIN_FACTOR_SHARPE,
                     require_causal=settings.WORKFLOW_REQUIRE_CAUSAL,
@@ -331,12 +373,32 @@ class DailyWorkflowOrchestrator:
                 if best:
                     factor = best[0]["factor"]
                     run.selected_factor_id = factor.id
+                    # 멀티 팩터 목록 저장
+                    run.config = run.config or {}
+                    run.config["selected_factors"] = [
+                        {
+                            "factor_id": str(b["factor"].id),
+                            "name": b["factor"].name,
+                            "score": round(b["score"], 4),
+                        }
+                        for b in best
+                    ]
+                    flag_modified(run, "config")
                     # IDLE → PRE_MARKET → (바로) TRADING 진행 위해 PRE_MARKET 전이
                     await self._transition(session, run, "PRE_MARKET")
+                    factors_desc = ", ".join(
+                        f"{b['factor'].name}({b['score']:.4f})" for b in best
+                    )
                     await self._log_event(
                         session, run, "factor_selected",
-                        f"catch-up 팩터 선택: {factor.name} (score={best[0]['score']:.4f})",
-                        data=best[0]["breakdown"],
+                        f"catch-up 팩터 {len(best)}개 선택: {factors_desc}",
+                        data={
+                            "count": len(best),
+                            "factors": [
+                                {"id": str(b["factor"].id), "name": b["factor"].name, "score": round(b["score"], 4)}
+                                for b in best
+                            ],
+                        },
                     )
                     await session.commit()
                     # 새 세션으로 재진입 (커밋된 상태에서 TRADING 진행)
@@ -351,28 +413,21 @@ class DailyWorkflowOrchestrator:
                 await session.commit()
                 return {"success": False, "message": "팩터 미달 — 매매 스킵"}
 
-            if not await self._transition(session, run, "TRADING"):
-                await session.commit()
-                return {"success": False, "message": f"전이 불가: {run.phase} → TRADING"}
+            if run.phase != "TRADING":
+                if not await self._transition(session, run, "TRADING"):
+                    await session.commit()
+                    return {"success": False, "message": f"전이 불가: {run.phase} → TRADING"}
 
             await self._set_step(session, run, "market_open", "running")
 
             try:
-                # 팩터 로드
                 from app.alpha.models import AlphaFactor
-                factor_stmt = select(AlphaFactor).where(
-                    AlphaFactor.id == run.selected_factor_id
-                )
-                factor_result = await session.execute(factor_stmt)
-                factor = factor_result.scalar_one_or_none()
-                if factor is None:
-                    run.error_message = "선택된 팩터를 찾을 수 없음"
-                    await self._set_step(
-                        session, run, "market_open", "error",
-                        error="팩터 조회 실패",
-                    )
-                    await session.commit()
-                    return {"success": False, "message": "팩터 조회 실패"}
+
+                # 선택된 팩터 목록 로드 (멀티 팩터)
+                selected_factors = (run.config or {}).get("selected_factors", [])
+                if not selected_factors and run.selected_factor_id:
+                    # 폴백: 단일 팩터 (기존 호환 — WORKFLOW_MULTI_FACTOR_COUNT=1 또는 레거시)
+                    selected_factors = [{"factor_id": str(run.selected_factor_id)}]
 
                 # 전일 피드백 기반 파라미터 오버라이드 로드
                 param_overrides = None
@@ -389,55 +444,108 @@ class DailyWorkflowOrchestrator:
                     except Exception as e:
                         logger.warning("전일 파라미터 로드 실패: %s", e)
 
-                # TradingContext DB 생성
+                # 각 세션이 독립 자본금 보유 (모의투자이므로 세션별 전액 배정)
+                capital_per_factor = settings.WORKFLOW_INITIAL_CAPITAL
+
                 mode = settings.WORKFLOW_TRADING_MODE
-                ctx_model = await build_context_from_factor(
-                    session, factor, mode=mode, param_overrides=param_overrides
-                )
-                run.trading_context_id = ctx_model.id
+                started_sessions: list[dict] = []
+                context_ids: list[str] = []
 
-                # 인메모리 TradingContext 동기화 + LiveSession 시작
-                # 주의: build_context_from_factor가 같은 세션에서 INSERT 했으므로
-                # 별도 세션으로 DB 저장하면 데드락 발생. 인메모리만 등록.
-                session_id = None
-                try:
-                    from app.trading.context import TradingContext, _contexts
-                    ctx = TradingContext.from_db_model(ctx_model)
-                    _contexts[ctx.id] = ctx
+                for factor_info in selected_factors:
+                    factor_id_str = factor_info["factor_id"]
+                    try:
+                        factor_uuid = uuid.UUID(factor_id_str)
+                    except (ValueError, TypeError):
+                        logger.warning("잘못된 factor_id 형식: %s", factor_id_str)
+                        continue
 
-                    from app.alpha.backtest_bridge import register_alpha_factor
-                    register_alpha_factor(str(factor.id), factor.expression_str)
+                    factor_stmt = select(AlphaFactor).where(AlphaFactor.id == factor_uuid)
+                    factor_result = await session.execute(factor_stmt)
+                    factor = factor_result.scalar_one_or_none()
+                    if factor is None:
+                        logger.warning("팩터 조회 실패 — factor_id=%s, 스킵", factor_id_str)
+                        continue
 
-                    from app.trading.live_runner import start_session
-                    live_session = await start_session(ctx)
-                    session_id = live_session.id
-                except Exception as e:
-                    logger.error("LiveSession 시작 실패: %s", e)
-                    run.error_message = f"세션 시작 실패: {e}"
+                    # TradingContext DB 생성 (분배된 자본금)
+                    ctx_model = await build_context_from_factor(
+                        session, factor, mode=mode,
+                        param_overrides=param_overrides,
+                        initial_capital=capital_per_factor,
+                    )
+                    context_ids.append(str(ctx_model.id))
+
+                    # 첫 번째 컨텍스트를 trading_context_id에 설정 (기존 호환)
+                    if run.trading_context_id is None:
+                        run.trading_context_id = ctx_model.id
+
+                    # 인메모리 TradingContext 동기화 + LiveSession 시작
+                    session_id = None
+                    try:
+                        from app.trading.context import TradingContext, _contexts
+                        ctx = TradingContext.from_db_model(ctx_model)
+                        _contexts[ctx.id] = ctx
+
+                        from app.alpha.backtest_bridge import register_alpha_factor
+                        register_alpha_factor(str(factor.id), factor.expression_str)
+
+                        from app.trading.live_runner import start_session
+                        live_session = await start_session(ctx)
+                        session_id = live_session.id
+                    except Exception as e:
+                        logger.error(
+                            "LiveSession 시작 실패 — factor=%s: %s", factor.name, e,
+                        )
+                        await self._log_event(
+                            session, run, "error",
+                            f"LiveSession 시작 실패 — factor={factor.name}: {e}",
+                        )
+
+                    started_sessions.append({
+                        "factor_id": str(factor.id),
+                        "factor_name": factor.name,
+                        "context_id": str(ctx_model.id),
+                        "session_id": session_id,
+                        "capital": round(capital_per_factor, 2),
+                    })
+
                     await self._log_event(
-                        session, run, "error",
-                        f"LiveSession 시작 실패: {e}",
+                        session, run, "trading_start",
+                        f"매매 시작: factor={factor.name}, ctx={ctx_model.id}, "
+                        f"capital={capital_per_factor:,.0f}, mode={mode}",
                     )
 
-                await self._log_event(
-                    session, run, "trading_start",
-                    f"매매 시작: factor={factor.name}, ctx={ctx_model.id}, mode={mode}",
-                )
+                if not started_sessions:
+                    run.error_message = "모든 팩터의 세션 시작 실패"
+                    await self._set_step(
+                        session, run, "market_open", "error",
+                        error="세션 0개 시작",
+                    )
+                    await session.commit()
+                    return {"success": False, "message": "모든 팩터 세션 시작 실패"}
+
+                # 멀티 컨텍스트 ID 목록 저장 (market_close에서 전체 아카이브용)
+                run.config = run.config or {}
+                run.config["trading_context_ids"] = context_ids
+                flag_modified(run, "config")
 
                 run.status = "RUNNING"
                 await self._set_step(
                     session, run, "market_open", "completed",
-                    detail=f"ctx={ctx_model.id}, session={session_id}",
+                    detail=f"sessions={len(started_sessions)}, contexts={context_ids}",
                 )
                 await session.commit()
 
                 return {
                     "success": True,
                     "phase": "TRADING",
-                    "context_id": str(ctx_model.id),
-                    "session_id": session_id,
-                    "factor_name": factor.name,
+                    "sessions": started_sessions,
+                    "session_count": len(started_sessions),
+                    "capital_per_factor": round(capital_per_factor, 2),
                     "mode": mode,
+                    # 기존 호환 필드
+                    "context_id": context_ids[0] if context_ids else None,
+                    "session_id": started_sessions[0]["session_id"] if started_sessions else None,
+                    "factor_name": started_sessions[0]["factor_name"] if started_sessions else None,
                 }
             except Exception as e:
                 await self._set_step(
@@ -507,20 +615,34 @@ class DailyWorkflowOrchestrator:
             except Exception as e:
                 logger.error("LiveSession 중지 실패: %s", e)
 
-            run.trade_count = total_trades
+            # DB에서 오늘 실제 매매 건수 집계 (인메모리 세션이 없어도 정확)
+            try:
+                from sqlalchemy import text as _text
+                _db_count = await session.execute(_text(
+                    "SELECT COUNT(*) FROM live_trades lt "
+                    "JOIN trading_contexts tc ON lt.context_id = tc.id "
+                    "WHERE tc.created_at::date = :today"
+                ), {"today": str(run.date)})
+                db_trade_count = _db_count.scalar() or 0
+                run.trade_count = max(total_trades, db_trade_count)
+            except Exception:
+                run.trade_count = total_trades
 
             # 예비 PnL 계산 (REVIEW 전에 OpenClaw이 조회할 수 있도록)
             try:
                 from app.workflow.models import LiveTrade
                 from sqlalchemy import func
+
+                # 멀티 팩터: 모든 컨텍스트의 거래를 합산
+                pnl_context_ids = (run.config or {}).get("trading_context_ids", [])
+                if not pnl_context_ids and run.trading_context_id:
+                    pnl_context_ids = [str(run.trading_context_id)]
+
+                # 오늘 전체 SELL 매매 조회 (멀티 context 합산)
                 sell_stmt = select(LiveTrade).where(
                     func.date(LiveTrade.executed_at) == run.date,
                     LiveTrade.side == "SELL",
                 )
-                if run.trading_context_id:
-                    sell_stmt = sell_stmt.where(
-                        LiveTrade.context_id == run.trading_context_id
-                    )
                 sell_result = await session.execute(sell_stmt)
                 sell_trades = list(sell_result.scalars().all())
 
@@ -541,33 +663,46 @@ class DailyWorkflowOrchestrator:
                         "win_rate": round(
                             len(wins) / len(sell_trades) * 100, 2
                         ) if sell_trades else 0,
+                        "context_count": len(pnl_context_ids),
                     }
             except Exception as e:
                 logger.warning("MARKET_CLOSE 예비 PnL 계산 실패: %s", e)
 
-            # 다이버전스 체크 (팩터 실매매 성능 감시)
-            if run.selected_factor_id:
+            # 다이버전스 체크 (팩터 실매매 성능 감시 — 멀티 팩터 전체)
+            div_factor_ids = [
+                f["factor_id"]
+                for f in (run.config or {}).get("selected_factors", [])
+            ]
+            if not div_factor_ids and run.selected_factor_id:
+                div_factor_ids = [str(run.selected_factor_id)]
+            for div_fid in div_factor_ids:
                 try:
                     from app.workflow.divergence_detector import check_divergence
-                    div_result = await check_divergence(
-                        session, str(run.selected_factor_id)
-                    )
+                    div_result = await check_divergence(session, div_fid)
                     if div_result.get("action") in ("halt", "warn"):
                         logger.info(
-                            "다이버전스 감지: %s — %s",
-                            div_result["action"], div_result,
+                            "다이버전스 감지 — factor=%s: %s — %s",
+                            div_fid, div_result["action"], div_result,
                         )
                 except Exception as e:
-                    logger.warning("다이버전스 체크 실패: %s", e)
+                    logger.warning("다이버전스 체크 실패 — factor=%s: %s", div_fid, e)
 
-            # TradingContext archived
-            if run.trading_context_id:
-                stmt = (
-                    update(TradingContextModel)
-                    .where(TradingContextModel.id == run.trading_context_id)
-                    .values(status="archived")
-                )
-                await session.execute(stmt)
+            # TradingContext archived (멀티 팩터: 전체 컨텍스트 아카이브)
+            context_ids_to_archive = (run.config or {}).get("trading_context_ids", [])
+            if not context_ids_to_archive and run.trading_context_id:
+                # 폴백: 단일 컨텍스트 (기존 호환)
+                context_ids_to_archive = [str(run.trading_context_id)]
+            for ctx_id_str in context_ids_to_archive:
+                try:
+                    ctx_uuid = uuid.UUID(ctx_id_str)
+                    stmt = (
+                        update(TradingContextModel)
+                        .where(TradingContextModel.id == ctx_uuid)
+                        .values(status="archived")
+                    )
+                    await session.execute(stmt)
+                except (ValueError, TypeError) as e:
+                    logger.warning("컨텍스트 아카이브 실패 — id=%s: %s", ctx_id_str, e)
 
             await self._set_step(
                 session, run, "market_close", "completed",
@@ -738,29 +873,33 @@ class DailyWorkflowOrchestrator:
             except Exception as e:
                 logger.warning("스탈니스 체크 실패: %s", e)
 
-            # 다이버전스 재확인 (정밀 리뷰 후)
-            if run.selected_factor_id:
+            # 다이버전스 재확인 (정밀 리뷰 후 — 멀티 팩터 전체)
+            review_factor_ids = [
+                f["factor_id"]
+                for f in (run.config or {}).get("selected_factors", [])
+            ]
+            if not review_factor_ids and run.selected_factor_id:
+                review_factor_ids = [str(run.selected_factor_id)]
+            for rev_fid in review_factor_ids:
                 try:
                     from app.workflow.divergence_detector import check_divergence
-                    div_result = await check_divergence(
-                        session, str(run.selected_factor_id)
-                    )
+                    div_result = await check_divergence(session, rev_fid)
                     if div_result.get("action") in ("halt", "warn"):
                         logger.info(
-                            "REVIEW 다이버전스: %s — %s",
-                            div_result["action"], div_result,
+                            "REVIEW 다이버전스 — factor=%s: %s — %s",
+                            rev_fid, div_result["action"], div_result,
                         )
                 except Exception as e:
-                    logger.warning("REVIEW 다이버전스 체크 실패: %s", e)
+                    logger.warning("REVIEW 다이버전스 체크 실패 — factor=%s: %s", rev_fid, e)
 
             run.completed_at = datetime.now(timezone.utc)
             await self._set_step(session, run, "review", "completed")
             await self._log_event(session, run, "review_complete", "리뷰 + 피드백 완료")
             await session.commit()
 
-        # 텔레그램: 일일 리뷰 종합 보고
+        # 텔레그램: 일일 리뷰 종합 보고 (1일 1회 — 레지스트리 체크)
         try:
-            from app.telegram.bot import send_message as tg_send
+            from app.telegram.bot import send_once
 
             trade_count = run.trade_count or 0
             pnl_pct = run.pnl_pct or 0.0
@@ -788,7 +927,10 @@ class DailyWorkflowOrchestrator:
             elif not settings.WORKFLOW_PARAM_EVAL_ENABLED:
                 tg_msg += f"\nℹ\ufe0f 파라미터 자동 조정: 비활성 상태\n"
 
-            await tg_send(tg_msg, category="review_report", caller="workflow.orchestrator")
+            await send_once(
+                "daily_review", tg_msg,
+                category="review_report", caller="workflow.orchestrator",
+            )
         except Exception as e:
             logger.debug("리뷰 텔레그램 보고 실패: %s", e)
 
@@ -987,19 +1129,49 @@ class DailyWorkflowOrchestrator:
                 async with async_session() as session:
                     run = await self._get_or_create_today(session)
                     step_info = self._get_step(run, step_key)
-                    # 이미 완료된 단계는 catch-up 불필요 (mining 제외: 반복 작업)
+
                     if step_info.get("status") == "completed" and step_key != "mining":
-                        return
+                        # 시간대 검증: completed 시각이 해당 단계의 정상 시간대 안인지 확인
+                        # 예: market_open은 09:00 이후에 완료되어야 유효
+                        _step_valid = True
+                        _at = step_info.get("at", "")
+                        if _at:
+                            try:
+                                _completed_hour = int(_at[11:13])  # HH 추출
+                                _STEP_MIN_HOUR = {
+                                    "pre_market": 8, "market_open": 9,
+                                    "market_close": 15, "review": 16,
+                                }
+                                _min_h = _STEP_MIN_HOUR.get(step_key)
+                                if _min_h is not None and _completed_hour < _min_h:
+                                    _step_valid = False
+                                    logger.info(
+                                        "step_status %s completed at %s (< %d시) — 무효, 재실행",
+                                        step_key, _at[:19], _min_h,
+                                    )
+                            except (ValueError, IndexError):
+                                pass
+                        if _step_valid:
+                            return  # 정상 완료 → catch-up 불필요
+
                     # 진행 중인 단계는 중복 실행 금지
                     if step_info.get("status") == "running":
                         return
 
-            # 이미 기대 페이즈에 있으면 OK
+            # 이미 기대 페이즈에 있으면 OK — 단, step 미완료면 재실행
             if actual_phase == expected_phase:
                 if expected_phase == "MINING":
                     await self._ensure_mining_running()
                 elif expected_phase == "TRADING":
-                    await self._session_health_check()
+                    # market_open step이 미완료면 세션 시작 필요
+                    async with async_session() as _s:
+                        _r = await self._get_or_create_today(_s)
+                        _mo = self._get_step(_r, "market_open")
+                    if _mo.get("status") != "completed":
+                        logger.info("Phase Watchdog: TRADING이지만 market_open 미완료 — handle_market_open 실행")
+                        await self.handle_market_open()
+                    else:
+                        await self._session_health_check()
                 return
 
             # 기대 페이즈가 IDLE이면 catch-up 불필요
