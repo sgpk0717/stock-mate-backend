@@ -517,7 +517,7 @@ class AlphaFactoryScheduler:
             except Exception as e:
                 logger.warning("Telegram report failed: %s", e, exc_info=True)
 
-            # WorkflowEvent에 사이클 결과 기록 (OpenClaw 조회용)
+            # WorkflowEvent에 사이클 결과 기록 (내부 로직 관측용 — 텔레그램과 독립)
             try:
                 async with async_session() as evt_db:
                     from app.workflow.models import WorkflowEvent, WorkflowRun
@@ -527,13 +527,25 @@ class AlphaFactoryScheduler:
                     today_run = await evt_db.execute(today_run_stmt)
                     wf_run = today_run.scalar_one_or_none()
                     if wf_run:
+                        disc_count = len(discovered)
+                        best_ic = max((d.ic_mean for d in discovered), default=0)
+                        if disc_count > 0:
+                            evt_msg = f"[MINING] {gen}번째 탐색 완료 — {disc_count}개 발견 (최고 IC {best_ic:.4f})"
+                        else:
+                            evt_msg = f"[MINING] {gen}번째 탐색 완료 — 기준 통과 전략 없음"
                         evt = WorkflowEvent(
                             workflow_run_id=wf_run.id,
-                            event_type="mining_cycle_complete",
-                            message=(
-                                f"사이클 {cycle_num}: {len(discovered)}개 발견 "
-                                f"(총 {self._state.factors_discovered_total}개)"
-                            ),
+                            phase=wf_run.phase,
+                            event_type="mining_cycle",
+                            message=evt_msg,
+                            data={
+                                "level": "info",
+                                "gen": gen,
+                                "cycle": cycle_num,
+                                "discovered": disc_count,
+                                "best_ic": round(best_ic, 4),
+                                "total": self._state.factors_discovered_total,
+                            },
                         )
                         evt_db.add(evt)
                         await evt_db.commit()
@@ -693,81 +705,75 @@ class AlphaFactoryScheduler:
         else:
             status_emoji = "\U0001f52c"  # 🔬
 
-        msg = f"{status_emoji} <b>세대 {gen} 완료</b> ({elapsed_str})\n\n"
+        msg = f"{status_emoji} <b>{gen}번째 탐색 완료</b> ({elapsed_str})\n\n"
 
-        # 결과
-        msg += (
-            f"\U0001f4ca <b>결과</b>\n"
-            f"  발견: <b>{discovered_count}개</b> / 누적: {total}개\n"
-        )
+        # 결과 — 쉬운 말로
+        if discovered_count > 0:
+            msg += f"이번에 쓸 만한 전략을 <b>{discovered_count}개</b> 찾았어요! (지금까지 총 {total}개)\n"
+        else:
+            msg += f"이번엔 기준을 통과한 전략이 없었어요. (지금까지 총 {total}개)\n"
 
-        # 발견 팩터 상세
+        # 발견 팩터 상세 — 쉽게 설명
         if report_data["discovered_factors"]:
-            msg += f"\n\U0001f3c6 <b>발견 팩터 (상위 3개)</b>\n"
+            msg += f"\n\U0001f3c6 <b>찾아낸 전략 (상위 3개)</b>\n"
             for i, d in enumerate(report_data["discovered_factors"][:3], 1):
                 ic = d.get("ic_mean", 0)
                 sh = d.get("sharpe", 0)
+                # IC/Sharpe를 별점으로 직관 표현
+                ic_stars = "\u2b50" * min(5, max(1, int(ic / 0.03)))
                 msg += (
-                    f"  {i}. <code>{d['expression'][:40]}</code>\n"
-                    f"     IC={ic:.4f} / Sharpe={sh:.2f}\n"
+                    f"  {i}. 예측력 {ic_stars} ({ic:.3f})"
+                    f" · 안정성 {sh:.1f}점\n"
                 )
 
-        # 진화 과정
+        # 진화 과정 — 비유로 설명
         if f.get("attempted"):
             attempted = f["attempted"]
             eval_ok = f.get("eval_ok", 0)
             ic_pass = f.get("ic_pass", 0)
-
-            # 연산자 분포
-            op_info = ""
-            ast_count = sum(v for k, v in op_breakdown.items() if k.startswith("ast_"))
-            llm_count = sum(v for k, v in op_breakdown.items() if k.startswith("llm_"))
-            if ast_count or llm_count:
-                op_info = f" (AST {ast_count} / LLM {llm_count})"
-
             eval_pct = int(eval_ok / attempted * 100) if attempted else 0
-            ic_pct = int(ic_pass / max(eval_ok, 1) * 100)
 
             msg += (
-                f"\n\u2699\ufe0f <b>진화 과정</b>\n"
-                f"  후보 생성: {attempted}개{op_info}\n"
-                f"  \u251c 계산 성공: {eval_ok}개 ({eval_pct}%)\n"
-                f"  \u251c IC\u2265{ic_thr} 통과: {ic_pass}개 ({ic_pct}%)\n"
+                f"\n\U0001f9ec <b>이번 탐색 과정</b>\n"
+                f"  {attempted}개 후보를 만들어서 테스트했어요\n"
+                f"  \u251c 제대로 계산된 것: {eval_ok}개 ({eval_pct}%)\n"
+                f"  \u251c 예측력 기준 통과: {ic_pass}개\n"
             )
             wf_overfit = f.get("wf_overfit", 0)
             sharpe_fail = f.get("sharpe_fail", 0)
             if wf_overfit > 0:
-                msg += f"  \u251c 과적합 탈락: {wf_overfit}개\n"
+                msg += f"  \u251c 과거에만 잘 맞는 것 제외: {wf_overfit}개\n"
             if sharpe_fail > 0:
-                msg += f"  \u251c Sharpe 미달: {sharpe_fail}개\n"
-            msg += f"  \u2514 최종 발견: {discovered_count}개\n"
+                msg += f"  \u251c 수익이 불안정한 것 제외: {sharpe_fail}개\n"
+            msg += f"  \u2514 최종 합격: <b>{discovered_count}개</b>\n"
 
-        # 최고 성적 (미발견 시)
+        # 미발견 시 최고 성적
         if not report_data["discovered_factors"]:
             samples = report_data.get("top_samples") or report_data.get("fail_samples", [])
             if samples:
-                msg += f"\n\U0001f4c8 <b>최고 성적</b>\n"
-                for i, s in enumerate(samples[:3], 1):
-                    expr = s.get("expression", "?")[:45]
-                    ic_val = s.get("ic", 0)
-                    msg += f"  {i}. <code>{expr}</code>  IC={ic_val:.4f}\n"
+                best_ic = max(s.get("ic", 0) for s in samples)
+                msg += f"\n\U0001f4c8 가장 유망했던 후보의 예측력: {best_ic:.4f}\n"
 
-        # 동적 해석
+        # 쉬운 해석
         if discovered_count == 0:
             best_ic = 0.0
             all_samples = report_data.get("top_samples", []) + report_data.get("fail_samples", [])
             if all_samples:
                 best_ic = max(s.get("ic", 0) for s in all_samples)
             if best_ic >= ic_thr * 0.8:
-                msg += f"\n\U0001f4a1 IC {ic_thr}에 근접 (최고 {best_ic:.4f}). 진화 중.\n"
+                msg += f"\n\U0001f4a1 기준에 거의 근접했어요. 조금만 더 진화하면 찾을 수 있어요.\n"
             elif f.get("eval_ok", 0) == 0:
-                msg += f"\n\U0001f4a1 수식 계산 실패 다수 \u2014 데이터 점검 필요.\n"
+                msg += f"\n\u26a0\ufe0f 계산 실패가 많아요. 데이터를 점검해볼 필요가 있어요.\n"
             else:
-                msg += f"\n\U0001f4a1 기준(IC>{ic_thr}) 미달. 세대 누적으로 개선됩니다.\n"
+                msg += f"\n\U0001f4a1 아직 좋은 전략을 못 찾았지만, 탐색을 계속하면 점점 나아져요.\n"
         else:
-            msg += f"\n\U0001f4a1 IC = 주가 예측력 (0.03+) / Sharpe = 수익 안정성 (1.0+)\n"
+            msg += (
+                f"\n\U0001f4a1 <b>용어 설명</b>\n"
+                f"  예측력(IC): 내일 주가를 얼마나 잘 맞추는지 (높을수록 좋음)\n"
+                f"  안정성(Sharpe): 수익이 꾸준한지 (1.0 이상이면 좋음)\n"
+            )
 
-        msg += f"\n\u2699\ufe0f {universe_code} / {data_interval} / 사이클 {cycle_num}"
+        msg += f"\n\u2699\ufe0f 탐색 범위: {universe_code} / {data_interval} / {cycle_num}번째 사이클"
         return msg
 
     async def _run_causal_validation(self, run_id: uuid.UUID, cycle_num: int) -> None:
