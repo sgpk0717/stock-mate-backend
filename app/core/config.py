@@ -98,6 +98,7 @@ class Settings(BaseSettings):
     ALPHA_MAX_TREE_DEPTH: int = 10
     ALPHA_MAX_TREE_SIZE: int = 30
     ALPHA_TOURNAMENT_K: int = 5
+    ALPHA_NICHE_MAX_PCT: float = 0.25        # 니치별 최대 모집단 비율 (0.25=25%, 1.0=비활성화)
 
     # Evolution Engine 병렬화
     ALPHA_LLM_MAX_CONCURRENT: int = 20       # LLM 동시 호출 수 (Tier 3 기준)

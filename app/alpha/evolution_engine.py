@@ -535,9 +535,8 @@ class EvolutionEngine:
         all_new = elites + offspring
         all_new = self._deduplicate(all_new)
 
-        # 6. 모집단 크기 제한
-        all_new.sort(key=lambda f: f.fitness_composite, reverse=True)
-        final_population = all_new[:self._population_size]
+        # 6. 모집단 크기 제한 (niche-based diversity cap)
+        final_population = self._niche_cap_trim(all_new, self._population_size)
 
         # 6.5. 벡터 메모리에 경험 저장
         if self._vector_memory and new_discovered:
@@ -838,6 +837,68 @@ class EvolutionEngine:
         n_elite = max(1, math.ceil(len(population) * self._elite_pct))
         sorted_pop = sorted(population, key=lambda f: f.fitness_composite, reverse=True)
         return sorted_pop[:n_elite]
+
+    def _niche_cap_trim(
+        self, population: list[ScoredFactor], target_size: int,
+    ) -> list[ScoredFactor]:
+        """니치(피처 패밀리)별 최대 점유율을 적용하여 모집단 크기 제한.
+
+        Algorithm:
+        1. 각 팩터를 dominant feature family(니치)로 분류
+        2. fitness 내림차순 정렬
+        3. Pass 1: 니치별 max_per_niche까지만 수용, 초과 시 overflow로
+        4. Pass 2: 미달 시 overflow에서 보충 (항상 target_size 유지)
+        """
+        from app.alpha.ast_converter import classify_niche
+
+        if len(population) <= target_size:
+            return population
+
+        max_pct = settings.ALPHA_NICHE_MAX_PCT
+        if max_pct >= 1.0:
+            # 비활성화: 기존 fitness 순 트리밍
+            population.sort(key=lambda f: f.fitness_composite, reverse=True)
+            return population[:target_size]
+
+        max_per_niche = max(2, int(target_size * max_pct))
+
+        # 니치 분류 + fitness 내림차순 정렬
+        labeled = [(f, classify_niche(f.expression)) for f in population]
+        labeled.sort(key=lambda x: x[0].fitness_composite, reverse=True)
+
+        # Pass 1: 니치별 캡 적용
+        accepted: list[ScoredFactor] = []
+        overflow: list[ScoredFactor] = []
+        niche_counts: dict[str, int] = {}
+
+        for factor, niche in labeled:
+            count = niche_counts.get(niche, 0)
+            if count < max_per_niche:
+                accepted.append(factor)
+                niche_counts[niche] = count + 1
+                if len(accepted) >= target_size:
+                    break
+            else:
+                overflow.append(factor)
+
+        # Pass 2: 미달분 overflow에서 보충
+        if len(accepted) < target_size:
+            remaining = target_size - len(accepted)
+            accepted.extend(overflow[:remaining])
+
+        # 니치 분포 로그
+        final_dist: dict[str, int] = {}
+        for factor in accepted:
+            n = classify_niche(factor.expression)
+            final_dist[n] = final_dist.get(n, 0) + 1
+
+        logger.warning(
+            "Niche cap trim: %d → %d (max_per_niche=%d). Distribution: %s",
+            len(population), len(accepted), max_per_niche,
+            {k: v for k, v in sorted(final_dist.items(), key=lambda x: -x[1])},
+        )
+
+        return accepted
 
     def _split_train_val(self) -> tuple[pl.DataFrame, pl.DataFrame | None]:
         """데이터를 Train(70%) / Validation(30%) 분할."""

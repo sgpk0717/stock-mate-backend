@@ -177,6 +177,83 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
 _ALL_VARIABLES = {**VARIABLE_MAP, **NAMED_VARIABLE_MAP}
 
 
+# ── Feature Family Taxonomy (Niche 분류용) ──
+_FAMILY_DEFINITIONS: dict[str, list[str]] = {
+    "price": [
+        "close", "open", "high", "low",
+        "close_lag_1", "close_lag_5", "close_lag_20",
+        "bb_upper", "bb_lower", "bb_middle", "bb_position", "bb_width",
+        "sma_5", "sma_10", "sma_20", "sma_60",
+        "ema_5", "ema_10", "ema_20", "ema_60",
+        "price_change_pct",
+        "gap_up_pct", "gap_down_pct",
+        "range_breakout", "range_breakdown",
+        "rank_close", "zscore_close", "ts_rank_close", "ts_zscore_close",
+    ],
+    "volume": [
+        "volume", "volume_ratio",
+        "volume_lag_1", "volume_lag_5",
+        "rank_volume", "zscore_volume", "ts_rank_volume", "ts_zscore_volume",
+        "vol_spike_5d", "vol_spike_20d", "consec_low_vol_5", "vol_dry_then_spike",
+    ],
+    "momentum": [
+        "rsi", "rsi_7", "rsi_21",
+        "macd_hist", "macd_line", "macd_signal",
+        "macd_cross_up", "rsi_oversold_bounce",
+        "return_5d", "return_20d",
+        "consec_up", "consec_down",
+    ],
+    "volatility": [
+        "atr_7", "atr_14", "atr_21",
+        "bb_squeeze", "bb_breakout_upper",
+    ],
+    "supply": [
+        "foreign_net_norm", "inst_net_norm", "retail_net_norm",
+        "foreign_buy_ratio", "inst_buy_ratio", "retail_buy_ratio",
+        "foreign_accumulate_5d", "inst_accumulate_5d",
+    ],
+    "fundamental": [
+        "eps", "bps", "operating_margin", "debt_to_equity",
+        "earnings_yield", "book_yield",
+    ],
+    "sentiment": [
+        "sentiment_score", "article_count", "event_score",
+    ],
+    "market_micro": [
+        "margin_rate", "short_balance_rate", "short_volume_ratio",
+        "pgm_net_norm", "pgm_buy_ratio",
+        "sector_return", "sector_rel_strength", "sector_rank",
+    ],
+}
+
+FEATURE_FAMILY_MAP: dict[str, str] = {}
+for _family, _cols in _FAMILY_DEFINITIONS.items():
+    for _col in _cols:
+        FEATURE_FAMILY_MAP[_col] = _family
+
+
+def classify_niche(expr: "sympy.Basic") -> str:
+    """수식의 dominant feature family(니치)를 반환.
+
+    free_symbols를 패밀리로 분류하고, 가장 많이 등장한 패밀리를 반환한다.
+    동점 시 알파벳 순서로 결정 (결정적).
+    인식된 피처가 없으면 'unknown' 반환.
+    """
+    family_counts: dict[str, int] = {}
+    for sym in expr.free_symbols:
+        col_name = _ALL_VARIABLES.get(str(sym), str(sym))
+        family = FEATURE_FAMILY_MAP.get(col_name, "unknown")
+        family_counts[family] = family_counts.get(family, 0) + 1
+
+    if not family_counts:
+        return "unknown"
+
+    return max(
+        family_counts.keys(),
+        key=lambda f: (family_counts[f], f),  # count 우선, 동점 시 이름순
+    )
+
+
 class ASTConversionError(Exception):
     """SymPy → Polars 변환 실패."""
 
