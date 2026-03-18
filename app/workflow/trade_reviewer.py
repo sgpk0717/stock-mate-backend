@@ -45,6 +45,9 @@ class TradeReviewResult:
     stop_loss_trigger_rate: float = 0.0  # SELL 중 S-STOP 비율
     trailing_trigger_rate: float = 0.0  # SELL 중 S-TRAIL 비율
 
+    # 세션별 분리 성과
+    per_session: list[dict] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         return {
             "trade_count": self.trade_count,
@@ -64,6 +67,7 @@ class TradeReviewResult:
             "improvements": self.improvements,
             "stop_loss_trigger_rate": round(self.stop_loss_trigger_rate, 4),
             "trailing_trigger_rate": round(self.trailing_trigger_rate, 4),
+            "per_session": self.per_session,
         }
 
 
@@ -79,14 +83,20 @@ class TradeReviewer:
         """WorkflowRun에 연결된 세션의 매매 로그를 분석."""
         result = TradeReviewResult()
 
-        # 1차: DB에서 당일 매매 조회 (C3 영속화된 데이터)
+        # DB에서 당일 매매 조회 — 현재 세션(config.trading_context_ids)만 필터
         trade_logs: list[dict] = []
+        ctx_ids = (run.config or {}).get("trading_context_ids", [])
         try:
-            stmt = select(LiveTrade).where(
-                func.date(LiveTrade.executed_at) == run.date,
-            )
-            if run.trading_context_id:
-                stmt = stmt.where(LiveTrade.context_id == run.trading_context_id)
+            if ctx_ids:
+                stmt = select(LiveTrade).where(
+                    func.date(LiveTrade.executed_at) == run.date,
+                    LiveTrade.context_id.in_([uuid.UUID(c) for c in ctx_ids]),
+                )
+            else:
+                # 폴백: context_id가 없으면 오늘 전체 (하위 호환)
+                stmt = select(LiveTrade).where(
+                    func.date(LiveTrade.executed_at) == run.date,
+                )
             db_result = await session.execute(stmt)
             db_trades = db_result.scalars().all()
             if db_trades:
@@ -119,13 +129,19 @@ class TradeReviewer:
         result.win_rate = (len(wins) / len(sell_logs) * 100) if sell_logs else 0
 
         pnls = [t.get("pnl_pct") or 0 for t in sell_logs]
-        result.total_pnl_pct = sum(pnls)
         result.max_single_loss_pct = min(pnls) if pnls else 0
         result.max_single_gain_pct = max(pnls) if pnls else 0
 
         # 총 PnL 금액
         pnl_amounts = [t.get("pnl_amount") or 0 for t in sell_logs]
         result.total_pnl = sum(pnl_amounts)
+
+        # PnL %: 자본금 기준 (개별 pnl_pct 합산이 아닌 총 손익/자본금)
+        from app.core.config import settings
+        initial_capital = float(getattr(settings, "WORKFLOW_INITIAL_CAPITAL", 100_000_000))
+        num_sessions = max(len(ctx_ids), 1)
+        total_capital = initial_capital  # 멀티 세션이어도 자본금은 1억 (분배됨)
+        result.total_pnl_pct = (result.total_pnl / total_capital * 100) if total_capital > 0 else 0.0
 
         # 보유 시간 계산
         holdings = [
@@ -155,6 +171,55 @@ class TradeReviewer:
 
         # 규칙 기반 개선 방향 도출 (설계서 §12.2)
         result.improvements = self._derive_improvements(result)
+
+        # 세션별 분리 성과
+        if ctx_ids:
+            from app.alpha.models import AlphaFactor
+            selected_factors = (run.config or {}).get("selected_factors", [])
+
+            capital_per_session = initial_capital / num_sessions
+            for idx, cid in enumerate(ctx_ids):
+                ctx_trades = [t for t in trade_logs if str(t.get("context_id", "")) == cid]
+                ctx_sells = [t for t in ctx_trades if t.get("side") == "SELL"]
+                ctx_pnl_amt = sum(t.get("pnl_amount") or 0 for t in ctx_sells)
+                ctx_wins = len([t for t in ctx_sells if (t.get("pnl_pct") or 0) > 0])
+                ctx_losses = len([t for t in ctx_sells if (t.get("pnl_pct") or 0) < 0])
+
+                # 팩터 정보 (인덱스 기반: 첫 번째 factor → 첫 번째 context)
+                sf = selected_factors[idx] if idx < len(selected_factors) else {}
+                factor_name = sf.get("name", "?")
+                factor_id = sf.get("factor_id", "")
+
+                # 팩터 수식 조회
+                expr_str = ""
+                ic_mean = 0.0
+                if factor_id:
+                    try:
+                        fr = await session.execute(
+                            select(AlphaFactor.expression_str, AlphaFactor.ic_mean)
+                            .where(AlphaFactor.id == uuid.UUID(factor_id))
+                        )
+                        frow = fr.fetchone()
+                        if frow:
+                            expr_str = frow[0] or ""
+                            ic_mean = frow[1] or 0.0
+                    except Exception:
+                        pass
+
+                result.per_session.append({
+                    "context_id": cid,
+                    "factor_name": factor_name,
+                    "factor_id": factor_id,
+                    "expression": expr_str[:120],
+                    "ic_mean": round(ic_mean, 4),
+                    "trade_count": len(ctx_trades),
+                    "sell_count": len(ctx_sells),
+                    "win_count": ctx_wins,
+                    "loss_count": ctx_losses,
+                    "win_rate": round(ctx_wins / len(ctx_sells) * 100, 1) if ctx_sells else 0,
+                    "pnl_amount": round(ctx_pnl_amt, 2),
+                    "pnl_pct": round(ctx_pnl_amt / capital_per_session * 100, 2) if capital_per_session > 0 else 0,
+                })
 
         # live_feedback 테이블에 기록
         if run.selected_factor_id:
@@ -237,6 +302,7 @@ class TradeReviewer:
     def _trade_model_to_dict(t: LiveTrade) -> dict:
         """LiveTrade DB 모델 → trade_log dict 변환."""
         return {
+            "context_id": str(t.context_id) if t.context_id else "",
             "symbol": t.symbol,
             "name": t.name,
             "side": t.side,

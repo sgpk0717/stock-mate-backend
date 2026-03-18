@@ -33,24 +33,38 @@ _last_update_id: int = 0
 # 승인 대기 큐: callback_data → {description, resolver_future}
 _approval_queue: dict[str, dict] = {}
 
+# 발송 큐 + rate limiter (Telegram: 같은 채팅 초당 1건, 분당 20건)
+_send_queue: asyncio.Queue | None = None
+_send_worker_task: asyncio.Task | None = None
+_MIN_INTERVAL = 1.5  # 발송 간격 (초) — 여유 확보
+
 
 async def _api(method: str, **kwargs) -> dict | None:
-    """Telegram Bot API 호출."""
+    """Telegram Bot API 호출 (429 시 retry_after 대기 후 재시도)."""
     token = settings.TELEGRAM_BOT_TOKEN
     if not token:
         return None
     url = f"{_BASE_URL.format(token=token)}/{method}"
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=kwargs)
-            data = resp.json()
-            if not data.get("ok"):
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.post(url, json=kwargs)
+                data = resp.json()
+                if data.get("ok"):
+                    return data.get("result")
+                # 429 Too Many Requests — retry_after 대기
+                if data.get("error_code") == 429:
+                    retry_after = data.get("parameters", {}).get("retry_after", 5)
+                    logger.info("Telegram 429 — %d초 대기 후 재시도 (%d/%d)", retry_after, attempt + 1, max_retries)
+                    await asyncio.sleep(retry_after)
+                    continue
                 logger.warning("Telegram API %s failed: %s", method, data)
                 return None
-            return data.get("result")
-    except Exception as e:
-        logger.error("Telegram API %s error: %s", method, e)
-        return None
+        except Exception as e:
+            logger.error("Telegram API %s error: %s", method, e)
+            return None
+    return None
 
 
 # ── 발송 로깅 ──
@@ -94,8 +108,7 @@ async def send_message(
     category: str = "system",
     caller: str = "",
 ) -> dict | None:
-    """메시지 전송 + DB 로깅."""
-    # KST 타임스탬프 자동 추가
+    """메시지를 Redis Stream에 발행. Redis 실패 시 인메모리 큐 폴백."""
     from datetime import datetime, timezone, timedelta
     _KST = timezone(timedelta(hours=9))
     _ts = datetime.now(_KST).strftime("[%Y-%m-%d %H:%M:%S KST]")
@@ -105,18 +118,196 @@ async def send_message(
     if not cid:
         await _log_message(category, caller, text, "", "skipped", "chat_id 없음")
         return None
-    kwargs = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
+
+    fields = {
+        "text": text,
+        "chat_id": cid,
+        "category": category,
+        "caller": caller,
+    }
     if reply_markup:
-        kwargs["reply_markup"] = reply_markup
+        fields["reply_markup"] = json.dumps(reply_markup)
+
+    # Redis Stream 발행 (메인 경로)
+    try:
+        from app.core.redis import xadd
+        msg_id = await xadd("telegram:outbox", fields, maxlen=1000)
+        if msg_id:
+            return None
+    except Exception:
+        pass
+
+    # Redis 실패 시 인메모리 큐 폴백
+    _ensure_send_worker()
+    await _send_queue.put(fields)
+    return None
+
+
+def _ensure_send_worker() -> None:
+    """발송 워커가 없으면 시작."""
+    global _send_queue, _send_worker_task
+    if _send_queue is None:
+        _send_queue = asyncio.Queue()
+    if _send_worker_task is None or _send_worker_task.done():
+        _send_worker_task = asyncio.create_task(_send_worker_loop())
+
+
+async def _send_worker_loop() -> None:
+    """큐에서 메시지를 꺼내 rate limit에 맞춰 시간순 발송."""
+    logger.info("텔레그램 발송 워커 시작")
+    while True:
+        try:
+            msg = await _send_queue.get()
+            kwargs = {"chat_id": msg["chat_id"], "text": msg["text"], "parse_mode": "HTML"}
+            if msg.get("reply_markup"):
+                kwargs["reply_markup"] = msg["reply_markup"]
+
+            result = await _api("sendMessage", **kwargs)
+            if result:
+                await _log_message(
+                    msg["category"], msg["caller"], msg["text"], msg["chat_id"],
+                    "success", telegram_message_id=result.get("message_id"),
+                )
+            else:
+                await _log_message(
+                    msg["category"], msg["caller"], msg["text"], msg["chat_id"],
+                    "failed", "API 호출 실패",
+                )
+
+            # rate limit 간격 대기
+            await asyncio.sleep(_MIN_INTERVAL)
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("텔레그램 발송 워커 오류: %s", e)
+            await asyncio.sleep(2)
+
+
+async def _deliver(fields: dict) -> bool:
+    """단일 메시지 Telegram 발송 + DB 로깅. 성공 시 True."""
+    kwargs = {"chat_id": fields["chat_id"], "text": fields["text"], "parse_mode": "HTML"}
+    rm = fields.get("reply_markup")
+    if rm:
+        kwargs["reply_markup"] = json.loads(rm) if isinstance(rm, str) else rm
+
     result = await _api("sendMessage", **kwargs)
-    if result:
-        await _log_message(
-            category, caller, text, cid, "success",
-            telegram_message_id=result.get("message_id"),
+    status = "success" if result else "failed"
+    await _log_message(
+        fields.get("category", "system"),
+        fields.get("caller", ""),
+        fields["text"],
+        fields["chat_id"],
+        status,
+        error_message=None if result else "API 호출 실패",
+        telegram_message_id=result.get("message_id") if result else None,
+    )
+    return bool(result)
+
+
+# ── Redis Stream Consumer ──
+
+_TG_STREAM = "telegram:outbox"
+_TG_GROUP = "tg_senders"
+_TG_CONSUMER = "worker-1"
+
+
+async def start_telegram_consumer() -> None:
+    """Redis Stream consumer 시작 (Worker에서 호출).
+
+    PEL(Pending Entry List)에서 미처리 메시지를 먼저 복구한 뒤,
+    신규 메시지를 블로킹 소비한다. 실패 시 ACK 안 함 → 재시작 시 재처리.
+    """
+    from app.core.redis import ensure_consumer_group, xreadgroup, xack
+
+    await ensure_consumer_group(_TG_STREAM, _TG_GROUP)
+    logger.info("텔레그램 Redis consumer 시작 (stream=%s, group=%s)", _TG_STREAM, _TG_GROUP)
+
+    # Phase 1: PEL 복구 (미처리 메시지)
+    try:
+        pending = await xreadgroup(
+            _TG_GROUP, _TG_CONSUMER, {_TG_STREAM: "0-0"}, count=50, block=0,
         )
-    else:
-        await _log_message(category, caller, text, cid, "failed", "API 호출 실패")
-    return result
+        recovered = 0
+        for _stream_name, messages in pending:
+            for msg_id, fields in messages:
+                if not fields:
+                    await xack(_TG_STREAM, _TG_GROUP, msg_id)
+                    continue
+                success = await _deliver(fields)
+                if success:
+                    await xack(_TG_STREAM, _TG_GROUP, msg_id)
+                    recovered += 1
+                await asyncio.sleep(_MIN_INTERVAL)
+        if recovered:
+            logger.info("텔레그램 PEL 복구: %d건 재발송", recovered)
+    except Exception as e:
+        logger.warning("텔레그램 PEL 복구 실패: %s", e)
+
+    # Phase 2: 신규 메시지 소비 (블로킹 루프)
+    while True:
+        try:
+            results = await xreadgroup(
+                _TG_GROUP, _TG_CONSUMER, {_TG_STREAM: ">"}, count=1, block=5000,
+            )
+            for _stream_name, messages in results:
+                for msg_id, fields in messages:
+                    success = await _deliver(fields)
+                    if success:
+                        await xack(_TG_STREAM, _TG_GROUP, msg_id)
+                    await asyncio.sleep(_MIN_INTERVAL)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error("텔레그램 consumer 오류: %s", e)
+            await asyncio.sleep(3)
+
+
+async def send_once(
+    message_key: str,
+    text: str,
+    *,
+    category: str = "system",
+    caller: str = "",
+) -> bool:
+    """1일 1회성 메시지 발송 (레지스트리 체크 → 중복 방지).
+
+    Returns True if sent, False if already sent today.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import text as sa_text
+
+    _KST = timezone(timedelta(hours=9))
+    today = datetime.now(_KST).date()
+
+    try:
+        from app.core.database import async_session as _async_session
+
+        async with _async_session() as db:
+            row = await db.execute(sa_text(
+                "SELECT 1 FROM telegram_message_registry "
+                "WHERE message_key=:k AND date=:d"
+            ), {"k": message_key, "d": today})
+            if row.scalar():
+                logger.info("메시지 '%s' 이미 발송됨 — 스킵", message_key)
+                return False
+
+            await send_message(text, category=category, caller=caller)
+            await db.execute(sa_text(
+                "INSERT INTO telegram_message_registry (message_key, date, sender) "
+                "VALUES (:k, :d, 'backend') ON CONFLICT DO NOTHING"
+            ), {"k": message_key, "d": today})
+            await db.commit()
+            return True
+    except Exception as e:
+        logger.warning("send_once 실패 (%s): %s", message_key, e)
+        # 레지스트리 실패해도 메시지는 발송 시도
+        try:
+            await send_message(text, category=category, caller=caller)
+        except Exception:
+            pass
+        return True
 
 
 async def request_approval(
