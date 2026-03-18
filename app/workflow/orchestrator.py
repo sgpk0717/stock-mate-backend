@@ -114,6 +114,7 @@ class DailyWorkflowOrchestrator:
         event_type: str,
         message: str,
         data: dict | None = None,
+        level: str = "info",
     ) -> None:
         event = WorkflowEvent(
             id=uuid.uuid4(),
@@ -121,7 +122,7 @@ class DailyWorkflowOrchestrator:
             phase=run.phase,
             event_type=event_type,
             message=message,
-            data=data,
+            data={**(data or {}), "level": level},
         )
         session.add(event)
 

@@ -1103,6 +1103,31 @@ async def _paper_loop_tick(
     # Redis 동기화 (Phase 1: 매 tick마다)
     await _sync_session_to_redis(session)
 
+    # workflow_events에 매매 요약 기록 (내부 로직 관측 — 텔레그램과 독립)
+    new_trades = len(session.trade_log) - getattr(session, "_prev_trade_count", 0)
+    if new_trades > 0:
+        session._prev_trade_count = len(session.trade_log)
+        try:
+            from app.core.database import async_session as get_db
+            from app.workflow.models import WorkflowEvent, WorkflowRun
+            from sqlalchemy import select
+            from datetime import date
+            async with get_db() as evt_db:
+                wf = await evt_db.execute(select(WorkflowRun).where(WorkflowRun.date == date.today()))
+                run = wf.scalar_one_or_none()
+                if run:
+                    evt = WorkflowEvent(
+                        workflow_run_id=run.id,
+                        phase=run.phase,
+                        event_type="trade_tick",
+                        message=f"[TRADING] {session.context.strategy_name} — {new_trades}건 체결 (포지션 {len(session.positions)}개)",
+                        data={"level": "info", "session_id": session.id[:8], "new_trades": new_trades, "total_trades": len(session.trade_log), "positions": len(session.positions)},
+                    )
+                    evt_db.add(evt)
+                    await evt_db.commit()
+        except Exception:
+            pass
+
     await manager.broadcast("trading:update", {
         "session_id": session.id,
         "positions": len(session.positions),
