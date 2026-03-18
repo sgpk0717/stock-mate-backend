@@ -38,14 +38,39 @@ _FULL_SNAP_KEYS = (
 
 
 @dataclass
-class LivePosition:
-    """실시간 포지션 추적."""
-    symbol: str
+class LiveScaleEntry:
+    """개별 매수 건 (backtest _ScaleEntry 미러링)."""
+    date: str
+    price: float
     qty: int
-    avg_price: float
+    step: str  # "B1", "B2", "B-EXT"
+
+
+@dataclass
+class LivePosition:
+    """실시간 포지션 추적 (entries 기반 분할매매 지원)."""
+    symbol: str
+    entries: list[LiveScaleEntry] = field(default_factory=list)
     highest_price: float = 0.0
-    entry_date: str = ""        # 캔들 dt (시뮬 기준 시각)
-    entry_candle_dt: str = ""   # 진입 봉의 원본 dt (보유시간 계산용)
+    conviction: float = 0.0
+    target_qty: int = 0               # 분할매수 목표 수량
+    scale_in_count: int = 0           # B2 횟수
+    has_partial_exited: bool = False   # S-HALF 1회 제한
+    entry_candle_dt: str = ""         # 진입 봉의 원본 dt (보유시간 계산용)
+
+    @property
+    def qty(self) -> int:
+        return sum(e.qty for e in self.entries)
+
+    @property
+    def avg_price(self) -> float:
+        total_cost = sum(e.price * e.qty for e in self.entries)
+        total_q = self.qty
+        return total_cost / total_q if total_q > 0 else 0.0
+
+    @property
+    def entry_date(self) -> str:
+        return self.entries[0].date if self.entries else ""
 
 
 @dataclass
@@ -75,7 +100,14 @@ class LiveSession:
             "strategy_name": self.context.strategy_name,
             "status": self.status,
             "positions": {
-                sym: {"symbol": p.symbol, "qty": p.qty, "avg_price": p.avg_price}
+                sym: {
+                    "symbol": p.symbol, "qty": p.qty, "avg_price": p.avg_price,
+                    "entries_count": len(p.entries),
+                    "conviction": p.conviction,
+                    "scale_in_count": p.scale_in_count,
+                    "has_partial_exited": p.has_partial_exited,
+                    "target_qty": p.target_qty,
+                }
                 for sym, p in self.positions.items()
             },
             "trade_count": len(self.trade_log),
@@ -87,6 +119,42 @@ class LiveSession:
 
 # 세션 저장소
 _sessions: dict[str, LiveSession] = {}
+_intraday_collector_task: asyncio.Task | None = None
+
+
+async def _sync_session_to_redis(session: LiveSession) -> None:
+    """세션 상태를 Redis Hash에 동기화 (Phase 1: 이중 기록)."""
+    try:
+        from app.core.redis import hset
+        import json
+        d = session.to_dict()
+        await hset(f"sessions:{session.id}", {
+            "id": d["id"],
+            "context_id": d["context_id"],
+            "mode": d["mode"],
+            "strategy_name": d["strategy_name"],
+            "status": d["status"],
+            "positions": json.dumps(d["positions"], ensure_ascii=False),
+            "trade_count": str(d["trade_count"]),
+            "error_message": d["error_message"],
+            "started_at": d["started_at"],
+            "stopped_at": d["stopped_at"],
+        })
+    except Exception:
+        pass  # Redis 실패해도 기존 동작에 영향 없음
+
+
+async def _sync_sessions_index_to_redis() -> None:
+    """활성 세션 ID 목록을 Redis Set에 동기화."""
+    try:
+        from app.core.redis import get_client
+        r = get_client()
+        ids = list(_sessions.keys())
+        await r.delete("sessions:index")
+        if ids:
+            await r.sadd("sessions:index", *ids)
+    except Exception:
+        pass
 
 
 async def start_session(ctx: TradingContext) -> LiveSession:
@@ -98,11 +166,32 @@ async def start_session(ctx: TradingContext) -> LiveSession:
         started_at=datetime.now().isoformat(),
         _cash=ctx.initial_capital,
     )
+
+    # 오늘 이미 매매한 기록이 있으면 마지막 시각 복구 (재시작 시 중복 리플레이 방지)
+    try:
+        from app.core.database import async_session as get_session
+        from sqlalchemy import text
+        async with get_session() as db:
+            row = await db.execute(text(
+                "SELECT MAX(executed_at) FROM live_trades "
+                "WHERE executed_at >= CURRENT_DATE"
+            ))
+            last_trade_dt = row.scalar()
+            if last_trade_dt:
+                session._last_processed_dt = str(last_trade_dt)
+                logger.info("세션 %s: 오늘 마지막 매매 시각 복구 — %s", session.id[:8], last_trade_dt)
+    except Exception as e:
+        logger.debug("마지막 매매 시각 복구 실패: %s", e)
+
     _sessions[session.id] = session
 
     # 백그라운드 러너 시작
     session._task = asyncio.create_task(_run_loop(session))
     logger.info("실거래 세션 시작: %s (mode=%s)", session.id, ctx.mode)
+
+    # Redis 동기화 (Phase 1)
+    await _sync_session_to_redis(session)
+    await _sync_sessions_index_to_redis()
 
     await manager.broadcast("trading:status", {
         "session_id": session.id,
@@ -132,6 +221,10 @@ async def stop_session(session_id: str) -> LiveSession | None:
     await _clear_session_state(session_id)
 
     logger.info("실거래 세션 중지: %s", session_id)
+
+    # Redis 동기화 (Phase 1)
+    await _sync_session_to_redis(session)
+    await _sync_sessions_index_to_redis()
 
     await manager.broadcast("trading:status", {
         "session_id": session_id,
@@ -237,11 +330,58 @@ def _log_decision(
     session.decision_log.append(entry)
 
 
+# ── 분할매매 헬퍼 ────────────────────────────────────────────
+
+
+def _reduce_entries(pos: LivePosition, sell_qty: int) -> None:
+    """분할매도 시 entries에서 수량 차감 (FIFO, backtest engine 동일)."""
+    remaining = sell_qty
+    new_entries: list[LiveScaleEntry] = []
+    for entry in pos.entries:
+        if remaining <= 0:
+            new_entries.append(entry)
+            continue
+        if entry.qty <= remaining:
+            remaining -= entry.qty
+        else:
+            entry.qty -= remaining
+            remaining = 0
+            new_entries.append(entry)
+    pos.entries = new_entries
+
+
+def _calc_conviction_live(
+    strategy: dict, ps_cfg: dict, row: dict | None = None,
+) -> float:
+    """확신도 계산 (backtest engine _calc_conviction 간소화)."""
+    mode = ps_cfg.get("mode", "fixed")
+    if mode == "fixed":
+        return 1.0
+    if mode == "conviction":
+        weights = ps_cfg.get("weights") or {}
+        buy_conds = strategy.get("buy_conditions", [])
+        if not buy_conds or not weights:
+            return 1.0
+        total_w = sum(weights.values()) or 1.0
+        met_w = sum(
+            weights.get(c.get("indicator", ""), 1.0 / len(buy_conds))
+            for c in buy_conds
+        )
+        return min(met_w / total_w, 1.0)
+    if mode == "atr_target" and row is not None:
+        atr = row.get("atr_14", 0) or 0
+        price = row.get("close", 1) or 1
+        atr_pct = atr / price if price > 0 else 0.1
+        return min(1.0, 0.02 / max(atr_pct, 0.001))
+    return 1.0
+
+
 # ── paper 모드: 자체 시뮬레이션 ──────────────────────────────
 
 
 async def _run_loop(session: LiveSession) -> None:
     """전략 실행 메인 루프."""
+    logger.info("_run_loop 시작: %s (mode=%s)", session.id, session.context.mode)
     ctx = session.context
     is_paper = ctx.mode != "real"
 
@@ -255,21 +395,35 @@ async def _run_loop(session: LiveSession) -> None:
     risk = ctx.risk_management or {}
     stop_loss_pct = risk.get("stop_loss_pct")
     trailing_stop_pct = risk.get("trailing_stop_pct")
+    atr_stop_mult = risk.get("atr_stop_multiplier")
+
+    scaling = ctx.scaling or {}
+    scaling_enabled = scaling.get("enabled", False)
+    ps_cfg = ctx.position_sizing or {}
 
     check_interval = 30  # 초
 
     try:
         while session.status == "running":
+            logger.info("_run_loop tick 시작: %s", session.id[:8])
             try:
                 if is_paper:
                     await _paper_loop_tick(
                         session, strategy, cost, ctx,
                         stop_loss_pct, trailing_stop_pct,
+                        atr_stop_mult=atr_stop_mult,
+                        scaling=scaling,
+                        scaling_enabled=scaling_enabled,
+                        ps_cfg=ps_cfg,
                     )
                 else:
                     await _real_loop_tick(
                         session, strategy, cost, ctx,
                         stop_loss_pct, trailing_stop_pct,
+                        atr_stop_mult=atr_stop_mult,
+                        scaling=scaling,
+                        scaling_enabled=scaling_enabled,
+                        ps_cfg=ps_cfg,
                     )
                 # 매 틱 후 세션 상태 DB 저장 (C2: 서버 재시작 복구)
                 await _save_session_state(session)
@@ -287,56 +441,101 @@ async def _run_loop(session: LiveSession) -> None:
         logger.error("실거래 루프 치명적 에러: %s", e, exc_info=True)
 
 
-async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
-    """당일 분봉이 DB에 없으면 KIS API로 수집하여 저장.
+async def start_intraday_candle_collector(symbols: list[str]) -> None:
+    """장중 1분봉 수집기 시작 — live_runner와 독립적으로 실행.
 
-    KIS API는 1분봉만 제공하므로, 3m/5m 등은 1m을 리샘플링한다.
-    Returns: 저장된 캔들 수.
+    09:00 KST부터 현재까지 빈 구간을 앞쪽부터 채워나감.
+    5분 주기로 반복, 15:30 이후 자동 종료.
     """
+    global _intraday_collector_task
+    if _intraday_collector_task and not _intraday_collector_task.done():
+        logger.info("장중 분봉 수집기 이미 실행 중 — 스킵")
+        return
+    _intraday_collector_task = asyncio.create_task(
+        _intraday_collect_loop(symbols)
+    )
+    logger.info("장중 분봉 수집기 시작 (%d종목)", len(symbols))
+
+
+async def _intraday_collect_loop(symbols: list[str]) -> None:
+    """5분 주기로 빈 구간 채우기 루프."""
     from datetime import date as date_cls, timedelta, timezone as tz
 
     KST = tz(timedelta(hours=9))
-    today = date_cls.today()
-    today_str = today.strftime("%Y%m%d")
 
-    # DB에 최근 1분봉이 있는지 체크 (장중 지속 수집 보장)
+    while True:
+        try:
+            now_kst = datetime.now(KST)
+            # 15:30 이후면 종료
+            if now_kst.hour > 15 or (now_kst.hour == 15 and now_kst.minute >= 30):
+                logger.info("장중 분봉 수집기 종료 (15:30 이후)")
+                break
+
+            today = now_kst.date()
+            collected = await _collect_missing_candles(symbols, today, now_kst)
+            if collected > 0:
+                logger.info("장중 분봉 수집: %d봉 추가", collected)
+
+        except Exception as e:
+            logger.warning("장중 분봉 수집 루프 오류: %s", e)
+
+        await asyncio.sleep(300)  # 5분 대기
+
+
+async def _collect_missing_candles(
+    symbols: list[str],
+    today: "date",
+    now_kst: datetime,
+) -> int:
+    """09:00~현재 사이 빈 구간을 앞쪽부터 채움."""
+    from datetime import timedelta, timezone as tz
+    from app.core.database import async_session as get_session
+    from sqlalchemy import text
+
+    KST = tz(timedelta(hours=9))
+    today_str = today.strftime("%Y%m%d")
+    market_open_kst = datetime(today.year, today.month, today.day, 9, 0, tzinfo=KST)
+
+    # DB에서 오늘 1m 캔들의 마지막 시각 조회 (샘플 종목 기준)
+    sample_sym = symbols[0] if symbols else "005930"
     try:
-        from app.core.database import async_session
-        from sqlalchemy import text
-        now_kst = datetime.now(KST)
-        # 최근 10분 이내 데이터가 있으면 충분 (장중 지속 수집)
-        recent_cutoff = now_kst - timedelta(minutes=10)
-        async with async_session() as db:
+        async with get_session() as db:
             row = await db.execute(
                 text(
-                    "SELECT count(DISTINCT symbol) FROM stock_candles "
-                    "WHERE interval = '1m' AND dt >= :cutoff"
+                    "SELECT MAX(dt) FROM stock_candles "
+                    "WHERE symbol = :sym AND interval = '1m' AND dt >= :start"
                 ),
-                {"cutoff": recent_cutoff.replace(tzinfo=None)},
+                {"sym": sample_sym, "start": market_open_kst.replace(tzinfo=None)},
             )
-            recent_sym_count = row.scalar() or 0
-            if recent_sym_count >= len(symbols) // 4:
-                return 0  # 최근 데이터 충분
+            last_dt = row.scalar()
     except Exception as e:
-        logger.warning("당일 캔들 존재 체크 실패: %s", e)
+        logger.warning("마지막 수집 시각 조회 실패: %s", e)
+        last_dt = None
+
+    # 수집 시작점: DB에 있는 마지막 시각 이후, 또는 09:00
+    if last_dt:
+        # naive → KST aware
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=KST)
+        collect_from = last_dt
+    else:
+        collect_from = market_open_kst
+
+    # 이미 최신이면 스킵
+    if collect_from >= now_kst - timedelta(minutes=2):
         return 0
 
-    # KIS 클라이언트로 1분봉 수집 (시세 조회는 실전 URL 필수)
-    logger.info("당일 %s 캔들 없음 — KIS API 분봉 수집 시작 (%d종목)", interval, len(symbols[:50]))
+    # KIS API로 수집 (collect_from ~ now_kst 구간)
+    hour_str = now_kst.strftime("%H%M%S")
+
     try:
         from app.trading.kis_client import get_kis_client
-        client = get_kis_client(is_mock=False)  # 시세 조회는 실전 URL
+        from app.services.candle_writer import write_candles_bulk
 
-        # interval에서 분 단위 추출 (1m→1, 3m→3, 5m→5)
-        interval_min = int(interval.replace("m", "")) if interval.endswith("m") else 0
-        if interval_min <= 0:
-            return 0  # 일봉 등은 KIS 분봉으로 커버 불가
-
+        client = get_kis_client(is_mock=False)
         total_written = 0
-        now_kst = datetime.now(KST)
-        hour_str = now_kst.strftime("%H%M%S")
 
-        for symbol in symbols:  # Token Bucket(15req/s)이 rate limit 관리
+        for symbol in symbols:
             try:
                 raw_candles, _, _ = await client.get_minute_candles(
                     symbol, today_str, hour_str,
@@ -344,7 +543,6 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
                 if not raw_candles:
                     continue
 
-                # KIS 응답 → 표준 dict 변환 (1분봉)
                 one_min: list[dict] = []
                 for c in raw_candles:
                     dt_str = c.get("stck_bsop_date", "") + c.get("stck_cntg_hour", "")
@@ -352,6 +550,9 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
                         continue
                     dt = datetime.strptime(dt_str, "%Y%m%d%H%M%S").replace(tzinfo=KST)
                     if dt.date() != today:
+                        continue
+                    # collect_from 이후 데이터만 수집 (이미 있는 구간 스킵)
+                    if dt <= collect_from:
                         continue
                     one_min.append({
                         "dt": dt,
@@ -362,27 +563,20 @@ async def _ensure_today_candles(symbols: list[str], interval: str) -> int:
                         "volume": int(c.get("cntg_vol", 0)),
                     })
 
-                if not one_min:
-                    continue
-
-                # 1분봉 원본을 DB에 저장 (load_candles가 1m → Nm 리샘플링하므로)
-                from app.services.candle_writer import write_candles_bulk
-                await write_candles_bulk(symbol, one_min, "1m")
-                total_written += len(one_min)
+                if one_min:
+                    await write_candles_bulk(symbol, one_min, "1m")
+                    total_written += len(one_min)
 
             except Exception as e:
-                logger.warning("KIS 분봉 수집 실패 (%s): %s", symbol, e)
+                logger.warning("장중 분봉 수집 실패 (%s): %s", symbol, e)
                 continue
 
-            # rate limit (15req/s → ~67ms/req, 여유 확보)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)  # rate limit
 
-        if total_written > 0:
-            logger.info("KIS 분봉 자동 수집: %d봉 (%s, %d종목)", total_written, interval, len(symbols[:50]))
         return total_written
 
     except Exception as e:
-        logger.warning("KIS 분봉 수집 전체 실패: %s", e)
+        logger.warning("장중 분봉 수집 전체 실패: %s", e)
         return 0
 
 
@@ -446,6 +640,11 @@ async def _paper_loop_tick(
     ctx: TradingContext,
     stop_loss_pct: float | None,
     trailing_stop_pct: float | None,
+    *,
+    atr_stop_mult: float | None = None,
+    scaling: dict | None = None,
+    scaling_enabled: bool = False,
+    ps_cfg: dict | None = None,
 ) -> None:
     """Paper 모드: 장중 실시간 시뮬레이션.
 
@@ -467,9 +666,8 @@ async def _paper_loop_tick(
     start = end - timedelta(days=120)
     interval = strategy.get("interval", "5m")
 
-    # 당일 분봉이 없으면 KIS API로 자동 수집
-    if interval.endswith("m"):
-        await _ensure_today_candles(scan_symbols, interval)
+    # 분봉 수집은 별도 장중 수집기(intraday_collector)가 담당
+    # live_runner는 DB에 있는 데이터로만 매매
 
     is_alpha = any(
         c.get("indicator", "").startswith("alpha_")
@@ -477,18 +675,30 @@ async def _paper_loop_tick(
     )
 
     try:
+        # to_thread: 데이터 로딩을 스레드풀에서 실행 → 메인 이벤트 루프 해방
         if is_alpha:
-            from app.backtest.data_loader import load_enriched_candles
-            df = await load_enriched_candles(scan_symbols, start, end, interval)
+            from app.backtest.data_loader import load_enriched_candles_sync
+            df = await asyncio.to_thread(load_enriched_candles_sync, scan_symbols, start, end, interval)
         else:
-            from app.backtest.data_loader import load_candles
-            df = await load_candles(scan_symbols, start, end, interval)
+            from app.backtest.data_loader import load_candles_sync
+            df = await asyncio.to_thread(load_candles_sync, scan_symbols, start, end, interval)
     except Exception as e:
         logger.warning("캔들 로딩 실패: %s", e)
         return
 
     if df.is_empty():
         return
+
+    # 중복 행 감지 로그
+    _total_rows = df.height
+    _unique_rows = df.unique(subset=["symbol", "dt"]).height
+    if _total_rows != _unique_rows:
+        logger.warning(
+            "paper_tick [%s]: 캔들 데이터에 중복 행 %d건 (total=%d, unique=%d)",
+            session.id[:8], _total_rows - _unique_rows, _total_rows, _unique_rows,
+        )
+        # 중복 제거
+        df = df.unique(subset=["symbol", "dt"], keep="first")
 
     last_dt = getattr(session, "_last_processed_dt", None)
 
@@ -538,11 +748,29 @@ async def _paper_loop_tick(
                     if str(dt_val) >= str(today_market_open):
                         rows.append(r)
         else:
-            # 이후 호출: 마지막 처리 봉 이후 새 봉만
-            rows = [
-                r for r in all_rows
-                if str(r.get("dt", "")) > str(last_dt)
-            ]
+            # 이후 호출: 마지막 처리 봉 이후 새 봉만 (datetime 비교로 통일)
+            _last_dt_parsed = None
+            if last_dt:
+                try:
+                    _last_dt_parsed = datetime.fromisoformat(str(last_dt))
+                except (ValueError, TypeError):
+                    pass
+
+            if _last_dt_parsed:
+                rows = []
+                for r in all_rows:
+                    dt_val = r.get("dt")
+                    if dt_val is None:
+                        continue
+                    try:
+                        if dt_val > _last_dt_parsed:
+                            rows.append(r)
+                    except TypeError:
+                        # 타입 불일치 폴백
+                        if str(dt_val).replace(" ", "T") > str(last_dt):
+                            rows.append(r)
+            else:
+                rows = list(all_rows)
 
         if rows:
             sym_frames[sym] = rows
@@ -571,6 +799,10 @@ async def _paper_loop_tick(
             all_bars.append((sym, r))
     all_bars.sort(key=lambda x: str(x[1].get("dt", "")))
 
+    # 중복 봉 감지 (같은 symbol+dt가 2회 이상이면 WARNING)
+    _seen_bars: set[str] = set()
+    _dup_count = 0
+
     for sym, row in all_bars:
         dt_val = row.get("dt")
         candle_dt_str = dt_val.isoformat() if hasattr(dt_val, "isoformat") else str(dt_val)
@@ -579,6 +811,15 @@ async def _paper_loop_tick(
 
         if close_price <= 0:
             continue
+
+        # 중복 봉 스킵 (같은 종목+시각 2번 이상 처리 방지)
+        bar_key = f"{sym}:{candle_dt_str}"
+        if bar_key in _seen_bars:
+            _dup_count += 1
+            if _dup_count <= 5:
+                logger.warning("중복 봉 스킵: %s (signal=%d)", bar_key, signal)
+            continue
+        _seen_bars.add(bar_key)
 
         # ── 고가 갱신 + 리스크 관리 (보유 포지션) ──
         if sym in session.positions:
@@ -627,10 +868,110 @@ async def _paper_loop_tick(
                                 snapshot=risk_snap, candle_dt=candle_dt_str)
                     continue
 
+            # ATR 동적 손절
+            if atr_stop_mult is not None and pos.avg_price > 0:
+                atr_val = row.get("atr_14", 0) or 0
+                if atr_val > 0:
+                    stop_line = pos.avg_price - atr_val * atr_stop_mult
+                    if close_price <= stop_line:
+                        sell_price = effective_sell_price(close_price, cost)
+                        risk_snap = {
+                            "close": close_price, "avg_price": round(pos.avg_price),
+                            "atr_14": round(atr_val, 2), "stop_line": round(stop_line),
+                        }
+                        _log_decision(
+                            session, sym, "RISK_ATR_STOP",
+                            f"ATR 스탑: {close_price:,.0f} <= {stop_line:,.0f} (평단-ATR×{atr_stop_mult})",
+                            risk={"type": "atr_stop", "stop_line": round(stop_line), "atr": round(atr_val, 2)},
+                        )
+                        _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
+                                    step="S-STOP",
+                                    reason=f"ATR 스탑: {close_price:,.0f} <= {stop_line:,.0f}",
+                                    snapshot=risk_snap, candle_dt=candle_dt_str)
+                        continue
+
+            # S-HALF 부분 익절
+            if scaling_enabled and not pos.has_partial_exited and pos.qty > 1:
+                _scaling = scaling or {}
+                partial_gain_pct = _scaling.get("partial_exit_gain_pct", 5.0)
+                partial_exit_ratio = _scaling.get("partial_exit_pct", 0.5)
+                if pos.avg_price > 0:
+                    gain_pct = (close_price - pos.avg_price) / pos.avg_price * 100
+                    if gain_pct >= partial_gain_pct:
+                        sell_qty = max(1, int(pos.qty * partial_exit_ratio))
+                        if sell_qty >= pos.qty:
+                            sell_qty = pos.qty - 1
+                        if sell_qty > 0:
+                            sell_price = effective_sell_price(close_price, cost)
+                            _log_decision(
+                                session, sym, "PARTIAL_EXIT",
+                                f"부분 익절: +{gain_pct:.2f}% >= {partial_gain_pct}% → {sell_qty}주 매도",
+                            )
+                            _paper_sell(session, sym, sell_qty, close_price, sell_price, cost,
+                                        step="S-HALF",
+                                        reason=f"부분 익절: 평단 대비 +{gain_pct:.2f}%",
+                                        snapshot={"close": close_price, "avg_price": round(pos.avg_price),
+                                                  "gain_pct": round(gain_pct, 2)},
+                                        candle_dt=candle_dt_str, partial=True)
+                            pos.has_partial_exited = True
+
         snapshot = _collect_snapshot(row)
         conditions = _collect_conditions_detail(row, strategy, signal)
 
-        # ── 매수 시그널 ──
+        # ── 매도 시그널 ──
+        if signal == -1 and sym in session.positions:
+            pos = session.positions[sym]
+            if pos.qty <= 0:
+                continue
+            sell_price = effective_sell_price(close_price, cost)
+            sell_reason = "매도 시그널: " + ", ".join(
+                f"{c['indicator']}{c['op']}{c['threshold']} (실제={c['actual']})"
+                for c in conditions.get("sell_conditions", []))
+            _log_decision(session, sym, "SELL", sell_reason,
+                          signal=signal, conditions=conditions, snapshot=snapshot)
+            _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
+                        step="", reason=sell_reason,
+                        snapshot=snapshot, conditions=conditions, candle_dt=candle_dt_str)
+            continue
+
+        # ── B2 분할매수 ──
+        if scaling_enabled and sym in session.positions:
+            _scaling = scaling or {}
+            pos = session.positions[sym]
+            max_scale = _scaling.get("max_scale_in", 1)
+            if pos.scale_in_count < max_scale and pos.qty > 0 and pos.avg_price > 0:
+                drop_trigger = _scaling.get("scale_in_drop_pct", 3.0)
+                drop_pct = (pos.avg_price - close_price) / pos.avg_price * 100
+                if drop_pct >= drop_trigger:
+                    remaining_qty = pos.target_qty - pos.qty
+                    if remaining_qty > 0:
+                        buy_p = effective_buy_price(close_price, cost)
+                        cost_amount = buy_p * remaining_qty
+                        # 현금 부족 시 수량 축소
+                        if cost_amount > session._cash * 0.95:
+                            remaining_qty = int(session._cash * 0.95 / buy_p)
+                        if remaining_qty > 0:
+                            total_cost = buy_p * remaining_qty
+                            session._cash -= total_cost
+                            pos.entries.append(LiveScaleEntry(
+                                date=candle_dt_str, price=buy_p,
+                                qty=remaining_qty, step="B2",
+                            ))
+                            pos.scale_in_count += 1
+                            result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
+                                       "message": f"시뮬 추가매수 체결 @ {buy_p:,.0f}"}
+                            _log_decision(
+                                session, sym, "SCALE_IN",
+                                f"B2 추가매수: 평단 대비 -{drop_pct:.2f}% (기준 -{drop_trigger}%) → {remaining_qty}주",
+                                snapshot=snapshot,
+                            )
+                            _log_trade(session, sym, "BUY", "B2", remaining_qty, buy_p, result,
+                                       reason=f"분할매수: 평단 대비 -{drop_pct:.2f}%",
+                                       snapshot=snapshot, candle_dt=candle_dt_str,
+                                       sizing={"drop_pct": round(drop_pct, 2), "target_qty": pos.target_qty,
+                                               "current_qty": pos.qty, "scale_in_count": pos.scale_in_count})
+
+        # ── 매수 시그널 (B1 신규 진입) ──
         if signal == 1 and sym not in session.positions:
             if len(session.positions) >= ctx.max_positions:
                 _log_decision(session, sym, "SKIP_BUY",
@@ -638,21 +979,35 @@ async def _paper_loop_tick(
                               signal=signal, conditions=conditions, snapshot=snapshot)
                 continue
 
-            alloc = ctx.initial_capital * ctx.position_size_pct
+            conviction = _calc_conviction_live(strategy, ps_cfg or {}, row)
+            alloc = ctx.initial_capital * ctx.position_size_pct * conviction
+            if scaling_enabled:
+                initial_pct = (scaling or {}).get("initial_pct", 0.5)
+            else:
+                initial_pct = 1.0
+            alloc *= initial_pct
             alloc = min(alloc, session._cash * 0.95)
             buy_price = effective_buy_price(close_price, cost)
             qty = int(alloc / buy_price)
 
+            # target_qty: 분할매수 활성 시 전체 목표 수량
+            if scaling_enabled and initial_pct > 0:
+                target_qty = int(qty / initial_pct) if initial_pct < 1.0 else qty
+            else:
+                target_qty = qty
+
             sizing = {
                 "initial_capital": ctx.initial_capital,
                 "position_size_pct": ctx.position_size_pct,
+                "conviction": round(conviction, 4),
+                "initial_pct": initial_pct,
+                "scaling_enabled": scaling_enabled,
                 "alloc_raw": ctx.initial_capital * ctx.position_size_pct,
-                "alloc_cash_limited": alloc,
+                "alloc_effective": round(alloc, 2),
                 "close_price": close_price,
                 "buy_price_effective": round(buy_price, 2),
-                "buy_commission": cost.buy_commission,
-                "slippage_pct": cost.slippage_pct,
                 "qty": qty,
+                "target_qty": target_qty,
                 "total_cost": round(buy_price * qty, 2),
                 "cash_before": round(session._cash, 2),
                 "positions_count": len(session.positions),
@@ -674,9 +1029,13 @@ async def _paper_loop_tick(
 
             session._cash -= total_cost
             session.positions[sym] = LivePosition(
-                symbol=sym, qty=qty, avg_price=buy_price,
+                symbol=sym,
+                entries=[LiveScaleEntry(
+                    date=candle_dt_str, price=buy_price, qty=qty, step="B1",
+                )],
                 highest_price=close_price,
-                entry_date=candle_dt_str,
+                conviction=conviction,
+                target_qty=target_qty,
                 entry_candle_dt=candle_dt_str,
             )
             result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
@@ -690,27 +1049,17 @@ async def _paper_loop_tick(
                        reason=buy_reason, snapshot=snapshot,
                        conditions=conditions, sizing=sizing, candle_dt=candle_dt_str)
 
-        # ── 매도 시그널 ──
-        elif signal == -1 and sym in session.positions:
-            pos = session.positions[sym]
-            if pos.qty <= 0:
-                continue
-            sell_price = effective_sell_price(close_price, cost)
-            sell_reason = "매도 시그널: " + ", ".join(
-                f"{c['indicator']}{c['op']}{c['threshold']} (실제={c['actual']})"
-                for c in conditions.get("sell_conditions", []))
-            _log_decision(session, sym, "SELL", sell_reason,
-                          signal=signal, conditions=conditions, snapshot=snapshot)
-            _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
-                        step="", reason=sell_reason,
-                        snapshot=snapshot, conditions=conditions, candle_dt=candle_dt_str)
+    # 중복 봉 요약
+    if _dup_count > 0:
+        logger.warning(
+            "paper_tick [%s]: 중복 봉 %d건 스킵됨 (load_enriched_candles 중복 행 의심)",
+            session.id[:8], _dup_count,
+        )
 
     # 마지막 처리 봉 기록
     if all_bars:
         last_dt_val = all_bars[-1][1].get("dt")
-        session._last_processed_dt = (
-            last_dt_val.isoformat() if hasattr(last_dt_val, "isoformat") else str(last_dt_val)
-        )
+        session._last_processed_dt = str(last_dt_val) if last_dt_val else None
 
     # H2: Paper 모드 포트폴리오 MDD 서킷브레이커
     from app.core.config import settings as _settings
@@ -751,6 +1100,9 @@ async def _paper_loop_tick(
         len(session.trade_log), len(session.decision_log),
     )
 
+    # Redis 동기화 (Phase 1: 매 tick마다)
+    await _sync_session_to_redis(session)
+
     await manager.broadcast("trading:update", {
         "session_id": session.id,
         "positions": len(session.positions),
@@ -771,13 +1123,22 @@ def _paper_sell(
     snapshot: dict | None = None,
     conditions: dict | None = None,
     candle_dt: str | None = None,
+    partial: bool = False,
 ) -> None:
-    """Paper 모드 매도 처리: 포지션 제거 + 현금 회수."""
+    """Paper 모드 매도 처리.
+
+    partial=True: _reduce_entries FIFO 차감, 포지션 유지 (S-HALF).
+    partial=False: 포지션 완전 제거 (기존 동작).
+    """
     pos = session.positions.get(symbol)
     if not pos:
         return
 
-    proceeds = sell_price * qty
+    actual_qty = min(qty, pos.qty)  # 안전: 보유량 초과 방지
+    if actual_qty <= 0:
+        return
+
+    proceeds = sell_price * actual_qty
     session._cash += proceeds
 
     result = {
@@ -786,7 +1147,7 @@ def _paper_sell(
         "message": f"시뮬 매도 체결 @ {sell_price:,.0f}",
     }
     _log_trade(
-        session, symbol, "SELL", step, qty, sell_price, result,
+        session, symbol, "SELL", step, actual_qty, sell_price, result,
         reason=reason, snapshot=snapshot, position=pos,
         conditions=conditions,
         sizing={
@@ -796,11 +1157,14 @@ def _paper_sell(
             "slippage_pct": cost.slippage_pct,
             "proceeds": round(proceeds, 2),
             "cash_after": round(session._cash, 2),
+            "partial": partial,
         },
         candle_dt=candle_dt,
     )
-    # 포지션 제거
-    session.positions.pop(symbol, None)
+    if partial:
+        _reduce_entries(pos, actual_qty)
+    else:
+        session.positions.pop(symbol, None)
 
 
 # ── real 모드: KIS API ──────────────────────────────────────
@@ -813,6 +1177,11 @@ async def _real_loop_tick(
     ctx: TradingContext,
     stop_loss_pct: float | None,
     trailing_stop_pct: float | None,
+    *,
+    atr_stop_mult: float | None = None,
+    scaling: dict | None = None,
+    scaling_enabled: bool = False,
+    ps_cfg: dict | None = None,
 ) -> None:
     """Real 모드 1회 루프: KIS API 실주문."""
     from .kis_client import get_kis_client
@@ -821,8 +1190,55 @@ async def _real_loop_tick(
     client = get_kis_client(is_mock=False)
     executor = KISOrderExecutor(client)
 
-    # H1: 미체결 주문 체결 확인
-    await executor.check_pending_orders()
+    # H1: 미체결 주문 체결 확인 (OrderManager)
+    from .order_manager import get_order_manager
+    om = get_order_manager(executor)
+    check_result = await om.check_orders()
+    for filled in check_result.newly_filled:
+        logger.info(
+            "체결 확인: %s %s %d주 @ %.0f",
+            filled.side, filled.symbol, filled.filled_qty, filled.filled_avg_price,
+        )
+        # entries 반영 (분할매매 추적)
+        fsym = filled.symbol
+        if filled.side == "BUY" and fsym in session.positions:
+            pos = session.positions[fsym]
+            step = getattr(filled, "meta", {}).get("step", "B1") if hasattr(filled, "meta") else "B1"
+            pos.entries.append(LiveScaleEntry(
+                date=datetime.now().isoformat(),
+                price=filled.filled_avg_price,
+                qty=filled.filled_qty,
+                step=step,
+            ))
+            if step == "B2":
+                pos.scale_in_count += 1
+        elif filled.side == "BUY" and fsym not in session.positions:
+            # 신규 B1 포지션 생성
+            meta = getattr(filled, "meta", {}) if hasattr(filled, "meta") else {}
+            session.positions[fsym] = LivePosition(
+                symbol=fsym,
+                entries=[LiveScaleEntry(
+                    date=datetime.now().isoformat(),
+                    price=filled.filled_avg_price,
+                    qty=filled.filled_qty,
+                    step=meta.get("step", "B1"),
+                )],
+                highest_price=filled.filled_avg_price,
+                conviction=meta.get("conviction", 1.0),
+                target_qty=meta.get("target_qty", filled.filled_qty),
+                entry_candle_dt=datetime.now().isoformat(),
+            )
+        elif filled.side == "SELL" and fsym in session.positions:
+            pos = session.positions[fsym]
+            _reduce_entries(pos, filled.filled_qty)
+            if pos.qty <= 0:
+                session.positions.pop(fsym, None)
+
+    for expired in check_result.expired:
+        logger.info(
+            "TTL 만료 취소: %s %s 잔량 %d주",
+            expired.side, expired.symbol, expired.remaining_qty,
+        )
 
     balance_data = await client.inquire_balance()
     kis_positions = {p["symbol"]: p for p in balance_data["positions"]}
@@ -846,11 +1262,18 @@ async def _real_loop_tick(
                 portfolio_dd, max_dd_pct,
                 f"{session._portfolio_peak:,.0f}", f"{total_eval:,.0f}",
             )
-            # 전량 청산
+            # 전량 청산 (OrderManager 경유)
+            from .order_manager import get_order_manager
+            om = get_order_manager(executor)
+            # 미체결 전량 취소
+            await om.cancel_all(reason="circuit_breaker")
             for sym, kp in kis_positions.items():
                 qty = kp.get("qty", 0)
                 if qty > 0:
-                    result = await executor.sell(sym, qty, order_type="MARKET")
+                    managed = await om.submit_sell(
+                        sym, qty, reason="circuit_breaker", urgent=True,
+                    )
+                    result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
                     pos = session.positions.get(sym)
                     _log_trade(
                         session, sym, "SELL", "S-CIRCUIT", qty,
@@ -892,12 +1315,28 @@ async def _real_loop_tick(
             return
 
     for sym, kp in kis_positions.items():
+        kis_qty = kp["qty"]
+        kis_avg = kp["avg_price"]
         if sym in session.positions:
-            session.positions[sym].qty = kp["qty"]
+            pos = session.positions[sym]
+            local_qty = pos.qty
+            if kis_qty < local_qty:
+                # 외부 매도 발생 — entries FIFO 차감
+                _reduce_entries(pos, local_qty - kis_qty)
+            elif kis_qty > local_qty:
+                # 외부 매수 발생 — synthetic entry 추가
+                pos.entries.append(LiveScaleEntry(
+                    date=datetime.now().isoformat(),
+                    price=kis_avg, qty=kis_qty - local_qty, step="B-EXT",
+                ))
         else:
             session.positions[sym] = LivePosition(
-                symbol=sym, qty=kp["qty"], avg_price=kp["avg_price"],
-                entry_date=datetime.now().strftime("%Y-%m-%d"),
+                symbol=sym,
+                entries=[LiveScaleEntry(
+                    date=datetime.now().isoformat(),
+                    price=kis_avg, qty=kis_qty, step="B-EXT",
+                )],
+                highest_price=kp.get("current_price", kis_avg),
             )
 
     for sym in list(session.positions.keys()):
@@ -914,7 +1353,10 @@ async def _real_loop_tick(
         if stop_loss_pct is not None:
             loss_pct = (current_price - pos.avg_price) / pos.avg_price * 100
             if loss_pct <= -stop_loss_pct:
-                result = await executor.sell(sym, pos.qty, order_type="MARKET")
+                managed = await om.submit_sell(
+                    sym, pos.qty, reason="stop_loss", urgent=True,
+                )
+                result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
                 _log_trade(
                     session, sym, "SELL", "S-STOP", pos.qty, current_price, result,
                     reason=f"손절: 평단 대비 {round(loss_pct, 2):+.2f}% (기준 -{stop_loss_pct}%)",
@@ -926,7 +1368,10 @@ async def _real_loop_tick(
         if trailing_stop_pct is not None and pos.highest_price > 0:
             drop_pct = (pos.highest_price - current_price) / pos.highest_price * 100
             if drop_pct >= trailing_stop_pct:
-                result = await executor.sell(sym, pos.qty, order_type="MARKET")
+                managed = await om.submit_sell(
+                    sym, pos.qty, reason="trailing", urgent=True,
+                )
+                result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
                 _log_trade(
                     session, sym, "SELL", "S-TRAIL", pos.qty, current_price, result,
                     reason=f"트레일링: 고점({round(pos.highest_price):,}) 대비 -{round(drop_pct, 2):.2f}%",
@@ -935,6 +1380,27 @@ async def _real_loop_tick(
                 )
                 continue
 
+        # ATR 동적 손절 (현재가 기반 — 캔들 ATR은 시그널 체크 시 확보)
+        # Note: real 모드에서는 KIS current_price 기반이므로, ATR 값은 세션에 캐시 필요
+        # → _real_check_signals에서 ATR 값을 세션 속성에 저장, 여기서 참조
+        if atr_stop_mult is not None and pos.avg_price > 0:
+            atr_val = getattr(session, "_atr_cache", {}).get(sym, 0)
+            if atr_val > 0:
+                stop_line = pos.avg_price - atr_val * atr_stop_mult
+                if current_price <= stop_line:
+                    managed = await om.submit_sell(
+                        sym, pos.qty, reason="atr_stop", urgent=True,
+                    )
+                    result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
+                    _log_trade(
+                        session, sym, "SELL", "S-STOP", pos.qty, current_price, result,
+                        reason=f"ATR 스탑: {current_price:,} <= {round(stop_line):,}",
+                        snapshot={"close": current_price, "atr_14": round(atr_val, 2),
+                                  "stop_line": round(stop_line)},
+                        position=pos,
+                    )
+                    continue
+
     held_symbols = set(session.positions.keys())
     universe = ctx.symbols or [sym for sym in kis_positions]
     scan_limit = max(ctx.max_positions * 5, 50)
@@ -942,7 +1408,8 @@ async def _real_loop_tick(
 
     if scan_symbols:
         await _real_check_signals(
-            session, executor, strategy, scan_symbols, cash, cost, ctx
+            session, executor, strategy, scan_symbols, cash, cost, ctx,
+            scaling=scaling, scaling_enabled=scaling_enabled, ps_cfg=ps_cfg,
         )
 
     logger.info(
@@ -966,6 +1433,10 @@ async def _real_check_signals(
     cash: float,
     cost: CostConfig,
     ctx: TradingContext,
+    *,
+    scaling: dict | None = None,
+    scaling_enabled: bool = False,
+    ps_cfg: dict | None = None,
 ) -> None:
     """Real 모드 시그널 체크 → KIS 주문."""
     from datetime import date, timedelta
@@ -1009,18 +1480,102 @@ async def _real_check_signals(
         snapshot = _collect_snapshot(last_row)
         conditions = _collect_conditions_detail(last_row, strategy, signal)
 
-        # H1: 미체결 주문 있는 종목 스킵
-        from .kis_order import has_pending_order
-        if has_pending_order(sym):
+        # ATR 캐시 (real 모드 리스크 체크에서 사용)
+        atr_val = last_row.get("atr_14", 0) or 0
+        if atr_val > 0:
+            if not hasattr(session, "_atr_cache"):
+                session._atr_cache = {}
+            session._atr_cache[sym] = atr_val
+
+        # H1: 미체결 주문 있는 종목 스킵 (OrderManager)
+        from .order_manager import get_order_manager
+        om = get_order_manager()
+        if om.has_pending(sym):
             _log_decision(session, sym, "SKIP_PENDING",
                           "미체결 주문 존재 — 중복 주문 방지",
                           signal=signal, conditions=conditions, snapshot=snapshot)
             continue
 
+        # S-HALF 부분 익절 (real 모드)
+        if scaling_enabled and sym in session.positions:
+            _scaling = scaling or {}
+            pos = session.positions[sym]
+            if not pos.has_partial_exited and pos.qty > 1 and pos.avg_price > 0:
+                close_p = int(last_row.get("close", 0))
+                if close_p > 0:
+                    gain_pct = (close_p - pos.avg_price) / pos.avg_price * 100
+                    partial_gain = _scaling.get("partial_exit_gain_pct", 5.0)
+                    if gain_pct >= partial_gain:
+                        partial_ratio = _scaling.get("partial_exit_pct", 0.5)
+                        sell_qty = max(1, int(pos.qty * partial_ratio))
+                        if sell_qty >= pos.qty:
+                            sell_qty = pos.qty - 1
+                        if sell_qty > 0:
+                            managed = await om.submit_sell(
+                                sym, sell_qty, close_p, reason="partial_exit", urgent=False,
+                            )
+                            if managed:
+                                managed.meta = {"step": "S-HALF"}
+                            result = {"success": managed is not None,
+                                      "order_id": managed.order_id if managed else ""}
+                            pos.has_partial_exited = True
+                            _log_trade(session, sym, "SELL", "S-HALF", sell_qty, close_p, result,
+                                       reason=f"부분 익절: +{gain_pct:.2f}%",
+                                       snapshot=snapshot, position=pos, conditions=conditions)
+                            continue
+
+        # B2 분할매수 (real 모드)
+        if scaling_enabled and sym in session.positions:
+            _scaling = scaling or {}
+            pos = session.positions[sym]
+            max_scale = _scaling.get("max_scale_in", 1)
+            if pos.scale_in_count < max_scale and pos.qty > 0 and pos.avg_price > 0:
+                close_p = int(last_row.get("close", 0))
+                if close_p > 0:
+                    drop_pct = (pos.avg_price - close_p) / pos.avg_price * 100
+                    drop_trigger = _scaling.get("scale_in_drop_pct", 3.0)
+                    if drop_pct >= drop_trigger:
+                        remaining_qty = pos.target_qty - pos.qty
+                        if remaining_qty > 0:
+                            if remaining_qty * close_p > cash * 0.95:
+                                remaining_qty = int(cash * 0.95 / close_p)
+                            if remaining_qty > 0:
+                                managed = await om.submit_buy(sym, remaining_qty, close_p)
+                                if managed:
+                                    managed.meta = {"step": "B2"}
+                                result = {"success": managed is not None,
+                                          "order_id": managed.order_id if managed else ""}
+                                _log_trade(session, sym, "BUY", "B2", remaining_qty, close_p, result,
+                                           reason=f"분할매수: 평단 대비 -{drop_pct:.2f}%",
+                                           snapshot=snapshot, conditions=conditions)
+                                continue
+
+        # 매도 시그널
+        if signal == -1 and sym in session.positions:
+            pos = session.positions[sym]
+            if pos.qty <= 0:
+                continue
+            current_price = int(last_row.get("close", 0))
+            managed = await om.submit_sell(
+                sym, pos.qty, current_price, reason="signal", urgent=False,
+            )
+            result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
+            _log_trade(session, sym, "SELL", "", pos.qty, current_price, result,
+                       reason="매도 시그널", snapshot=snapshot, position=pos, conditions=conditions)
+            continue
+
+        # 매수 시그널 (B1 신규 진입)
         if signal == 1 and sym not in session.positions:
             if len(session.positions) >= ctx.max_positions:
                 continue
-            alloc = ctx.initial_capital * ctx.position_size_pct
+
+            conviction = _calc_conviction_live(strategy, ps_cfg or {}, last_row)
+            alloc = ctx.initial_capital * ctx.position_size_pct * conviction
+            if scaling_enabled:
+                initial_pct = (scaling or {}).get("initial_pct", 0.5)
+            else:
+                initial_pct = 1.0
+            alloc *= initial_pct
             alloc = min(alloc, cash * 0.95)
             price = int(last_row.get("close", 0))
             if price <= 0:
@@ -1029,17 +1584,20 @@ async def _real_check_signals(
             if qty <= 0:
                 continue
 
-            result = await executor.buy(sym, qty, price, order_type="LIMIT")
-            _log_trade(session, sym, "BUY", "B1", qty, price, result,
-                       reason="매수 시그널", snapshot=snapshot, conditions=conditions)
+            # target_qty 계산
+            if scaling_enabled and initial_pct > 0 and initial_pct < 1.0:
+                target_qty = int(qty / initial_pct)
+            else:
+                target_qty = qty
 
-        elif signal == -1 and sym in session.positions:
-            pos = session.positions[sym]
-            if pos.qty <= 0:
-                continue
-            result = await executor.sell(sym, pos.qty, order_type="MARKET")
-            _log_trade(session, sym, "SELL", "", pos.qty, last_row.get("close", 0), result,
-                       reason="매도 시그널", snapshot=snapshot, position=pos, conditions=conditions)
+            managed = await om.submit_buy(sym, qty, price)
+            if managed:
+                managed.meta = {"step": "B1", "conviction": conviction, "target_qty": target_qty}
+            result = {"success": managed is not None, "order_id": managed.order_id if managed else ""}
+            _log_trade(session, sym, "BUY", "B1", qty, price, result,
+                       reason="매수 시그널", snapshot=snapshot, conditions=conditions,
+                       sizing={"conviction": round(conviction, 4), "initial_pct": initial_pct,
+                               "target_qty": target_qty, "scaling_enabled": scaling_enabled})
 
 
 # ── 공통 유틸 ────────────────────────────────────────────────
@@ -1086,6 +1644,9 @@ def _log_trade(
             "entry_candle_dt": getattr(position, "entry_candle_dt", ""),
             "highest_price": round(position.highest_price, 2),
             "qty_held": position.qty,
+            "entries_count": len(position.entries),
+            "conviction": position.conviction,
+            "scale_in_count": position.scale_in_count,
         }
         # 보유시간: 캔들 dt 기반으로 계산 (시뮬레이션 시간이 아닌 실제 시장 시간)
         entry_dt_str = getattr(position, "entry_candle_dt", "") or position.entry_date
@@ -1286,11 +1847,20 @@ async def _save_session_state(session: LiveSession) -> None:
         "status": session.status,
         "positions": {
             sym: {
+                "entries": [
+                    {"date": e.date, "price": e.price, "qty": e.qty, "step": e.step}
+                    for e in p.entries
+                ],
+                "highest_price": p.highest_price,
+                "conviction": p.conviction,
+                "target_qty": p.target_qty,
+                "scale_in_count": p.scale_in_count,
+                "has_partial_exited": p.has_partial_exited,
+                "entry_candle_dt": p.entry_candle_dt,
+                # 하위 호환: 기존 소비자용 flat 필드
                 "qty": p.qty,
                 "avg_price": p.avg_price,
-                "highest_price": p.highest_price,
                 "entry_date": p.entry_date,
-                "entry_candle_dt": p.entry_candle_dt,
             }
             for sym, p in session.positions.items()
         },
@@ -1299,6 +1869,13 @@ async def _save_session_state(session: LiveSession) -> None:
         "started_at": session.started_at,
         "trade_count": len(session.trade_log),
     }
+    # OrderManager 미체결 주문 저장 (서버 재시작 시 복구용)
+    try:
+        from .order_manager import get_order_manager
+        om = get_order_manager()
+        state["pending_orders"] = om.to_state_dict()
+    except Exception:
+        pass
     try:
         from app.core.database import async_session
         from app.workflow.models import TradingContextModel
@@ -1355,14 +1932,33 @@ async def restore_sessions_from_db() -> int:
             _cash=ctx.session_state.get("cash", ctx.initial_capital),
         )
 
-        # 포지션 복원
+        # 포지션 복원 (entries 형식 + 레거시 flat 형식 호환)
         for sym, pdata in ctx.session_state.get("positions", {}).items():
+            entries_data = pdata.get("entries")
+            if entries_data:
+                entries = [
+                    LiveScaleEntry(
+                        date=e.get("date", ""), price=e.get("price", 0),
+                        qty=e.get("qty", 0), step=e.get("step", "B1"),
+                    )
+                    for e in entries_data
+                ]
+            else:
+                # 레거시: flat qty/avg_price → single B1 entry
+                entries = [LiveScaleEntry(
+                    date=pdata.get("entry_date", ""),
+                    price=pdata.get("avg_price", 0),
+                    qty=pdata.get("qty", 0),
+                    step="B1",
+                )]
             session.positions[sym] = LivePosition(
                 symbol=sym,
-                qty=pdata["qty"],
-                avg_price=pdata["avg_price"],
+                entries=entries,
                 highest_price=pdata.get("highest_price", 0),
-                entry_date=pdata.get("entry_date", ""),
+                conviction=pdata.get("conviction", 0.0),
+                target_qty=pdata.get("target_qty", 0),
+                scale_in_count=pdata.get("scale_in_count", 0),
+                has_partial_exited=pdata.get("has_partial_exited", False),
                 entry_candle_dt=pdata.get("entry_candle_dt", ""),
             )
 

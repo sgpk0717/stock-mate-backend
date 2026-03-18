@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 
@@ -226,6 +227,9 @@ async def _load_raw_candles_chunked(
         )
         if not chunk_df.is_empty():
             chunks.append(chunk_df)
+
+        # 이벤트 루프에 제어권 양보 — API 핸들러가 처리될 수 있도록
+        await asyncio.sleep(0)
 
     if not chunks:
         dt_type = pl.Datetime if as_datetime else pl.Date
@@ -692,6 +696,7 @@ async def load_enriched_candles(
                 if col in df.columns:
                     df = df.with_columns(pl.col(col).fill_null(0).alias(col))
             logger.info("Enriched candles with investor trading data (%d rows)", inv_df.height)
+        await asyncio.sleep(0)  # yield to event loop
 
     # DART 재무 데이터 JOIN (join_asof: 가장 최근 공시)
     if include_dart:
@@ -716,6 +721,7 @@ async def load_enriched_candles(
                 df = df.with_columns(pl.lit(0.0).alias(col))
             else:
                 df = df.with_columns(pl.col(col).fill_null(0.0).alias(col))
+        await asyncio.sleep(0)  # yield to event loop
 
     # 뉴스 감성 데이터 JOIN
     if include_sentiment:
@@ -759,6 +765,7 @@ async def load_enriched_candles(
                 if col in df.columns:
                     df = df.with_columns(pl.col(col).fill_null(0).alias(col))
             logger.info("Enriched candles with margin/short data (%d rows)", ms_df.height)
+        await asyncio.sleep(0)  # yield to event loop
 
     # 프로그램 매매 JOIN (분봉: T-1 전일 기준, 일봉: 당일)
     if include_program_trading:
@@ -791,3 +798,40 @@ async def load_enriched_candles(
     df = df.sort(["symbol", "dt"])
 
     return df
+
+
+def load_enriched_candles_sync(
+    symbols: list[str] | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    interval: str = "1d",
+    **kwargs,
+) -> pl.DataFrame:
+    """동기 래퍼 — asyncio.to_thread()에서 호출용.
+
+    별도 스레드에서 새 이벤트 루프를 생성하여 async 함수를 실행.
+    메인 이벤트 루프를 블로킹하지 않음.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            load_enriched_candles(symbols, start_date, end_date, interval, **kwargs)
+        )
+    finally:
+        loop.close()
+
+
+def load_candles_sync(
+    symbols: list[str] | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    interval: str = "1d",
+) -> pl.DataFrame:
+    """동기 래퍼 — asyncio.to_thread()에서 호출용."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(
+            load_candles(symbols, start_date, end_date, interval)
+        )
+    finally:
+        loop.close()
