@@ -1,9 +1,12 @@
-"""FastMCP 서버 — Stock Mate 도구 16개 + 리소스 1개.
+"""FastMCP 서버 — Stock Mate 도구 23개 + 리소스 1개.
 
 기존 5개: execute_order, query_stock_data, fetch_sentiment, run_alpha_scan, get_portfolio_status
 워크플로우 4개: get_workflow_status, get_best_factors, get_trading_review, submit_trading_feedback
 보조 4개: get_system_health, trigger_workflow_phase, get_error_logs, get_factor_performance
 마이닝 제어 3개: start_alpha_mining, stop_alpha_mining, get_mining_status
+세션 매매 3개: get_trading_sessions, get_session_trades, get_session_report
+메시지 레지스트리 2개: check_message_sent, mark_message_sent
+텔레그램 로깅 1개: log_telegram_message
 """
 
 from __future__ import annotations
@@ -275,10 +278,44 @@ async def get_workflow_status() -> str:
     반환: phase, status, 선택된 팩터, 매매 건수, PnL, 마이닝 상태.
     """
     start_ms = time.monotonic()
-    from app.workflow.orchestrator import get_orchestrator
 
-    orch = get_orchestrator()
-    status = await orch.get_status()
+    # Redis 캐시 우선 (Phase 3: MCP 분리 시 orchestrator import 불필요)
+    status = None
+    try:
+        from app.core.redis import hgetall
+        cached = await hgetall("workflow:status")
+        if cached and cached.get("phase"):
+            status = {}
+            for k, v in cached.items():
+                if k in ("step_status",) and v:
+                    try:
+                        status[k] = json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        status[k] = v
+                elif k in ("trade_count", "mining_cycles", "mining_factors"):
+                    try:
+                        status[k] = int(v) if v else 0
+                    except (ValueError, TypeError):
+                        status[k] = 0
+                elif k in ("pnl_pct", "pnl_amount"):
+                    try:
+                        status[k] = float(v) if v else None
+                    except (ValueError, TypeError):
+                        status[k] = None
+                elif k == "mining_running":
+                    status[k] = v.lower() == "true" if v else False
+                elif v == "None" or v == "":
+                    status[k] = None
+                else:
+                    status[k] = v
+    except Exception:
+        pass
+
+    # 폴백: orchestrator 직접 호출
+    if not status:
+        from app.workflow.orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        status = await orch.get_status()
 
     elapsed = int((time.monotonic() - start_ms) * 1000)
     await audit_log("get_workflow_status", {}, {"phase": status.get("phase")}, "success", execution_ms=elapsed)
@@ -369,13 +406,36 @@ async def get_trading_review(target_date: str = "") -> str:
             return json.dumps({"error": f"{target} 워크플로우 기록 없음"}, ensure_ascii=False)
 
         review = run.review_summary or {}
+
+        # DB 폴백: workflow_runs.trade_count가 0이면 live_trades에서 직접 집계
+        trade_count = run.trade_count or 0
+        pnl_pct = run.pnl_pct
+        pnl_amount = float(run.pnl_amount) if run.pnl_amount else None
+
+        if trade_count == 0:
+            try:
+                from sqlalchemy import text as _text
+                _r = await session.execute(_text(
+                    "SELECT COUNT(*), "
+                    "  COALESCE(SUM(lt.pnl_amount) FILTER (WHERE lt.side='SELL'), 0) "
+                    "FROM live_trades lt "
+                    "JOIN trading_contexts tc ON lt.context_id = tc.id "
+                    "WHERE tc.created_at::date = :td"
+                ), {"td": str(target)})
+                _row = _r.fetchone()
+                if _row and _row[0] > 0:
+                    trade_count = _row[0]
+                    pnl_amount = float(_row[1]) if _row[1] else 0
+            except Exception:
+                pass
+
         data = {
             "date": str(target),
             "phase": run.phase,
             "status": run.status,
-            "trade_count": run.trade_count,
-            "pnl_pct": run.pnl_pct,
-            "pnl_amount": float(run.pnl_amount) if run.pnl_amount else None,
+            "trade_count": trade_count,
+            "pnl_pct": pnl_pct,
+            "pnl_amount": pnl_amount,
             "review_summary": review,
             "mining_context": run.mining_context,
         }
@@ -604,25 +664,45 @@ async def trigger_workflow_phase(phase: str) -> str:
     OpenClaw 긴급 제어용.
     """
     start_ms = time.monotonic()
-    from app.workflow.orchestrator import get_orchestrator
-
-    orch = get_orchestrator()
-
-    handlers = {
-        "pre_market": orch.handle_pre_market,
-        "market_open": orch.handle_market_open,
-        "market_close": orch.handle_market_close,
-        "review": orch.handle_review,
-        "mining": orch.handle_mining,
-        "emergency_stop": orch.handle_emergency_stop,
-        "resume": orch.handle_resume,
-    }
-
-    handler = handlers.get(phase)
-    if not handler:
+    valid_phases = ["pre_market", "market_open", "market_close", "review", "mining", "emergency_stop", "resume"]
+    if phase not in valid_phases:
         return json.dumps({"error": f"알 수 없는 phase: {phase}"}, ensure_ascii=False)
 
-    result = await handler()
+    # Redis 명령 큐로 전달 시도 (Phase 3: MCP 분리)
+    result = None
+    try:
+        from app.core.redis import xadd
+        msg_id = await xadd("commands:workflow", {"action": "trigger_phase", "phase": phase})
+        if msg_id:
+            # 큐에 넣었으면 결과를 대기 (최대 30초)
+            import asyncio
+            from app.core.redis import get_client
+            r = get_client()
+            for _ in range(60):  # 0.5초 × 60 = 30초
+                cached = await r.get(f"commands:result:{msg_id}")
+                if cached:
+                    result = json.loads(cached)
+                    await r.delete(f"commands:result:{msg_id}")
+                    break
+                await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
+    # 폴백: orchestrator 직접 호출
+    if not result:
+        from app.workflow.orchestrator import get_orchestrator
+        orch = get_orchestrator()
+        handlers = {
+            "pre_market": orch.handle_pre_market,
+            "market_open": orch.handle_market_open,
+            "market_close": orch.handle_market_close,
+            "review": orch.handle_review,
+            "mining": orch.handle_mining,
+            "emergency_stop": orch.handle_emergency_stop,
+            "resume": orch.handle_resume,
+        }
+        handler = handlers.get(phase)
+        result = await handler() if handler else {"error": "handler not found"}
 
     elapsed = int((time.monotonic() - start_ms) * 1000)
     await audit_log("trigger_workflow_phase", {"phase": phase}, result, "success", execution_ms=elapsed)
@@ -1077,3 +1157,442 @@ async def get_realtime_orderbook(symbol: str) -> str:
         "ws_channel": f"orderbook:{symbol}",
     }
     return json.dumps(data, ensure_ascii=False)
+
+
+# ── Tool 18: get_trading_sessions (DB 기반) ─────────────
+
+
+@mcp.tool()
+async def get_trading_sessions(
+    target_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+) -> str:
+    """매매 세션(팩터) 목록 조회 (DB 기반 — 서버 재시작 후에도 유지).
+
+    같은 strategy_name의 여러 context를 합산하여 팩터별 집계 제공.
+
+    Args:
+        target_date: 특정 날짜 (YYYY-MM-DD). 비어있으면 오늘.
+        start_date: 기간 시작 (YYYY-MM-DD). target_date보다 우선.
+        end_date: 기간 종료 (YYYY-MM-DD). start_date와 함께 사용.
+    """
+    from sqlalchemy import text
+
+    if start_date and end_date:
+        date_filter = "tc.created_at::date >= :start AND tc.created_at::date <= :end"
+        params: dict = {"start": start_date, "end": end_date}
+    else:
+        td = target_date or date.today().isoformat()
+        date_filter = "tc.created_at::date = :td"
+        params = {"td": td}
+
+    sql = f"""
+    SELECT tc.strategy_name,
+           COUNT(DISTINCT tc.id) as context_count,
+           COUNT(lt.id) as trade_count,
+           COUNT(lt.id) FILTER (WHERE lt.side = 'BUY') as buy_count,
+           COUNT(lt.id) FILTER (WHERE lt.side = 'SELL') as sell_count,
+           COALESCE(SUM(lt.pnl_amount) FILTER (WHERE lt.side = 'SELL'), 0) as realized_pnl,
+           MIN(tc.created_at) as first_created,
+           MAX(tc.status) as latest_status
+    FROM trading_contexts tc
+    LEFT JOIN live_trades lt ON lt.context_id = tc.id
+    WHERE {date_filter}
+    GROUP BY tc.strategy_name
+    ORDER BY trade_count DESC
+    """
+
+    async with async_session() as db:
+        result = await db.execute(text(sql), params)
+        rows = result.fetchall()
+
+    sessions = []
+    for r in rows:
+        sessions.append({
+            "strategy_name": r[0],
+            "context_count": r[1],
+            "trade_count": r[2],
+            "buy_count": r[3],
+            "sell_count": r[4],
+            "realized_pnl": float(r[5]) if r[5] else 0,
+            "first_created": r[6].isoformat() if r[6] else None,
+            "latest_status": r[7],
+        })
+
+    return json.dumps({"sessions": sessions, "total": len(sessions)}, ensure_ascii=False)
+
+
+# ── Tool 19: get_session_trades (DB 기반) ─────────────
+
+
+@mcp.tool()
+async def get_session_trades(
+    strategy_name: str,
+    target_date: str = "",
+) -> str:
+    """특정 팩터(strategy_name)의 매매 기록 전체 조회 (DB 기반).
+
+    Args:
+        strategy_name: 팩터명 (예: "auto:evo_g50_0"). get_trading_sessions에서 확인.
+        target_date: 날짜 (YYYY-MM-DD). 비어있으면 오늘.
+    """
+    from sqlalchemy import text
+
+    td = target_date or date.today().isoformat()
+
+    sql = """
+    SELECT lt.symbol, lt.name, lt.side, lt.step, lt.qty, lt.price,
+           lt.pnl_pct, lt.pnl_amount, lt.holding_minutes,
+           lt.reason, lt.executed_at
+    FROM live_trades lt
+    JOIN trading_contexts tc ON lt.context_id = tc.id
+    WHERE tc.strategy_name = :sn AND tc.created_at::date = :td
+    ORDER BY lt.executed_at
+    """
+
+    async with async_session() as db:
+        result = await db.execute(text(sql), {"sn": strategy_name, "td": td})
+        rows = result.fetchall()
+
+    trades = [
+        {
+            "symbol": r[0], "name": r[1], "side": r[2], "step": r[3],
+            "qty": r[4], "price": float(r[5]) if r[5] else 0,
+            "pnl_pct": float(r[6]) if r[6] else None,
+            "pnl_amount": float(r[7]) if r[7] else None,
+            "holding_minutes": float(r[8]) if r[8] else None,
+            "reason": r[9],
+            "timestamp": r[10].isoformat() if r[10] else None,
+        }
+        for r in rows
+    ]
+
+    return json.dumps({
+        "strategy_name": strategy_name,
+        "date": td,
+        "trade_count": len(trades),
+        "trades": trades,
+    }, ensure_ascii=False)
+
+
+# ── Tool 20: get_session_report (DB 기반) ─────────────
+
+
+@mcp.tool()
+async def get_session_report(
+    strategy_name: str = "",
+    target_date: str = "",
+    start_date: str = "",
+    end_date: str = "",
+) -> str:
+    """팩터별 매매 요약 보고서 (DB 기반).
+
+    Top 수익/손실 거래, 승률, 청산 유형별 집계 등 종합 리포트.
+    기간 지정 시 일별 PnL 추이도 포함.
+
+    Args:
+        strategy_name: 팩터명. 비어있으면 전체 합산.
+        target_date: 특정 날짜 (YYYY-MM-DD). 비어있으면 오늘.
+        start_date: 기간 시작 (YYYY-MM-DD). target_date보다 우선.
+        end_date: 기간 종료 (YYYY-MM-DD).
+    """
+    from sqlalchemy import text
+
+    # 날짜 조건 + 팩터 조건
+    conditions = []
+    params: dict = {}
+    if start_date and end_date:
+        conditions.append("tc.created_at::date >= :start AND tc.created_at::date <= :end")
+        params["start"] = start_date
+        params["end"] = end_date
+    else:
+        td = target_date or date.today().isoformat()
+        conditions.append("tc.created_at::date = :td")
+        params["td"] = td
+
+    if strategy_name:
+        conditions.append("tc.strategy_name = :sn")
+        params["sn"] = strategy_name
+
+    where = "WHERE " + " AND ".join(conditions)
+
+    # 매매 기록 조회
+    sql = f"""
+    SELECT lt.symbol, lt.name, lt.side, lt.step, lt.qty, lt.price,
+           lt.pnl_pct, lt.pnl_amount, lt.holding_minutes, lt.executed_at
+    FROM live_trades lt
+    JOIN trading_contexts tc ON lt.context_id = tc.id
+    {where}
+    ORDER BY lt.executed_at
+    """
+
+    async with async_session() as db:
+        result = await db.execute(text(sql), params)
+        rows = result.fetchall()
+
+    if not rows:
+        return json.dumps({
+            "strategy_name": strategy_name or "(전체)",
+            "total_trades": 0,
+            "message": "해당 기간 매매 기록 없음",
+        }, ensure_ascii=False)
+
+    buys = [r for r in rows if r[2] == "BUY"]
+    sells = [r for r in rows if r[2] == "SELL"]
+
+    realized_pnl = sum(float(r[7] or 0) for r in sells)
+    wins = [r for r in sells if (r[6] or 0) > 0]
+    losses = [r for r in sells if (r[6] or 0) <= 0]
+    win_rate = round(len(wins) / len(sells) * 100, 1) if sells else 0
+
+    holding_list = [float(r[8]) for r in sells if r[8] is not None]
+    avg_holding = round(sum(holding_list) / len(holding_list), 1) if holding_list else 0
+
+    # Top 수익/손실
+    sorted_sells = sorted(sells, key=lambda r: float(r[6] or 0), reverse=True)
+    top_gains = [
+        {"symbol": r[0], "name": r[1], "pnl_pct": float(r[6]), "pnl_amount": float(r[7] or 0)}
+        for r in sorted_sells[:3] if (r[6] or 0) > 0
+    ]
+    top_losses = [
+        {"symbol": r[0], "name": r[1], "pnl_pct": float(r[6]), "pnl_amount": float(r[7] or 0)}
+        for r in sorted_sells[-3:] if (r[6] or 0) < 0
+    ]
+
+    # 청산 유형
+    exit_breakdown: dict[str, int] = {}
+    for r in sells:
+        step = r[3] or "SELL"
+        exit_breakdown[step] = exit_breakdown.get(step, 0) + 1
+
+    report: dict = {
+        "strategy_name": strategy_name or "(전체)",
+        "total_trades": len(rows),
+        "buy_count": len(buys),
+        "sell_count": len(sells),
+        "realized_pnl": round(realized_pnl, 0),
+        "win_rate": win_rate,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "avg_holding_minutes": avg_holding,
+        "top_gains": top_gains,
+        "top_losses": top_losses,
+        "exit_breakdown": exit_breakdown,
+    }
+
+    # 기간 조회 시 일별 PnL 추이
+    if start_date and end_date:
+        daily_sql = f"""
+        SELECT tc.created_at::date as dt,
+               COUNT(lt.id) as trades,
+               COALESCE(SUM(lt.pnl_amount) FILTER (WHERE lt.side = 'SELL'), 0) as pnl
+        FROM live_trades lt
+        JOIN trading_contexts tc ON lt.context_id = tc.id
+        {where}
+        GROUP BY tc.created_at::date
+        ORDER BY dt
+        """
+        result2 = await db.execute(text(daily_sql), params)
+        daily = [
+            {"date": str(r[0]), "trades": r[1], "pnl": float(r[2] or 0)}
+            for r in result2.fetchall()
+        ]
+        report["period"] = f"{start_date} ~ {end_date}"
+        report["daily_pnl"] = daily
+    else:
+        report["date"] = td if not (start_date and end_date) else None
+
+    return json.dumps(report, ensure_ascii=False)
+
+
+# ── Tool 21: check_message_sent ─────────────────────────
+
+
+@mcp.tool()
+async def check_message_sent(
+    message_key: str,
+    target_date: str = "",
+) -> str:
+    """1일 1회성 텔레그램 메시지가 이미 발송됐는지 확인.
+
+    중복 발송 방지를 위해 발송 전에 호출.
+    message_key 예: daily_collect_start, morning_brief, post_market_analysis 등.
+
+    Args:
+        message_key: 메시지 키 (예: "morning_brief")
+        target_date: YYYY-MM-DD (비어있으면 오늘)
+    """
+    from sqlalchemy import text
+
+    td = target_date or date.today().isoformat()
+
+    async with async_session() as db:
+        row = await db.execute(
+            text(
+                "SELECT sent_at, sender FROM telegram_message_registry "
+                "WHERE message_key = :k AND date = :d"
+            ),
+            {"k": message_key, "d": td},
+        )
+        result = row.fetchone()
+
+    if result:
+        return json.dumps({
+            "sent": True,
+            "message_key": message_key,
+            "date": td,
+            "sent_at": result[0].isoformat() if result[0] else None,
+            "sender": result[1],
+        }, ensure_ascii=False)
+    else:
+        return json.dumps({
+            "sent": False,
+            "message_key": message_key,
+            "date": td,
+        }, ensure_ascii=False)
+
+
+# ── Tool 22: mark_message_sent ─────────────────────────
+
+
+@mcp.tool()
+async def mark_message_sent(
+    message_key: str,
+    sender: str = "openclaw",
+    target_date: str = "",
+) -> str:
+    """1일 1회성 텔레그램 메시지를 발송 완료로 등록.
+
+    발송 후 호출하여 중복 방지 레지스트리에 기록.
+
+    Args:
+        message_key: 메시지 키 (예: "morning_brief")
+        sender: 발송 주체 ("backend" 또는 "openclaw")
+        target_date: YYYY-MM-DD (비어있으면 오늘)
+    """
+    from sqlalchemy import text
+
+    td = target_date or date.today().isoformat()
+
+    async with async_session() as db:
+        try:
+            await db.execute(
+                text(
+                    "INSERT INTO telegram_message_registry (message_key, date, sender) "
+                    "VALUES (:k, :d, :s) ON CONFLICT (message_key, date) DO NOTHING"
+                ),
+                {"k": message_key, "d": td, "s": sender},
+            )
+            await db.commit()
+
+            # 실제로 INSERT 됐는지 확인
+            row = await db.execute(
+                text(
+                    "SELECT sender FROM telegram_message_registry "
+                    "WHERE message_key = :k AND date = :d"
+                ),
+                {"k": message_key, "d": td},
+            )
+            existing = row.fetchone()
+
+            if existing and existing[0] == sender:
+                return json.dumps({
+                    "success": True,
+                    "message_key": message_key,
+                    "date": td,
+                    "sender": sender,
+                }, ensure_ascii=False)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "reason": "already_sent",
+                    "message_key": message_key,
+                    "date": td,
+                    "existing_sender": existing[0] if existing else None,
+                }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({
+                "success": False,
+                "reason": str(e)[:200],
+            }, ensure_ascii=False)
+
+
+# ── Tool 23: log_telegram_message ─────────────────────────
+
+
+@mcp.tool()
+async def log_telegram_message(
+    text: str,
+    category: str = "openclaw",
+    caller: str = "openclaw",
+    telegram_message_id: int = 0,
+) -> str:
+    """외부에서 발송한 텔레그램 메시지를 DB에 기록.
+
+    OpenClaw 크론잡 등에서 텔레그램 발송 후 호출하여 히스토리를 보존한다.
+    telegram_message_logs 테이블에 기록되며, GET /telegram/logs API 및
+    프론트엔드 TelegramLogPage에서 조회 가능.
+
+    Args:
+        text: 발송한 메시지 본문
+        category: 메시지 카테고리 (openclaw, mining_report, review_report 등)
+        caller: 호출 주체 (openclaw.cron.morning_brief 등)
+        telegram_message_id: Telegram API가 반환한 message_id (0이면 미제공)
+    """
+    try:
+        from app.core.config import settings
+        from app.telegram.models import TelegramMessageLog
+
+        async with async_session() as db:
+            log = TelegramMessageLog(
+                category=category,
+                caller=caller,
+                text=text[:4000],
+                chat_id=settings.TELEGRAM_CHAT_ID or "",
+                status="success",
+                telegram_message_id=telegram_message_id or None,
+            )
+            db.add(log)
+            await db.commit()
+
+            return json.dumps({
+                "success": True,
+                "id": str(log.id),
+                "category": category,
+                "caller": caller,
+            }, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("log_telegram_message failed: %s", e)
+        return json.dumps({
+            "success": False,
+            "reason": str(e)[:200],
+        }, ensure_ascii=False)
+
+
+# ── Tool 24: send_and_log_telegram ─────────────────────────
+
+
+@mcp.tool()
+async def send_and_log_telegram(
+    text: str,
+    category: str = "openclaw",
+    caller: str = "openclaw",
+) -> str:
+    """텔레그램 메시지 발송 + DB 로깅을 원자적으로 처리.
+
+    OpenClaw 크론잡 등에서 텔레그램 메시지를 보낼 때 이 도구를 사용하면
+    백엔드의 발송 큐를 통해 rate limit을 준수하고, 자동으로 로그에 기록된다.
+
+    Args:
+        text: 발송할 메시지 본문 (HTML 태그 지원)
+        category: 메시지 카테고리 (openclaw, mining_report, review_report 등)
+        caller: 호출 주체 (openclaw.cron.morning_brief 등)
+    """
+    try:
+        from app.telegram.bot import send_message
+        await send_message(text, category=category, caller=caller)
+        return json.dumps({"success": True, "message": "발송 큐에 추가됨"}, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("send_and_log_telegram failed: %s", e)
+        return json.dumps({"success": False, "reason": str(e)[:200]}, ensure_ascii=False)
