@@ -86,14 +86,7 @@ class KISOrderExecutor:
             }
             if rt_cd == "0":
                 logger.info("매수 주문 성공: %s %d주 @ %s", symbol, qty, price or "시장가")
-                # 미체결 추적 등록
-                order_id = output.get("ODNO", "")
-                if order_id:
-                    _pending_orders[order_id] = {
-                        "symbol": symbol, "side": "BUY", "qty": qty,
-                        "price": price, "order_time": output.get("ORD_TMD", ""),
-                        "retries": 0,
-                    }
+                # NOTE: 미체결 추적은 OrderManager가 담당 (order_manager.py)
             else:
                 logger.warning("매수 주문 실패: %s — %s", symbol, msg)
             return result
@@ -143,13 +136,7 @@ class KISOrderExecutor:
             }
             if rt_cd == "0":
                 logger.info("매도 주문 성공: %s %d주 @ %s", symbol, qty, price or "시장가")
-                order_id = output.get("ODNO", "")
-                if order_id:
-                    _pending_orders[order_id] = {
-                        "symbol": symbol, "side": "SELL", "qty": qty,
-                        "price": price, "order_time": output.get("ORD_TMD", ""),
-                        "retries": 0,
-                    }
+                # NOTE: 미체결 추적은 OrderManager가 담당 (order_manager.py)
             else:
                 logger.warning("매도 주문 실패: %s — %s", symbol, msg)
             return result

@@ -35,6 +35,15 @@ async def _send_collection_telegram(msg: str) -> None:
         pass
 
 
+async def _send_once(message_key: str, msg: str) -> bool:
+    """1일 1회성 메시지 발송 — bot.send_once 위임."""
+    from app.telegram.bot import send_once
+    return await send_once(
+        message_key, msg,
+        category="daily_collect", caller="daily_scheduler",
+    )
+
+
 # ── 상태 ────────────────────────────────────────────────
 
 
@@ -166,7 +175,7 @@ class DailyScheduler:
     # ── 메인 루프 ──
 
     async def _already_collected_today(self) -> bool:
-        """DB에서 오늘 일봉 수집 기록 존재 여부 확인."""
+        """레지스트리에서 오늘 수집 시작 여부 확인."""
         from app.core.database import async_session
         from sqlalchemy import text
 
@@ -175,8 +184,8 @@ class DailyScheduler:
             async with async_session() as session:
                 result = await session.execute(
                     text(
-                        "SELECT 1 FROM stock_candles "
-                        "WHERE dt::date = :d AND interval = '1d' LIMIT 1"
+                        "SELECT 1 FROM telegram_message_registry "
+                        "WHERE message_key = 'daily_collect_start' AND date = :d"
                     ),
                     {"d": today},
                 )
@@ -270,19 +279,44 @@ class DailyScheduler:
 
     async def _run_daily_cycle(self, date: str) -> None:
         """일봉 → 분봉 → 뉴스 순차 실행."""
+        # 인메모리 중복 방지
+        if self._state.last_run_date == date:
+            logger.info("오늘 수집 이미 실행됨 (인메모리) — 스킵: %s", date)
+            return
+
         logger.info("=== 일일 수집 사이클 시작 (date=%s) ===", date)
         self._state.last_run_date = date
         _cycle_start = _now_kst()
 
-        # 텔레그램: 사이클 시작
+        # 텔레그램: 사이클 시작 (상세)
         _JOB_DISPLAY = {
             "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
             "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
         }
-        await _send_collection_telegram(
-            f"\U0001f4e6 <b>일일 수집 시작</b> ({date})\n"
-            f"대상: {', '.join(_JOB_DISPLAY.get(j, j) for j in JOB_NAMES)}"
+        _JOB_DETAIL = {
+            "daily_candle": "일봉 캔들 (pykrx)",
+            "minute_candle": "분봉 캔들 (KIS API)",
+            "news": "뉴스 기사 + 감성 분석 (네이버/DART)",
+            "margin_short": "신용잔고/공매도 (KIS API)",
+            "investor": "투자자별 매매동향 (KIS API)",
+            "dart_financial": "DART 재무 데이터",
+        }
+        _formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else date
+        items = "\n".join(
+            f"  {i}. {_JOB_DETAIL.get(j, j)}"
+            for i, j in enumerate(JOB_NAMES, 1)
         )
+        sent = await _send_once(
+            "daily_collect_start",
+            f"\U0001f4e6 <b>일일 데이터 수집 시작</b> ({_formatted_date})\n\n"
+            f"다음 {len(JOB_NAMES)}개 항목을 순차적으로 수집합니다:\n"
+            f"{items}\n\n"
+            f"각 항목 완료 시마다 결과를 보고합니다.\n"
+            f"전체 소요 예상: 약 20~40분",
+        )
+        if not sent:
+            logger.info("수집 시작 메시지 이미 발송됨 — 사이클 스킵")
+            return
 
         for job_name in JOB_NAMES:
             if not self._state.running:
@@ -328,7 +362,7 @@ class DailyScheduler:
         else:
             lines.append(f"\n\u2705 서킷 브레이커: 모두 정상")
 
-        await _send_collection_telegram("\n".join(lines))
+        await _send_once("daily_collect_complete", "\n".join(lines))
 
         logger.info("=== 일일 수집 사이클 완료 (date=%s) ===", date)
         await self._broadcast({"type": "cycle_complete", "date": date})

@@ -202,15 +202,28 @@ class KISClient:
 
         orders = []
         for item in data.get("output1", []):
+            tot_ccld = int(item.get("tot_ccld_qty", "0"))
+            ord_qty = int(item.get("ord_qty", "0"))
+
+            # 상태 분류: FILLED / PARTIAL / PENDING
+            if tot_ccld >= ord_qty and ord_qty > 0:
+                status = "FILLED"
+            elif tot_ccld > 0:
+                status = "PARTIAL"
+            else:
+                status = "PENDING"
+
             orders.append({
                 "order_id": item.get("odno", ""),
                 "symbol": item.get("pdno", ""),
                 "name": item.get("prdt_name", ""),
                 "side": "BUY" if item.get("sll_buy_dvsn_cd") == "02" else "SELL",
                 "price": float(item.get("avg_prvs", "0")),
-                "qty": int(item.get("tot_ccld_qty", "0")),
-                "order_qty": int(item.get("ord_qty", "0")),
-                "status": "FILLED" if int(item.get("tot_ccld_qty", "0")) > 0 else "PENDING",
+                "qty": tot_ccld,
+                "order_qty": ord_qty,
+                "remaining_qty": max(0, ord_qty - tot_ccld),
+                "tot_ccld_qty": tot_ccld,
+                "status": status,
                 "order_time": item.get("ord_tmd", ""),
             })
 

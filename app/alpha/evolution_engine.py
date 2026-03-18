@@ -16,7 +16,7 @@ from dataclasses import asdict
 
 import polars as pl
 import sympy
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_ as db_or, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alpha.ast_converter import (
@@ -228,6 +228,31 @@ class EvolutionEngine:
         elites = self._select_elites(population)
         logger.info("세대 %d: 엘리트 %d개 선택, Train/Val 분할 시작", self._generation, len(elites))
 
+        # 2b. 수렴 감지 → LLM 재시드 주입
+        if len(population) >= 10:
+            from collections import Counter as _Counter
+            _feat_counts = _Counter()
+            _top10 = sorted(population, key=lambda x: x.fitness_composite, reverse=True)[:10]
+            for _f in _top10:
+                for _sym in _f.expression.free_symbols:
+                    _feat_counts[str(_sym)] += 1
+            _dominant = _feat_counts.most_common(1)
+            if _dominant and _dominant[0][1] >= 8:
+                logger.warning(
+                    "세대 %d: 모집단 수렴 감지 — '%s' 상위 10개 중 %d개. LLM 시드 주입 시도.",
+                    self._generation, _dominant[0][0], _dominant[0][1],
+                )
+                _injected = 0
+                for _ in range(5):
+                    try:
+                        _seed_expr = await self._llm_seed()
+                        if _seed_expr is not None:
+                            _injected += 1
+                    except Exception:
+                        pass
+                if _injected > 0:
+                    logger.info("세대 %d: LLM 시드 %d개 주입 완료", self._generation, _injected)
+
         # 3. Train/Val 분할
         train_data, val_data = self._split_train_val()
         logger.info("세대 %d: Train/Val 분할 완료 (train=%d×%d, val=%s)", self._generation, train_data.height, train_data.width, val_data.height if val_data is not None else "None")
@@ -396,6 +421,18 @@ class EvolutionEngine:
         _t_phase2 = _time.perf_counter()
         all_children = ast_children
         logger.info("세대 %d: Phase 2 완료 (%.1fs) — 총 %d개 자식, to_thread 시작", self._generation, _t_phase2 - _t_phase1, len(all_children))
+
+        # ★ 자식 0개 시 Phase 3 스킵 (0초 빈 실행 방지)
+        if not all_children:
+            logger.warning(
+                "세대 %d: 후보 자식 0개 (operator_null=%d, LLM disabled=%s). Phase 3 스킵.",
+                self._generation,
+                funnel.get("operator_null", 0),
+                self._operator_registry.is_llm_disabled(),
+            )
+            if progress_cb:
+                await progress_cb(100, 100, f"세대 {self._generation}: 자식 생성 실패")
+            return []
 
         if progress_cb:
             await progress_cb(
@@ -712,7 +749,10 @@ class EvolutionEngine:
             from app.alpha.cpcv import cpcv_validate
 
             cpcv_candidates.sort(key=lambda c: c.fitness_composite, reverse=True)
-            cpcv_top_k = min(20, len(cpcv_candidates))
+            cpcv_top_k = min(50, len(cpcv_candidates))
+
+            # ★ 해시 기반 클론 중복 제거
+            _discovered_hashes: set[str] = set()
 
             for child in cpcv_candidates[:cpcv_top_k]:
                 cpcv_result = cpcv_validate(
@@ -720,6 +760,13 @@ class EvolutionEngine:
                     ic_threshold=self._ic_threshold,
                 )
                 if cpcv_result.passed:
+                    # ★ 구조적 해시로 클론 제거 (상수만 다른 동일 수식 방지)
+                    _hash = expression_hash(child.expression)
+                    if _hash in _discovered_hashes:
+                        logger.debug("Clone skipped: %s", child.expression_str[:50])
+                        continue
+                    _discovered_hashes.add(_hash)
+
                     # CPCV 통과 후 최종 Sharpe 검증
                     if child.sharpe < settings.ALPHA_SHARPE_THRESHOLD:
                         logger.info(
@@ -809,8 +856,14 @@ class EvolutionEngine:
         return train, val if val.height > 0 else None
 
     def _is_overfit(self, train_ic: float, val_ic: float) -> bool:
-        """과적합 판단: Val IC < threshold × 0.5면 과적합."""
-        return val_ic < self._ic_threshold * 0.5
+        """과적합 판단: Val IC 기준 미달 또는 Train→Val 하락 50% 초과."""
+        # 조건 1: Val IC가 임계값의 80% 미만
+        if val_ic < self._ic_threshold * 0.8:
+            return True
+        # 조건 2: Train→Val IC 하락이 50% 초과
+        if train_ic > 0 and (train_ic - val_ic) / train_ic > 0.5:
+            return True
+        return False
 
     async def _seed_population(self, count: int) -> list[ScoredFactor]:
         """초기 모집단 생성: 간단한 수식 시드."""
@@ -1404,6 +1457,28 @@ class EvolutionEngine:
                 factor.factor_id = str(new_factor.id)
 
         await self._db.commit()
+
+        # 자동 퍼지: 비활성(population_active=False) + population 상태 + 품질 미달 → hard delete
+        try:
+            from sqlalchemy import delete as sa_delete
+            purge_result = await self._db.execute(
+                sa_delete(AlphaFactor).where(
+                    AlphaFactor.population_active == False,  # noqa: E712
+                    AlphaFactor.status == "population",
+                    db_or(
+                        AlphaFactor.ic_mean < 0.03,
+                        AlphaFactor.ic_mean.is_(None),
+                        AlphaFactor.sharpe < 0.3,
+                        AlphaFactor.sharpe.is_(None),
+                    ),
+                )
+            )
+            purged = purge_result.rowcount
+            if purged:
+                await self._db.commit()
+                logger.info("진화 후 품질 미달 팩터 퍼지: %d개 삭제", purged)
+        except Exception as e:
+            logger.debug("진화 후 퍼지 실패 (무시): %s", e)
 
     @staticmethod
     def _safe_code_string(expr: sympy.Basic) -> str | None:

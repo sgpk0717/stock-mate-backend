@@ -103,10 +103,44 @@ async def check_staleness(session: AsyncSession) -> dict:
     if retired_count:
         logger.info("팩터 retired 전환: %d개", retired_count)
 
+    # 자동 퍼지: retired 90일 경과 → hard delete
+    purge_retired_cutoff = now - timedelta(days=90)
+    purge_retired_stmt = select(AlphaFactor.id).where(
+        AlphaFactor.status == "retired",
+        AlphaFactor.updated_at <= purge_retired_cutoff,
+    )
+    purge_retired_ids = (await session.execute(purge_retired_stmt)).scalars().all()
+    purged_retired = 0
+    if purge_retired_ids:
+        from sqlalchemy import delete as sa_delete
+        await session.execute(
+            sa_delete(AlphaFactor).where(AlphaFactor.id.in_(purge_retired_ids))
+        )
+        purged_retired = len(purge_retired_ids)
+        logger.info("retired 90일 퍼지: %d개 삭제", purged_retired)
+
+    # 자동 퍼지: mirage 7일 경과 → hard delete
+    purge_mirage_cutoff = now - timedelta(days=7)
+    purge_mirage_stmt = select(AlphaFactor.id).where(
+        AlphaFactor.status == "mirage",
+        AlphaFactor.updated_at <= purge_mirage_cutoff,
+    )
+    purge_mirage_ids = (await session.execute(purge_mirage_stmt)).scalars().all()
+    purged_mirage = 0
+    if purge_mirage_ids:
+        from sqlalchemy import delete as sa_delete
+        await session.execute(
+            sa_delete(AlphaFactor).where(AlphaFactor.id.in_(purge_mirage_ids))
+        )
+        purged_mirage = len(purge_mirage_ids)
+        logger.info("mirage 7일 퍼지: %d개 삭제", purged_mirage)
+
     await session.commit()
 
     return {
         "warned": warned,
         "stale": stale_count,
         "retired": retired_count,
+        "purged_retired": purged_retired,
+        "purged_mirage": purged_mirage,
     }

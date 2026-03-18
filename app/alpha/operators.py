@@ -6,9 +6,12 @@ UCB1 알고리즘으로 적합도 개선이 큰 연산자를 우선 선택한다
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -97,23 +100,24 @@ class OperatorRegistry:
             ]
 
         # UCB1 스코어 계산
-        best_name = None
-        best_score = -float("inf")
+        # 미시도 연산자가 있으면 그 중 랜덤 선택 (편향 방지)
+        untried = [name for name, stats in candidates if stats.calls == 0]
+        if untried:
+            best_name = random.choice(untried)
+        else:
+            best_name = None
+            best_score = -float("inf")
 
-        for name, stats in candidates:
-            if stats.calls == 0:
-                # 미시도 연산자 최우선 탐색 (+ 약간의 랜덤)
-                score = float("inf") - random.random()
-            else:
+            for name, stats in candidates:
                 avg_reward = stats.fitness_improvements / stats.calls
                 exploration = self._exploration_c * math.sqrt(
                     math.log(max(self._total_calls, 1)) / stats.calls
                 )
                 score = avg_reward + exploration
 
-            if score > best_score:
-                best_score = score
-                best_name = name
+                if score > best_score:
+                    best_score = score
+                    best_name = name
 
         return best_name  # type: ignore
 
@@ -133,7 +137,13 @@ class OperatorRegistry:
     def record_llm_failure(self) -> None:
         """LLM 연산자 실패 기록. 연속 3회 시 비활성화."""
         self._llm_consecutive_failures += 1
-        if self._llm_consecutive_failures >= 3:
+        will_disable = self._llm_consecutive_failures >= 3
+        logger.warning(
+            "LLM failure #%d%s",
+            self._llm_consecutive_failures,
+            " → LLM DISABLED" if will_disable else "",
+        )
+        if will_disable:
             self._llm_disabled = True
 
     def reset_llm_failures(self) -> None:

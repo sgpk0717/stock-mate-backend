@@ -171,7 +171,7 @@ def _mutate_function(expr: sympy.Basic) -> sympy.Basic | None:
     subtrees = _get_subtrees(expr)
 
     # 기존 함수 제거 시도
-    wrapped = [s for s in subtrees if isinstance(s, (sympy.log, sympy.Abs))]
+    wrapped = [s for s in subtrees if isinstance(s, (sympy.log, sympy.Abs, sympy.sign, sympy.Heaviside))]
     if wrapped and random.random() < 0.5:
         target = random.choice(wrapped)
         return expr.subs(target, target.args[0])
@@ -180,7 +180,7 @@ def _mutate_function(expr: sympy.Basic) -> sympy.Basic | None:
     symbols = [s for s in subtrees if isinstance(s, sympy.Symbol)]
     if symbols:
         target = random.choice(symbols)
-        func = random.choice([sympy.log, sympy.sqrt, sympy.Abs])
+        func = random.choice([sympy.log, sympy.sqrt, sympy.Abs, sympy.sign, sympy.Heaviside])
         return expr.subs(target, func(target))
 
     return None

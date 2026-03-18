@@ -169,6 +169,7 @@ async def build_context_from_factor(
     *,
     mode: str = "paper",
     param_overrides: dict | None = None,
+    initial_capital: float | None = None,
 ) -> TradingContextModel:
     """팩터에서 TradingContext DB 모델을 생성하여 저장한다.
 
@@ -176,8 +177,9 @@ async def build_context_from_factor(
         param_overrides: 전일 피드백 기반 파라미터 조정값.
             키: max_positions, stop_loss_pct, trailing_stop_pct,
                 max_drawdown_pct, position_size_pct
+        initial_capital: 배정 자본금. None이면 WORKFLOW_INITIAL_CAPITAL 사용.
     """
-    initial_capital = settings.WORKFLOW_INITIAL_CAPITAL
+    initial_capital = initial_capital or settings.WORKFLOW_INITIAL_CAPITAL
     max_positions = settings.WORKFLOW_MAX_POSITIONS
     stop_loss = settings.WORKFLOW_STOP_LOSS_PCT
     max_dd = settings.WORKFLOW_MAX_DRAWDOWN_PCT

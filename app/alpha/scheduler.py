@@ -46,6 +46,7 @@ class _FactoryState:
     generation: int = 0
     operator_stats: dict = field(default_factory=dict)
     last_funnel: dict = field(default_factory=dict)
+    generation_ic_history: list = field(default_factory=list)  # 세대별 IC 추이 (최근 20개)
     user_stopped: bool = False  # 사용자가 의도적으로 중지 (watchdog 재시작 방지)
 
 
@@ -247,6 +248,9 @@ class AlphaFactoryScheduler:
         config = self._state.config
         self._state.current_cycle_progress = 0
         cycle_num = self._state.cycles_completed + 1
+
+        # ★ LLM 장애 리셋을 최상단에서 보장 (데이터 로드 실패 시에도 리셋)
+        self._operator_registry.reset_llm_failures()
         discovered: list[DiscoveredFactor] = []
         run_id: uuid.UUID | None = None
         _last_funnel: dict = {}  # 퍼널 데이터 (텔레그램 보고용)
@@ -327,6 +331,19 @@ class AlphaFactoryScheduler:
                         self._state.elite_count = event.get("elite_count", 0)
                         _last_funnel = event.get("funnel", {})
                         self._state.last_funnel = _last_funnel
+                        # IC 히스토리 기록 (세대별 추이 — LLM 리포트용)
+                        _best_ic = 0.0
+                        if _last_eval:
+                            _all_s = _last_eval.get("top_samples", []) + _last_eval.get("fail_samples", [])
+                            if _all_s:
+                                _best_ic = max(s.get("ic", 0) for s in _all_s)
+                        self._state.generation_ic_history.append({
+                            "gen": event.get("generation", 0),
+                            "best_ic": round(_best_ic, 4),
+                            "discovered": event.get("new_discovered", 0),
+                            "eval_ok": _last_funnel.get("eval_ok", 0),
+                        })
+                        self._state.generation_ic_history = self._state.generation_ic_history[-20:]
                     elif etype == "candidates_ready":
                         _last_candidates = event
                     elif etype == "eval_complete":
@@ -335,8 +352,6 @@ class AlphaFactoryScheduler:
                         **event,
                         "cycle": cycle_num,
                     })
-
-                self._operator_registry.reset_llm_failures()
 
                 if self._evolution_engine is None:
                     self._evolution_engine = EvolutionEngine(
@@ -361,8 +376,21 @@ class AlphaFactoryScheduler:
                 self._data_cache_key = ""
                 import gc as _gc; _gc.collect()
 
-                # mining_run_id를 미리 생성하여 engine에 전달 (모집단 팩터에도 연결)
+                # alpha_mining_runs를 먼저 INSERT (FK 대상: _persist_population에서 참조)
                 run_id = uuid.uuid4()
+                mining_run = AlphaMiningRun(
+                    id=run_id,
+                    name=f"Factory Cycle {cycle_num} (Gen {self._state.generation})",
+                    context={"text": config.get("context", "")},
+                    config=config,
+                    status="RUNNING",
+                    progress=0,
+                    factors_found=0,
+                    total_evaluated=settings.ALPHA_POPULATION_SIZE,
+                )
+                db.add(mining_run)
+                await db.flush()  # DB에 레코드 생성 → FK 참조 가능
+
                 self._evolution_engine._current_run_id = str(run_id)
 
                 logger.info("Cycle %d: starting run_generation (gen=%d)", cycle_num, self._evolution_engine.generation)
@@ -375,48 +403,40 @@ class AlphaFactoryScheduler:
                 self._state.generation = self._evolution_engine.generation
                 self._state.operator_stats = self._operator_registry.to_dict()
 
-            # DB 저장 (실패해도 카운터에 영향 없음)
+                # mining_run 상태 업데이트 (같은 세션 #1에서)
+                mining_run.status = "COMPLETED"
+                mining_run.progress = 100
+                mining_run.factors_found = len(discovered)
+                mining_run.iteration_logs = {"operator_stats": self._operator_registry.to_dict()}
+                mining_run.completed_at = datetime.utcnow()
+                await db.commit()
+
+            # discovered 팩터 DB 저장 (별도 세션 — 실패해도 카운터에 영향 없음)
             try:
-                async with async_session() as save_db:
-                    # run_id는 위에서 미리 생성됨 (engine._current_run_id와 동일)
-                    mining_run = AlphaMiningRun(
-                        id=run_id,
-                        name=f"Factory Cycle {cycle_num} (Gen {self._state.generation})",
-                        context={"text": config.get("context", "")},
-                        config=config,
-                        status="COMPLETED",
-                        progress=100,
-                        factors_found=len(discovered),
-                        total_evaluated=settings.ALPHA_POPULATION_SIZE,
-                        iteration_logs={"operator_stats": self._operator_registry.to_dict()},
-                        completed_at=datetime.utcnow(),
-                    )
-                    save_db.add(mining_run)
-                    await save_db.flush()
-
-                    for factor in discovered:
-                        alpha_factor = AlphaFactor(
-                            mining_run_id=run_id,
-                            name=factor.name,
-                            expression_str=factor.expression_str,
-                            expression_sympy=factor.expression_sympy,
-                            polars_code=factor.polars_code,
-                            hypothesis=factor.hypothesis,
-                            generation=factor.generation,
-                            ic_mean=factor.metrics.ic_mean,
-                            ic_std=factor.metrics.ic_std,
-                            icir=factor.metrics.icir,
-                            turnover=factor.metrics.turnover,
-                            sharpe=factor.metrics.sharpe,
-                            max_drawdown=factor.metrics.max_drawdown,
-                            status="discovered",
-                            population_active=False,
-                            parent_ids=factor.parent_ids,
-                            interval=data_interval,
-                        )
-                        save_db.add(alpha_factor)
-
-                    await save_db.commit()
+                if discovered:
+                    async with async_session() as save_db:
+                        for factor in discovered:
+                            alpha_factor = AlphaFactor(
+                                mining_run_id=run_id,
+                                name=factor.name,
+                                expression_str=factor.expression_str,
+                                expression_sympy=factor.expression_sympy,
+                                polars_code=factor.polars_code,
+                                hypothesis=factor.hypothesis,
+                                generation=factor.generation,
+                                ic_mean=factor.metrics.ic_mean,
+                                ic_std=factor.metrics.ic_std,
+                                icir=factor.metrics.icir,
+                                turnover=factor.metrics.turnover,
+                                sharpe=factor.metrics.sharpe,
+                                max_drawdown=factor.metrics.max_drawdown,
+                                status="discovered",
+                                population_active=False,
+                                parent_ids=factor.parent_ids,
+                                interval=data_interval,
+                            )
+                            save_db.add(alpha_factor)
+                        await save_db.commit()
             except Exception as e:
                 logger.warning("Factory DB save failed for cycle %d: %s", cycle_num, e)
                 run_id = None
@@ -428,7 +448,21 @@ class AlphaFactoryScheduler:
         finally:
             # 성공이든 실패든 카운터 반영 + 브로드캐스트
             self._state.cycles_completed = cycle_num
-            self._state.factors_discovered_total += len(discovered)
+            # ★ DB 기반 누적 계산 (메모리 리셋에 강건)
+            if run_id:
+                try:
+                    async with async_session() as _count_db:
+                        _cnt_result = await _count_db.execute(
+                            select(func.count(AlphaFactor.id)).where(
+                                AlphaFactor.mining_run_id == str(run_id)
+                            )
+                        )
+                        _cycle_found = _cnt_result.scalar() or 0
+                    self._state.factors_discovered_total += _cycle_found
+                except Exception:
+                    self._state.factors_discovered_total += len(discovered)
+            else:
+                self._state.factors_discovered_total += len(discovered)
             self._state.last_cycle_at = datetime.utcnow().isoformat()
             self._state.current_cycle_progress = 100
 
@@ -460,121 +494,28 @@ class AlphaFactoryScheduler:
                     or (cycle_num % 5 == 0 and _time_ok)
                 )
                 if should_report:
-                    f = _last_funnel
-                    total = self._state.factors_discovered_total
-                    gen = self._state.generation
-                    ic_thr = config.get("ic_threshold", 0.03)
-                    universe_code = config.get("universe", "KOSPI200")
-                    data_interval = config.get("data_interval", "1d")
-
                     # 소요시간 계산
                     elapsed = datetime.utcnow() - _cycle_start
                     elapsed_min = int(elapsed.total_seconds() // 60)
                     elapsed_sec = int(elapsed.total_seconds() % 60)
                     elapsed_str = f"{elapsed_min}분 {elapsed_sec}초" if elapsed_min > 0 else f"{elapsed_sec}초"
 
-                    # 상태 이모지
-                    if len(discovered) >= 5:
-                        status_emoji = "\U0001f525"  # fire
-                    elif len(discovered) > 0:
-                        status_emoji = "\u2705"  # check
-                    else:
-                        status_emoji = "\U0001f52c"  # microscope
-
-                    # --- 헤더 ---
-                    msg = f"{status_emoji} <b>세대 {gen} 완료</b> ({elapsed_str})\n\n"
-
-                    # --- 결과 ---
-                    msg += (
-                        f"\U0001f4ca <b>결과</b>\n"
-                        f"  발견: <b>{len(discovered)}개</b> / 누적: {total}개\n"
+                    report_data = self._build_report_data(
+                        cycle_num, discovered, config,
+                        _last_funnel, _last_eval, _last_candidates, elapsed_str,
                     )
 
-                    # --- 발견 팩터 상세 (있으면) ---
-                    if discovered:
-                        msg += f"\n\U0001f3c6 <b>발견 팩터 (상위 3개)</b>\n"
-                        top_d = sorted(discovered, key=lambda d: d.metrics.ic_mean if d.metrics else 0, reverse=True)[:3]
-                        for i, d in enumerate(top_d, 1):
-                            ic = d.metrics.ic_mean if d.metrics else 0
-                            sh = d.metrics.sharpe if d.metrics else 0
-                            msg += (
-                                f"  {i}. <code>{d.expression_str[:40]}</code>\n"
-                                f"     IC={ic:.4f} / Sharpe={sh:.2f}\n"
-                            )
-
-                    # --- 진화 과정 (funnel + operator breakdown) ---
-                    if f:
-                        attempted = f.get('attempted', 0)
-                        eval_ok = f.get('eval_ok', 0)
-                        ic_pass = f.get('ic_pass', 0)
-                        wf_overfit = f.get('wf_overfit', 0)
-                        sharpe_fail = f.get('sharpe_fail', 0)
-                        cpcv_cands = f.get('cpcv_candidates', 0)
-
-                        # 연산자 분포
-                        op_info = ""
-                        if _last_candidates:
-                            op_breakdown = _last_candidates.get("operator_breakdown", {})
-                            ast_count = sum(v for k, v in op_breakdown.items() if k.startswith("ast_"))
-                            llm_count = sum(v for k, v in op_breakdown.items() if k.startswith("llm_"))
-                            if ast_count or llm_count:
-                                op_info = f" (AST {ast_count} / LLM {llm_count})"
-
-                        eval_pct = int(eval_ok / attempted * 100) if attempted else 0
-                        ic_pct = int(ic_pass / max(eval_ok, 1) * 100)
-
-                        msg += (
-                            f"\n\u2699\ufe0f <b>진화 과정</b>\n"
-                            f"  후보 생성: {attempted}개{op_info}\n"
-                            f"  \u251c 계산 성공: {eval_ok}개 ({eval_pct}%)\n"
-                            f"  \u251c IC\u2265{ic_thr} 통과: {ic_pass}개 ({ic_pct}%)\n"
-                        )
-                        if wf_overfit > 0:
-                            msg += f"  \u251c 과적합 탈락: {wf_overfit}개\n"
-                        if sharpe_fail > 0:
-                            msg += f"  \u251c Sharpe 미달: {sharpe_fail}개\n"
-                        msg += f"  \u2514 최종 발견: {len(discovered)}개\n"
-
-                    # --- 최고 성적 (팩터 미발견 시) ---
-                    if _last_eval and not discovered:
-                        top_samples = _last_eval.get("top_samples", [])
-                        fail_samples = _last_eval.get("fail_samples", [])
-                        samples = top_samples if top_samples else sorted(
-                            fail_samples, key=lambda x: x.get("ic", 0), reverse=True
-                        )[:3]
-                        if samples:
-                            msg += f"\n\U0001f4c8 <b>최고 성적</b>\n"
-                            for i, s in enumerate(samples[:3], 1):
-                                expr = s.get("expression", "?")[:45]
-                                ic_val = s.get("ic", 0)
-                                msg += f"  {i}. <code>{expr}</code>  IC={ic_val:.4f}\n"
-
-                    # --- 동적 해석 ---
-                    if len(discovered) == 0:
-                        best_ic = 0.0
-                        if _last_eval:
-                            all_samples = _last_eval.get("top_samples", []) + _last_eval.get("fail_samples", [])
-                            if all_samples:
-                                best_ic = max(s.get("ic", 0) for s in all_samples)
-
-                        if best_ic >= ic_thr * 0.8:
-                            msg += f"\n\U0001f4a1 IC {ic_thr}에 근접 (최고 {best_ic:.4f}). 진화 중.\n"
-                        elif f and f.get("eval_ok", 0) == 0:
-                            msg += f"\n\U0001f4a1 수식 계산 실패 다수 \u2014 데이터 점검 필요.\n"
-                        else:
-                            msg += f"\n\U0001f4a1 기준(IC>{ic_thr}) 미달. 세대 누적으로 개선됩니다.\n"
-                    else:
-                        msg += (
-                            f"\n\U0001f4a1 IC = 주가 예측력 (0.03+) / Sharpe = 수익 안정성 (1.0+)\n"
-                        )
-
-                    # --- 하단 설정 ---
-                    msg += f"\n\u2699\ufe0f {universe_code} / {data_interval} / 사이클 {cycle_num}"
+                    # LLM 리포트 생성 (Gemini), 실패 시 기존 f-string 폴백
+                    try:
+                        msg = await self._generate_llm_report(report_data)
+                    except Exception as llm_err:
+                        logger.warning("LLM report generation failed: %s — using fallback", llm_err)
+                        msg = self._build_fallback_report(report_data)
 
                     await tg_send(msg, category="mining_report", caller="alpha.scheduler")
                     self._last_tg_report_at = datetime.utcnow()
             except Exception as e:
-                logger.debug("Telegram report failed: %s", e)
+                logger.warning("Telegram report failed: %s", e, exc_info=True)
 
             # WorkflowEvent에 사이클 결과 기록 (OpenClaw 조회용)
             try:
@@ -598,6 +539,236 @@ class AlphaFactoryScheduler:
                         await evt_db.commit()
             except Exception:
                 pass  # 이벤트 기록 실패가 마이닝을 방해하면 안 됨
+
+    # ── 텔레그램 리포트 생성 ──
+
+    def _build_report_data(
+        self,
+        cycle_num: int,
+        discovered: list[DiscoveredFactor],
+        config: dict,
+        funnel: dict,
+        eval_data: dict,
+        candidates_data: dict,
+        elapsed_str: str,
+    ) -> dict:
+        """콜백 데이터를 LLM 입력용 dict로 구조화."""
+        ic_thr = config.get("ic_threshold", 0.03)
+
+        # 발견 팩터 상세
+        discovered_factors = []
+        for d in sorted(discovered, key=lambda x: x.metrics.ic_mean if x.metrics else 0, reverse=True):
+            entry: dict = {"expression": d.expression_str[:60]}
+            if d.metrics:
+                entry.update({
+                    "ic_mean": round(d.metrics.ic_mean, 4),
+                    "icir": round(d.metrics.icir, 2) if hasattr(d.metrics, "icir") and d.metrics.icir else 0,
+                    "sharpe": round(d.metrics.sharpe, 2) if d.metrics.sharpe else 0,
+                    "max_drawdown": round(d.metrics.max_drawdown, 3) if hasattr(d.metrics, "max_drawdown") and d.metrics.max_drawdown else 0,
+                    "turnover": round(d.metrics.turnover, 3) if hasattr(d.metrics, "turnover") and d.metrics.turnover else 0,
+                })
+            if d.hypothesis:
+                entry["hypothesis"] = d.hypothesis[:100]
+            discovered_factors.append(entry)
+
+        # 연산자 분포
+        op_breakdown = {}
+        if candidates_data:
+            op_breakdown = candidates_data.get("operator_breakdown", {})
+
+        # 연산자 성능 통계 (UCB1)
+        op_stats = self._state.operator_stats or {}
+
+        return {
+            "generation": self._state.generation,
+            "cycle_num": cycle_num,
+            "elapsed": elapsed_str,
+            "universe": config.get("universe", "KOSPI200"),
+            "data_interval": config.get("data_interval", "1d"),
+            "ic_threshold": ic_thr,
+            "total_discovered": self._state.factors_discovered_total,
+            "funnel": {
+                "attempted": funnel.get("attempted", 0),
+                "eval_ok": funnel.get("eval_ok", 0),
+                "ic_pass": funnel.get("ic_pass", 0),
+                "wf_overfit": funnel.get("wf_overfit", 0),
+                "sharpe_fail": funnel.get("sharpe_fail", 0),
+                "cpcv_candidates": funnel.get("cpcv_candidates", 0),
+            },
+            "operator_breakdown": op_breakdown,
+            "operator_stats": {
+                k: {
+                    "calls": v.get("calls", 0),
+                    "avg_fitness_delta": round(v.get("avg_fitness_delta", 0), 4),
+                }
+                for k, v in (op_stats.get("operators", {}) if isinstance(op_stats, dict) else {}).items()
+                if isinstance(v, dict)
+            },
+            "discovered_factors": discovered_factors,
+            "top_samples": eval_data.get("top_samples", []) if eval_data else [],
+            "fail_samples": eval_data.get("fail_samples", []) if eval_data else [],
+            "generation_ic_trend": self._state.generation_ic_history,
+        }
+
+    async def _generate_llm_report(self, report_data: dict) -> str:
+        """Gemini로 마이닝 리포트 생성."""
+        import json
+        from app.core.llm import chat_gemini
+
+        system_prompt = (
+            "당신은 알파 팩터 마이닝 시스템의 리포트 분석가입니다.\n"
+            "진화적 알파 팩터 탐색 사이클의 결과 데이터를 받아 텔레그램 리포트를 작성합니다.\n\n"
+            "## 리포트 구성 (순서대로)\n\n"
+            "1. **헤더**: 상태이모지 + 세대 번호 + 소요시간\n"
+            "   - 🔥 팩터 5개 이상 발견\n"
+            "   - ✅ 팩터 1~4개 발견\n"
+            "   - 🔬 팩터 미발견\n\n"
+            "2. **결과 요약**: 이번 사이클 발견 팩터 수, 누적 발견 수\n\n"
+            "3. **발견 팩터 상세** (있으면 상위 3개만):\n"
+            "   - 수식 (<code>태그), IC, Sharpe\n"
+            "   - 각 팩터의 경제적 의미 1줄 해석 (hypothesis 참고)\n\n"
+            "4. **진화 퍼널**: attempted → eval_ok → IC통과 → 최종 (퍼센트 포함)\n\n"
+            "5. **진화 방향성 분석** (generation_ic_trend 데이터 기반):\n"
+            "   - IC 추이 해석: 수렴 중인지, 발산 중인지, 정체인지\n"
+            "   - 어떤 연산자(operator_breakdown/operator_stats)가 효과적인지\n"
+            "   - 탐색 공간 포화도 판단 (eval_ok 비율 추이 등)\n\n"
+            "6. **전략적 제안** (1~2줄):\n"
+            "   - 다음 사이클 방향 권고 (연산자 비율, 유니버스, 인터벌 등)\n"
+            "   - 팩터 미발견 시 원인 진단 + 개선 방향\n\n"
+            "7. **하단 설정**: universe / interval / cycle_num 한 줄\n\n"
+            "## 형식 제약\n"
+            "- Telegram HTML만 사용: <b>, <i>, <code> 태그만 허용\n"
+            "- <br>, <p>, <div>, <span>, <ul>, <li> 등은 절대 사용 금지 (텔레그램 미지원)\n"
+            "- 줄바꿈은 반드시 \\n 문자 사용\n"
+            "- 총 길이 3500자 이내 (한국어 기준)\n"
+            "- 한국어로 작성\n"
+            "- 이모지는 섹션 구분용으로 적절히 사용 (과하지 않게)\n"
+            "- 트리 구조 표현 시 ├, └ 유니코드 문자 사용 가능\n"
+            "- 숫자 반올림: IC 소수점 4자리, Sharpe 2자리, 퍼센트 정수\n"
+        )
+
+        user_message = json.dumps(report_data, ensure_ascii=False, default=str)
+
+        response = await chat_gemini(
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+            max_tokens=2000,
+            temperature=0.3,
+        )
+
+        msg = response.text.strip()
+
+        # 4000자 제한 (KST 타임스탬프 ~30자 + 여유)
+        if len(msg) > 3800:
+            cut = msg[:3800].rfind("\n")
+            if cut > 2000:
+                msg = msg[:cut] + "\n\n... (전문 생략)"
+            else:
+                msg = msg[:3800] + "\n\n... (전문 생략)"
+
+        logger.info(
+            "LLM mining report generated: %d chars, %d input_tokens, %d output_tokens",
+            len(msg), response.input_tokens, response.output_tokens,
+        )
+        return msg
+
+    def _build_fallback_report(self, report_data: dict) -> str:
+        """LLM 실패 시 기존 f-string 폴백 리포트."""
+        gen = report_data["generation"]
+        elapsed_str = report_data["elapsed"]
+        discovered_count = len(report_data["discovered_factors"])
+        total = report_data["total_discovered"]
+        ic_thr = report_data["ic_threshold"]
+        f = report_data["funnel"]
+        universe_code = report_data["universe"]
+        data_interval = report_data["data_interval"]
+        cycle_num = report_data["cycle_num"]
+        op_breakdown = report_data.get("operator_breakdown", {})
+
+        # 상태 이모지
+        if discovered_count >= 5:
+            status_emoji = "\U0001f525"  # 🔥
+        elif discovered_count > 0:
+            status_emoji = "\u2705"  # ✅
+        else:
+            status_emoji = "\U0001f52c"  # 🔬
+
+        msg = f"{status_emoji} <b>세대 {gen} 완료</b> ({elapsed_str})\n\n"
+
+        # 결과
+        msg += (
+            f"\U0001f4ca <b>결과</b>\n"
+            f"  발견: <b>{discovered_count}개</b> / 누적: {total}개\n"
+        )
+
+        # 발견 팩터 상세
+        if report_data["discovered_factors"]:
+            msg += f"\n\U0001f3c6 <b>발견 팩터 (상위 3개)</b>\n"
+            for i, d in enumerate(report_data["discovered_factors"][:3], 1):
+                ic = d.get("ic_mean", 0)
+                sh = d.get("sharpe", 0)
+                msg += (
+                    f"  {i}. <code>{d['expression'][:40]}</code>\n"
+                    f"     IC={ic:.4f} / Sharpe={sh:.2f}\n"
+                )
+
+        # 진화 과정
+        if f.get("attempted"):
+            attempted = f["attempted"]
+            eval_ok = f.get("eval_ok", 0)
+            ic_pass = f.get("ic_pass", 0)
+
+            # 연산자 분포
+            op_info = ""
+            ast_count = sum(v for k, v in op_breakdown.items() if k.startswith("ast_"))
+            llm_count = sum(v for k, v in op_breakdown.items() if k.startswith("llm_"))
+            if ast_count or llm_count:
+                op_info = f" (AST {ast_count} / LLM {llm_count})"
+
+            eval_pct = int(eval_ok / attempted * 100) if attempted else 0
+            ic_pct = int(ic_pass / max(eval_ok, 1) * 100)
+
+            msg += (
+                f"\n\u2699\ufe0f <b>진화 과정</b>\n"
+                f"  후보 생성: {attempted}개{op_info}\n"
+                f"  \u251c 계산 성공: {eval_ok}개 ({eval_pct}%)\n"
+                f"  \u251c IC\u2265{ic_thr} 통과: {ic_pass}개 ({ic_pct}%)\n"
+            )
+            wf_overfit = f.get("wf_overfit", 0)
+            sharpe_fail = f.get("sharpe_fail", 0)
+            if wf_overfit > 0:
+                msg += f"  \u251c 과적합 탈락: {wf_overfit}개\n"
+            if sharpe_fail > 0:
+                msg += f"  \u251c Sharpe 미달: {sharpe_fail}개\n"
+            msg += f"  \u2514 최종 발견: {discovered_count}개\n"
+
+        # 최고 성적 (미발견 시)
+        if not report_data["discovered_factors"]:
+            samples = report_data.get("top_samples") or report_data.get("fail_samples", [])
+            if samples:
+                msg += f"\n\U0001f4c8 <b>최고 성적</b>\n"
+                for i, s in enumerate(samples[:3], 1):
+                    expr = s.get("expression", "?")[:45]
+                    ic_val = s.get("ic", 0)
+                    msg += f"  {i}. <code>{expr}</code>  IC={ic_val:.4f}\n"
+
+        # 동적 해석
+        if discovered_count == 0:
+            best_ic = 0.0
+            all_samples = report_data.get("top_samples", []) + report_data.get("fail_samples", [])
+            if all_samples:
+                best_ic = max(s.get("ic", 0) for s in all_samples)
+            if best_ic >= ic_thr * 0.8:
+                msg += f"\n\U0001f4a1 IC {ic_thr}에 근접 (최고 {best_ic:.4f}). 진화 중.\n"
+            elif f.get("eval_ok", 0) == 0:
+                msg += f"\n\U0001f4a1 수식 계산 실패 다수 \u2014 데이터 점검 필요.\n"
+            else:
+                msg += f"\n\U0001f4a1 기준(IC>{ic_thr}) 미달. 세대 누적으로 개선됩니다.\n"
+        else:
+            msg += f"\n\U0001f4a1 IC = 주가 예측력 (0.03+) / Sharpe = 수익 안정성 (1.0+)\n"
+
+        msg += f"\n\u2699\ufe0f {universe_code} / {data_interval} / 사이클 {cycle_num}"
+        return msg
 
     async def _run_causal_validation(self, run_id: uuid.UUID, cycle_num: int) -> None:
         """인과 검증을 동기적으로 실행. 검증 완료 후 다음 사이클로 진행."""

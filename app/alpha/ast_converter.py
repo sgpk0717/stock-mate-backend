@@ -11,6 +11,14 @@ import hashlib
 import sympy
 import polars as pl
 
+
+# ── 커스텀 SymPy 함수 ──
+
+class Clip(sympy.Function):
+    """clip(x, lo, hi) — x를 [lo, hi] 범위로 제한."""
+
+    nargs = 3
+
 from app.backtest.indicators import (
     add_atr,
     add_bb,
@@ -142,6 +150,27 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
     # 프로그램 매매 피처 (enriched candles에서 제공)
     "pgm_net_norm": "pgm_net_norm",
     "pgm_buy_ratio": "pgm_buy_ratio",
+    # ── 이벤트 감지 피처 (OHLCV에서 자동 계산) ──
+    # 거래량 이벤트
+    "vol_spike_5d": "vol_spike_5d",
+    "vol_spike_20d": "vol_spike_20d",
+    "consec_low_vol_5": "consec_low_vol_5",
+    "vol_dry_then_spike": "vol_dry_then_spike",
+    # 가격 이벤트
+    "consec_up": "consec_up",
+    "consec_down": "consec_down",
+    "gap_up_pct": "gap_up_pct",
+    "gap_down_pct": "gap_down_pct",
+    "range_breakout": "range_breakout",
+    "range_breakdown": "range_breakdown",
+    # 모멘텀 이벤트
+    "rsi_oversold_bounce": "rsi_oversold_bounce",
+    "macd_cross_up": "macd_cross_up",
+    "bb_squeeze": "bb_squeeze",
+    "bb_breakout_upper": "bb_breakout_upper",
+    # 수급 이벤트 (enriched candles에서 제공)
+    "foreign_accumulate_5d": "foreign_accumulate_5d",
+    "inst_accumulate_5d": "inst_accumulate_5d",
 }
 
 # 모든 유효한 변수명 합집합
@@ -220,6 +249,37 @@ def sympy_to_polars(expr: sympy.Basic) -> pl.Expr:
     if isinstance(expr, sympy.Abs):
         return sympy_to_polars(expr.args[0]).abs()
 
+    # sign(x) → 방향 추출: +1 / -1 / 0
+    if isinstance(expr, sympy.sign):
+        inner = sympy_to_polars(expr.args[0])
+        return (
+            pl.when(inner > 0).then(pl.lit(1.0))
+            .when(inner < 0).then(pl.lit(-1.0))
+            .otherwise(pl.lit(0.0))
+        )
+
+    # Heaviside(x) → step 함수: x>0이면 1, 아니면 0
+    if isinstance(expr, sympy.Heaviside):
+        inner = sympy_to_polars(expr.args[0])
+        return pl.when(inner > 0).then(pl.lit(1.0)).otherwise(pl.lit(0.0))
+
+    # Max(x, y, ...)
+    if isinstance(expr, sympy.Max):
+        args = [sympy_to_polars(a) for a in expr.args]
+        return pl.max_horizontal(*args)
+
+    # Min(x, y, ...)
+    if isinstance(expr, sympy.Min):
+        args = [sympy_to_polars(a) for a in expr.args]
+        return pl.min_horizontal(*args)
+
+    # clip(x, lo, hi) → x를 [lo, hi]로 제한
+    if isinstance(expr, Clip):
+        x = sympy_to_polars(expr.args[0])
+        lo = sympy_to_polars(expr.args[1])
+        hi = sympy_to_polars(expr.args[2])
+        return pl.max_horizontal(lo, pl.min_horizontal(hi, x))
+
     # NegativeOne: -1 (Mul(-1, x)로 처리됨)
     if expr == sympy.S.NegativeOne:
         return pl.lit(-1.0)
@@ -269,6 +329,28 @@ def sympy_to_code_string(expr: sympy.Basic) -> str:
     if isinstance(expr, sympy.Abs):
         return f"({sympy_to_code_string(expr.args[0])}).abs()"
 
+    if isinstance(expr, sympy.sign):
+        inner = sympy_to_code_string(expr.args[0])
+        return f"pl.when(({inner}) > 0).then(pl.lit(1.0)).when(({inner}) < 0).then(pl.lit(-1.0)).otherwise(pl.lit(0.0))"
+
+    if isinstance(expr, sympy.Heaviside):
+        inner = sympy_to_code_string(expr.args[0])
+        return f"pl.when(({inner}) > 0).then(pl.lit(1.0)).otherwise(pl.lit(0.0))"
+
+    if isinstance(expr, sympy.Max):
+        parts = [sympy_to_code_string(a) for a in expr.args]
+        return f"pl.max_horizontal({', '.join(parts)})"
+
+    if isinstance(expr, sympy.Min):
+        parts = [sympy_to_code_string(a) for a in expr.args]
+        return f"pl.min_horizontal({', '.join(parts)})"
+
+    if isinstance(expr, Clip):
+        x = sympy_to_code_string(expr.args[0])
+        lo = sympy_to_code_string(expr.args[1])
+        hi = sympy_to_code_string(expr.args[2])
+        return f"pl.max_horizontal({lo}, pl.min_horizontal({hi}, {x}))"
+
     if expr.is_number:
         return f"pl.lit({float(expr)})"
 
@@ -312,6 +394,12 @@ _ALPHA_FEATURE_COLUMNS = {
     "margin_rate", "short_balance_rate", "short_volume_ratio",
     # 프로그램 매매 (enriched candles에서 제공)
     "pgm_net_norm", "pgm_buy_ratio",
+    # 이벤트 감지 피처
+    "vol_spike_5d", "vol_spike_20d", "consec_low_vol_5", "vol_dry_then_spike",
+    "consec_up", "consec_down", "gap_up_pct", "gap_down_pct",
+    "range_breakout", "range_breakdown",
+    "rsi_oversold_bounce", "macd_cross_up", "bb_squeeze", "bb_breakout_upper",
+    "foreign_accumulate_5d", "inst_accumulate_5d",
 }
 
 
@@ -634,6 +722,177 @@ def ensure_alpha_features(
                 ).alias("pgm_buy_ratio")
             )
 
+    # ══════════════════════════════════════════════════════
+    # ── 이벤트 감지 피처 (OHLCV 기반, 자동 계산) ──
+    # ══════════════════════════════════════════════════════
+    existing = set(df.columns)
+
+    # ── 거래량 이벤트 ──
+    if _need("vol_spike_5d"):
+        df = df.with_columns(
+            (
+                pl.col("volume").cast(pl.Float64)
+                / pl.col("volume").cast(pl.Float64)
+                .rolling_mean(window_size=5, min_periods=1)
+                .clip(lower_bound=1.0)
+            ).alias("vol_spike_5d")
+        )
+
+    if _need("vol_spike_20d"):
+        df = df.with_columns(
+            (
+                pl.col("volume").cast(pl.Float64)
+                / pl.col("volume").cast(pl.Float64)
+                .rolling_mean(window_size=20, min_periods=1)
+                .clip(lower_bound=1.0)
+            ).alias("vol_spike_20d")
+        )
+
+    if _need("consec_low_vol_5"):
+        # 5일 윈도우 내 거래량이 20일 평균 미만인 일수
+        df = df.with_columns(
+            (pl.col("volume") < pl.col("volume").cast(pl.Float64).rolling_mean(window_size=20, min_periods=5))
+            .cast(pl.Int8)
+            .rolling_sum(window_size=5, min_periods=1)
+            .alias("consec_low_vol_5")
+        )
+
+    if _need("vol_dry_then_spike"):
+        # 의존 컬럼 보장
+        if "consec_low_vol_5" not in df.columns:
+            df = df.with_columns(
+                (pl.col("volume") < pl.col("volume").cast(pl.Float64).rolling_mean(window_size=20, min_periods=5))
+                .cast(pl.Int8)
+                .rolling_sum(window_size=5, min_periods=1)
+                .alias("consec_low_vol_5")
+            )
+        if "vol_spike_5d" not in df.columns:
+            df = df.with_columns(
+                (
+                    pl.col("volume").cast(pl.Float64)
+                    / pl.col("volume").cast(pl.Float64)
+                    .rolling_mean(window_size=5, min_periods=1)
+                    .clip(lower_bound=1.0)
+                ).alias("vol_spike_5d")
+            )
+        df = df.with_columns(
+            ((pl.col("consec_low_vol_5") >= 3) & (pl.col("vol_spike_5d") >= 3.0))
+            .cast(pl.Int8)
+            .alias("vol_dry_then_spike")
+        )
+
+    # ── 가격 이벤트 ──
+    if _need("consec_up"):
+        # 5일 윈도우 내 상승일 수
+        df = df.with_columns(
+            (pl.col("close") > pl.col("close").shift(1))
+            .cast(pl.Int8)
+            .rolling_sum(window_size=5, min_periods=1)
+            .alias("consec_up")
+        )
+
+    if _need("consec_down"):
+        # 5일 윈도우 내 하락일 수
+        df = df.with_columns(
+            (pl.col("close") < pl.col("close").shift(1))
+            .cast(pl.Int8)
+            .rolling_sum(window_size=5, min_periods=1)
+            .alias("consec_down")
+        )
+
+    if _need("gap_up_pct"):
+        prev_close = pl.col("close").shift(1)
+        df = df.with_columns(
+            ((pl.col("open") - prev_close) / prev_close.clip(lower_bound=1e-10) * 100)
+            .clip(lower_bound=0.0)
+            .alias("gap_up_pct")
+        )
+
+    if _need("gap_down_pct"):
+        prev_close = pl.col("close").shift(1)
+        df = df.with_columns(
+            ((prev_close - pl.col("open")) / prev_close.clip(lower_bound=1e-10) * 100)
+            .clip(lower_bound=0.0)
+            .alias("gap_down_pct")
+        )
+
+    if _need("range_breakout"):
+        df = df.with_columns(
+            (pl.col("close") > pl.col("high").rolling_max(window_size=20, min_periods=5).shift(1))
+            .cast(pl.Int8)
+            .alias("range_breakout")
+        )
+
+    if _need("range_breakdown"):
+        df = df.with_columns(
+            (pl.col("close") < pl.col("low").rolling_min(window_size=20, min_periods=5).shift(1))
+            .cast(pl.Int8)
+            .alias("range_breakdown")
+        )
+
+    # ── 모멘텀 이벤트 (기술적 지표 의존 — 위에서 이미 계산됨) ──
+    existing = set(df.columns)
+
+    if _need("rsi_oversold_bounce"):
+        if "rsi" not in existing:
+            df = add_rsi(df, period=14)
+        df = df.with_columns(
+            ((pl.col("rsi").shift(1) < 30.0) & (pl.col("rsi") >= 30.0))
+            .cast(pl.Int8)
+            .alias("rsi_oversold_bounce")
+        )
+
+    if _need("macd_cross_up"):
+        if "macd_hist" not in existing:
+            df = add_macd(df, fast=12, slow=26, signal=9)
+        df = df.with_columns(
+            ((pl.col("macd_hist").shift(1) <= 0.0) & (pl.col("macd_hist") > 0.0))
+            .cast(pl.Int8)
+            .alias("macd_cross_up")
+        )
+
+    if _need("bb_squeeze"):
+        if "bb_upper" not in existing or "bb_lower" not in existing:
+            df = add_bb(df, period=20, std=2.0)
+        bb_w = pl.col("bb_upper") - pl.col("bb_lower")
+        df = df.with_columns(
+            (bb_w <= bb_w.rolling_min(window_size=20, min_periods=5))
+            .cast(pl.Int8)
+            .alias("bb_squeeze")
+        )
+
+    if _need("bb_breakout_upper"):
+        if "bb_upper" not in existing:
+            df = add_bb(df, period=20, std=2.0)
+        df = df.with_columns(
+            (pl.col("close") > pl.col("bb_upper"))
+            .cast(pl.Int8)
+            .alias("bb_breakout_upper")
+        )
+
+    # ── 수급 이벤트 (enriched candles 조건부) ──
+    existing = set(df.columns)
+
+    if _need("foreign_accumulate_5d") and "foreign_net_norm" in existing:
+        df = df.with_columns(
+            (pl.col("foreign_net_norm") > 0)
+            .cast(pl.Int8)
+            .rolling_sum(window_size=5, min_periods=5)
+            .eq(5)
+            .cast(pl.Int8)
+            .alias("foreign_accumulate_5d")
+        )
+
+    if _need("inst_accumulate_5d") and "inst_net_norm" in existing:
+        df = df.with_columns(
+            (pl.col("inst_net_norm") > 0)
+            .cast(pl.Int8)
+            .rolling_sum(window_size=5, min_periods=5)
+            .eq(5)
+            .cast(pl.Int8)
+            .alias("inst_accumulate_5d")
+        )
+
     return df
 
 
@@ -707,6 +966,13 @@ def parse_expression(expr_str: str) -> sympy.Basic:
     local_dict["exp"] = sympy.exp
     local_dict["sqrt"] = sympy.sqrt
     local_dict["abs"] = sympy.Abs
+    # 조건부 함수
+    local_dict["sign"] = sympy.sign
+    local_dict["step"] = sympy.Heaviside
+    local_dict["Heaviside"] = sympy.Heaviside
+    local_dict["Max"] = sympy.Max
+    local_dict["Min"] = sympy.Min
+    local_dict["clip"] = Clip
 
     try:
         return sympy.sympify(expr_str, locals=local_dict)

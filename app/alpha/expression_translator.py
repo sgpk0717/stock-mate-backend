@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import sympy
 
+from app.alpha.ast_converter import Clip
+
 # ── 변수 → 한글 이름 매핑 ──
 
 _KOREAN_NAMES: dict[str, str] = {
@@ -65,6 +67,51 @@ _KOREAN_NAMES: dict[str, str] = {
     "rank_volume": "거래량 횡단면 순위",
     "zscore_close": "종가 횡단면 Z-score",
     "zscore_volume": "거래량 횡단면 Z-score",
+    # 투자자 수급
+    "foreign_net_norm": "외국인 순매수 강도",
+    "inst_net_norm": "기관 순매수 강도",
+    "retail_net_norm": "개인 순매수 강도",
+    "foreign_buy_ratio": "외국인 매수비율",
+    "inst_buy_ratio": "기관 매수비율",
+    "retail_buy_ratio": "개인 매수비율",
+    # DART 재무
+    "eps": "주당순이익(EPS)",
+    "bps": "주당순자산(BPS)",
+    "operating_margin": "영업이익률",
+    "debt_to_equity": "부채비율",
+    "earnings_yield": "이익수익률",
+    "book_yield": "자산수익률",
+    # 뉴스 감성
+    "sentiment_score": "뉴스 감성 점수",
+    "event_score": "이벤트 스코어",
+    # 섹터
+    "sector_return": "섹터 평균수익률",
+    "sector_rel_strength": "섹터 상대강도",
+    "sector_rank": "섹터 내 순위",
+    # 신용/공매도
+    "margin_rate": "융자잔고율",
+    "short_balance_rate": "대차잔고비율",
+    "short_volume_ratio": "공매도 비율",
+    # 프로그램 매매
+    "pgm_net_norm": "프로그램 순매수 강도",
+    "pgm_buy_ratio": "프로그램 매수비율",
+    # ── 이벤트 감지 피처 ──
+    "vol_spike_5d": "5일 거래량 폭증비",
+    "vol_spike_20d": "20일 거래량 폭증비",
+    "consec_low_vol_5": "5일중 저거래량 일수",
+    "vol_dry_then_spike": "거래량 고갈 후 폭발",
+    "consec_up": "5일중 상승일 수",
+    "consec_down": "5일중 하락일 수",
+    "gap_up_pct": "갭상승률",
+    "gap_down_pct": "갭하락률",
+    "range_breakout": "20일 신고가 돌파",
+    "range_breakdown": "20일 신저가 이탈",
+    "rsi_oversold_bounce": "RSI 과매도 반등",
+    "macd_cross_up": "MACD 골든크로스",
+    "bb_squeeze": "볼린저밴드 수축",
+    "bb_breakout_upper": "BB 상단 돌파",
+    "foreign_accumulate_5d": "외국인 5일 연속매수",
+    "inst_accumulate_5d": "기관 5일 연속매수",
 }
 
 # ── 연산자 origin → 한글 근거 ──
@@ -140,6 +187,33 @@ def sympy_to_korean(expr: sympy.Basic, depth: int = 0) -> str:
     if isinstance(expr, sympy.Abs):
         inner = sympy_to_korean(expr.args[0], depth + 1)
         return f"|{inner}|"
+
+    # sign(x) → 부호
+    if isinstance(expr, sympy.sign):
+        inner = sympy_to_korean(expr.args[0], depth + 1)
+        return f"부호({inner})"
+
+    # Heaviside(x) → 초과시1
+    if isinstance(expr, sympy.Heaviside):
+        inner = sympy_to_korean(expr.args[0], depth + 1)
+        return f"양수면1({inner})"
+
+    # Max(x, y)
+    if isinstance(expr, sympy.Max):
+        parts = [sympy_to_korean(a, depth + 1) for a in expr.args]
+        return f"큰값({', '.join(parts)})"
+
+    # Min(x, y)
+    if isinstance(expr, sympy.Min):
+        parts = [sympy_to_korean(a, depth + 1) for a in expr.args]
+        return f"작은값({', '.join(parts)})"
+
+    # clip(x, lo, hi)
+    if isinstance(expr, Clip):
+        x = sympy_to_korean(expr.args[0], depth + 1)
+        lo = sympy_to_korean(expr.args[1], depth + 1)
+        hi = sympy_to_korean(expr.args[2], depth + 1)
+        return f"범위제한({x}, {lo}~{hi})"
 
     # x^n — sqrt 및 나눗셈 패턴 처리
     if isinstance(expr, sympy.Pow):
