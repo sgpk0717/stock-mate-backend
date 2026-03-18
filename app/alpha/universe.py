@@ -56,15 +56,20 @@ def _fetch_index_members(index_code: str) -> list[str]:
 
 
 async def resolve_universe(universe: Universe) -> list[str]:
-    """Universe enum → symbol list 변환.
+    """Universe enum → symbol list 변환 (SSOT 패턴).
 
-    pykrx 조회 결과를 24시간 캐시.
-    실패 시 이전 캐시 반환 (서킷 브레이커 원칙).
+    조회 순서:
+    1. 메모리 캐시 (24시간 TTL)
+    2. Redis 캐시 (24시간 TTL, 컨테이너 재시작 시에도 유지)
+    3. DB stock_masters 마켓 기반 폴백 (정확한 인덱스는 아니지만 즉시 사용 가능)
+    4. pykrx KRX API (최후 수단, 하루 1회만)
+
+    pykrx는 IP 밴 위험이 있으므로 가능한 한 호출하지 않는다.
     """
     cache_key = universe.value
     now = time.monotonic()
 
-    # 캐시 히트
+    # 1. 메모리 캐시 히트
     if cache_key in _cache:
         symbols, cached_at = _cache[cache_key]
         if now - cached_at < _CACHE_TTL_SECONDS and symbols:
@@ -73,44 +78,113 @@ async def resolve_universe(universe: Universe) -> list[str]:
     if universe == Universe.ALL:
         all_stocks = get_all_stocks()
         symbols = [s["symbol"] for s in all_stocks]
-        _cache[cache_key] = (symbols, now)
-        return symbols
+        if symbols:
+            _cache[cache_key] = (symbols, now)
+            return symbols
 
-    index_code = _INDEX_CODES[universe]
-    symbols = await asyncio.to_thread(_fetch_index_members, index_code)
-
-    if symbols:
-        _cache[cache_key] = (symbols, now)
+    # 2. Redis 캐시 (컨테이너 재시작 후에도 유지)
+    redis_symbols = await _load_from_redis(cache_key)
+    if redis_symbols:
+        _cache[cache_key] = (redis_symbols, now)
         logger.info(
-            "Universe %s resolved: %d symbols (index %s)",
-            universe.value, len(symbols), index_code,
+            "Universe %s: Redis 캐시 히트 (%d symbols)",
+            universe.value, len(redis_symbols),
         )
-        return symbols
+        return redis_symbols
 
-    # 실패 시 이전 캐시 반환
-    if cache_key in _cache:
-        prev_symbols, _ = _cache[cache_key]
-        if prev_symbols:
-            logger.warning(
-                "Universe %s fetch failed, returning stale cache (%d symbols)",
-                universe.value, len(prev_symbols),
-            )
-            return prev_symbols
-
-    # pykrx 실패 + 캐시 없음 → stock_masters 마켓 기반 폴백
+    # 3. DB stock_masters 폴백 (pykrx 호출 없이 즉시)
     fallback = _fallback_from_stock_masters(universe)
     if fallback:
         _cache[cache_key] = (fallback, now)
-        logger.warning(
-            "Universe %s: pykrx failed, DB fallback (%d symbols from stock_masters)",
+        await _save_to_redis(cache_key, fallback)
+        logger.info(
+            "Universe %s: DB fallback (%d symbols from stock_masters)",
             universe.value, len(fallback),
         )
         return fallback
 
+    # 4. pykrx KRX API (최후 수단)
+    index_code = _INDEX_CODES.get(universe)
+    if index_code:
+        symbols = await asyncio.to_thread(_fetch_index_members, index_code)
+        if symbols:
+            _cache[cache_key] = (symbols, now)
+            await _save_to_redis(cache_key, symbols)
+            logger.info(
+                "Universe %s: pykrx 조회 성공 (%d symbols, index %s)",
+                universe.value, len(symbols), index_code,
+            )
+            return symbols
+
+    # 이전 메모리 캐시 (stale이라도)
+    if cache_key in _cache:
+        prev_symbols, _ = _cache[cache_key]
+        if prev_symbols:
+            logger.warning(
+                "Universe %s: 모든 소스 실패, stale 캐시 반환 (%d symbols)",
+                universe.value, len(prev_symbols),
+            )
+            return prev_symbols
+
     raise RuntimeError(
         f"Universe {universe.value} 구성종목을 가져올 수 없습니다. "
-        "네트워크 연결을 확인하세요."
+        "Redis/DB/pykrx 모두 실패."
     )
+
+
+async def prefetch_universe(universe: Universe) -> list[str]:
+    """하루 1회 프리페치 — handle_pre_market()에서 호출.
+
+    pykrx로 정확한 인덱스 구성종목을 조회하여 Redis에 캐싱.
+    """
+    cache_key = universe.value
+    index_code = _INDEX_CODES.get(universe)
+
+    if not index_code:
+        return await resolve_universe(universe)
+
+    symbols = await asyncio.to_thread(_fetch_index_members, index_code)
+    if symbols:
+        _cache[cache_key] = (symbols, time.monotonic())
+        await _save_to_redis(cache_key, symbols)
+        logger.info(
+            "Universe %s prefetched: %d symbols (pykrx)",
+            universe.value, len(symbols),
+        )
+        return symbols
+
+    # pykrx 실패해도 기존 캐시 유지
+    logger.warning("Universe %s prefetch 실패 — 기존 캐시 유지", universe.value)
+    return await resolve_universe(universe)
+
+
+async def _save_to_redis(cache_key: str, symbols: list[str]) -> None:
+    """유니버스를 Redis에 저장 (TTL 24시간)."""
+    try:
+        import json
+        from app.core.redis import get_client
+        r = get_client()
+        await r.set(
+            f"universe:{cache_key}",
+            json.dumps(symbols),
+            ex=86_400,  # 24시간
+        )
+    except Exception as e:
+        logger.debug("Redis universe 저장 실패: %s", e)
+
+
+async def _load_from_redis(cache_key: str) -> list[str]:
+    """Redis에서 유니버스 로드."""
+    try:
+        import json
+        from app.core.redis import get_client
+        r = get_client()
+        data = await r.get(f"universe:{cache_key}")
+        if data:
+            return json.loads(data)
+    except Exception as e:
+        logger.debug("Redis universe 로드 실패: %s", e)
+    return []
 
 
 _MARKET_FALLBACK: dict[Universe, str | None] = {
