@@ -6,7 +6,6 @@ services:
     container_name: stockmate-api
     ports:
       - "${PORT:-8007}:8007"
-      - "${MCP_SSE_PORT:-8009}:${MCP_SSE_PORT:-8009}"
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -19,7 +18,7 @@ services:
       - ZMQ_PORT=${ZMQ_PORT:-5555}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3-flash-preview}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-3.1-flash-lite-preview}
       - KIS_APP_KEY=${KIS_APP_KEY:-}
       - KIS_APP_SECRET=${KIS_APP_SECRET:-}
       - KIS_ACCOUNT_NO=${KIS_ACCOUNT_NO:-}
@@ -27,18 +26,53 @@ services:
       - WORKFLOW_ENABLED=${WORKFLOW_ENABLED:-false}
       - WORKFLOW_TRADING_MODE=${WORKFLOW_TRADING_MODE:-paper}
       - WORKFLOW_DATA_INTERVAL=${WORKFLOW_DATA_INTERVAL:-5m}
-      - MCP_ENABLED=${MCP_ENABLED:-false}
+      - MCP_ENABLED=false
       - MCP_SSE_PORT=${MCP_SSE_PORT:-8009}
       - PGM_TRADING_ENABLED=${PGM_TRADING_ENABLED:-false}
       - PGM_TRADING_COLLECT_INTERVAL_MINUTES=${PGM_TRADING_COLLECT_INTERVAL_MINUTES:-5}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-      - WORKER_MODE=${WORKER_MODE:-inline}
+      - WORKER_MODE=external
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - .:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8007
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8007 --reload --reload-dir /app/app
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stockmate-mcp
+    ports:
+      - "${MCP_SSE_PORT:-8009}:${MCP_SSE_PORT:-8009}"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-stockmate}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
+      - POSTGRES_DB=${POSTGRES_DB:-stockmate}
+      - REDIS_URL=redis://redis:6379/0
+      - MCP_ENABLED=true
+      - MCP_SSE_PORT=${MCP_SSE_PORT:-8009}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KIS_APP_KEY=${KIS_APP_KEY:-}
+      - KIS_APP_SECRET=${KIS_APP_SECRET:-}
+      - KIS_ACCOUNT_NO=${KIS_ACCOUNT_NO:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - .:/app
+    command: python -m app.mcp.server_standalone
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -47,24 +81,48 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: stockmate-worker
-    profiles: [worker]
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_USER=${POSTGRES_USER:-stockmate}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-stockmate}
       - POSTGRES_DB=${POSTGRES_DB:-stockmate}
+      - REDIS_URL=redis://redis:6379/0
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - KIS_APP_KEY=${KIS_APP_KEY:-}
+      - KIS_APP_SECRET=${KIS_APP_SECRET:-}
+      - KIS_ACCOUNT_NO=${KIS_ACCOUNT_NO:-}
       - WORKER_MODE=worker
-      - ALPHA_FACTORY_AUTO_START=${ALPHA_FACTORY_AUTO_START:-false}
+      - WORKFLOW_ENABLED=${WORKFLOW_ENABLED:-false}
+      - WORKFLOW_TRADING_MODE=${WORKFLOW_TRADING_MODE:-paper}
+      - WORKFLOW_DATA_INTERVAL=${WORKFLOW_DATA_INTERVAL:-5m}
+      - PGM_TRADING_ENABLED=${PGM_TRADING_ENABLED:-false}
+      - DAILY_SCHEDULER_ENABLED=${DAILY_SCHEDULER_ENABLED:-false}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     volumes:
       - .:/app
-    command: python worker.py
+    command: python -m app.worker
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: stockmate-redis
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
   postgres:
@@ -88,4 +146,6 @@ services:
 
 volumes:
   pgdata:
+    driver: local
+  redisdata:
     driver: local

@@ -48,7 +48,7 @@ class Settings(BaseSettings):
 
     # AI — Gemini (뉴스 감성분석 등 비용 민감 작업)
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3-flash-preview"
+    GEMINI_MODEL: str = "gemini-3.1-flash-lite-preview"
 
     # Agent (다중 턴 대화형 전략 수립)
     AGENT_SESSION_TTL_MINUTES: int = 30
@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     WORKFLOW_ENABLED: bool = True
     WORKFLOW_TRADING_MODE: str = "paper"  # "paper" | "real"
     WORKFLOW_INITIAL_CAPITAL: float = 100_000_000
+    WORKFLOW_MULTI_FACTOR_COUNT: int = 3  # 동시 매매 팩터 수 (1~5)
     WORKFLOW_MAX_POSITIONS: int = 10
     WORKFLOW_STOP_LOSS_PCT: float = 5.0
     WORKFLOW_MAX_DRAWDOWN_PCT: float = 10.0
@@ -155,6 +156,12 @@ class Settings(BaseSettings):
     WORKFLOW_REQUIRE_CAUSAL: bool = False
     WORKFLOW_FACTOR_MAX_AGE_DAYS: int = 30
     WORKFLOW_DATA_INTERVAL: str = "5m"  # 분봉 단타 (1m/3m/5m)
+
+    # Order Management
+    ORDER_BUY_TTL_SECONDS: int = 120       # 매수 미체결 TTL (2분)
+    ORDER_SELL_TTL_SECONDS: int = 90       # 매도 미체결 TTL (1.5분)
+    ORDER_CANCEL_TIMEOUT_SECONDS: int = 60 # 취소 확인 대기 (초)
+    ORDER_SELL_USE_LIMIT: bool = True      # True=매도 지정가, False=시장가(레거시)
 
     # AutoSelector 가중치 (6요소 — 설계서 §8.2)
     WORKFLOW_SCORE_W_IC: float = 0.25
@@ -187,6 +194,7 @@ class Settings(BaseSettings):
 
     # OpenClaw
     OPENCLAW_HEALTH_URL: str = "http://host.docker.internal:18789/health"
+    OPENCLAW_RESTART_URL: str = "http://host.docker.internal:18790/restart"
     OPENCLAW_MAX_MEMORY_MB: int = 2048
 
     # Worker Mode ("inline" | "external" | "worker")
@@ -194,6 +202,9 @@ class Settings(BaseSettings):
     # external: API는 DB 경유 위임 (REST만 서빙)
     # worker: 워커 프로세스 (팩토리+인과검증 실행, 명령큐 소비)
     WORKER_MODE: str = "inline"
+
+    # Redis
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # CORS
     CORS_ORIGINS: list[str] = ["*"]

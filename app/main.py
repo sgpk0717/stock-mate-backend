@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import async_session
 from app.core.stock_master import load_stock_cache
-from app.routers import accounts, agents, alpha, backtest, data_explorer, health, mcp, news, orders, paper, positions, scheduler, sector, simulation, stocks, telegram, trading, workflow, ws
+from app.routers import accounts, agents, alpha, backtest, data_explorer, health, mcp, news, orders, paper, positions, scheduler, sector, simulation, stocks, system, telegram, trading, workflow, ws
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,16 +97,16 @@ async def lifespan(app: FastAPI):
         )
         logger.info("Alpha factory auto-started")
 
-    # Daily Scheduler (일일 배치 수집)
-    if settings.DAILY_SCHEDULER_ENABLED:
+    # Daily Scheduler (일일 배치 수집) — external 모드에서는 Worker가 담당
+    if settings.DAILY_SCHEDULER_ENABLED and settings.WORKER_MODE != "external":
         from app.scheduler.daily_scheduler import get_daily_scheduler
 
         daily = get_daily_scheduler()
         await daily.start()
         logger.info("Daily scheduler auto-started")
 
-    # 프로그램 매매 수집기
-    if settings.PGM_TRADING_ENABLED:
+    # 프로그램 매매 수집기 — external 모드에서는 Worker가 담당
+    if settings.PGM_TRADING_ENABLED and settings.WORKER_MODE != "external":
         from app.services.program_trading_collector import start_collector
 
         tasks.append(asyncio.create_task(start_collector()))
@@ -119,8 +119,8 @@ async def lifespan(app: FastAPI):
         tasks.append(start_causal_scheduler())
         logger.info("Causal validation scheduler started (1h interval)")
 
-    # TradingContext DB 복원 + 매매 세션 복구 (워크플로우 활성 시에만)
-    if settings.WORKFLOW_ENABLED:
+    # TradingContext DB 복원 + 매매 세션 복구 — external 모드에서는 Worker가 담당
+    if settings.WORKFLOW_ENABLED and settings.WORKER_MODE != "external":
         from app.trading.context import load_active_contexts_from_db
         await load_active_contexts_from_db()
 
@@ -129,8 +129,8 @@ async def lifespan(app: FastAPI):
         if restored:
             logger.info("활성 매매 세션 %d개 복구됨", restored)
 
-    # 워크플로우 오케스트레이터
-    if settings.WORKFLOW_ENABLED:
+    # 워크플로우 오케스트레이터 — external 모드에서는 Worker가 담당
+    if settings.WORKFLOW_ENABLED and settings.WORKER_MODE != "external":
         # DB에서 EMERGENCY_STOP 상태 확인 — 토글 OFF 시 재시작해도 비활성 유지
         _wf_skip = False
         try:
@@ -155,6 +155,9 @@ async def lifespan(app: FastAPI):
             wf = get_orchestrator()
             await wf.setup_scheduler()
             logger.info("Workflow orchestrator started (APScheduler)")
+
+            # Redis 명령 소비자 시작 (Phase 4)
+            asyncio.create_task(wf.start_command_consumer())
 
     # Phase 4: MCP 서버 시작
     if settings.MCP_ENABLED:
@@ -274,6 +277,10 @@ app.include_router(scheduler.router)
 app.include_router(workflow.router)
 app.include_router(data_explorer.router)
 app.include_router(telegram.router)
+app.include_router(system.router)
+
+from app.routers import sim_replay
+app.include_router(sim_replay.router)
 
 
 @app.get("/")
