@@ -22,7 +22,45 @@ router = APIRouter(prefix="/workflow", tags=["workflow"])
 
 @router.get("/status")
 async def get_workflow_status() -> dict:
-    """현재 워크플로우 상태 (MCP/OpenClaw 겸용)."""
+    """현재 워크플로우 상태 (MCP/OpenClaw 겸용).
+
+    Phase 2: Redis 캐시 우선, 실패 시 기존 방식 폴백.
+    """
+    # Redis에서 읽기 시도
+    try:
+        import json
+        from app.core.redis import hgetall
+        cached = await hgetall("workflow:status")
+        if cached and cached.get("phase"):
+            # JSON 필드 역직렬화
+            result = {}
+            for k, v in cached.items():
+                if k in ("step_status",) and v:
+                    try:
+                        result[k] = json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        result[k] = v
+                elif k in ("trade_count", "mining_cycles", "mining_factors"):
+                    try:
+                        result[k] = int(v) if v else 0
+                    except (ValueError, TypeError):
+                        result[k] = 0
+                elif k in ("pnl_pct", "pnl_amount"):
+                    try:
+                        result[k] = float(v) if v else None
+                    except (ValueError, TypeError):
+                        result[k] = None
+                elif k == "mining_running":
+                    result[k] = v.lower() == "true" if v else False
+                elif v == "None" or v == "":
+                    result[k] = None
+                else:
+                    result[k] = v
+            return result
+    except Exception:
+        pass
+
+    # 폴백: 기존 방식 (DB 직접 조회)
     orchestrator = get_orchestrator()
     return await orchestrator.get_status()
 
@@ -56,6 +94,84 @@ async def trigger_workflow_phase(req: WorkflowTriggerRequest):
         phase=result.get("phase", req.phase),
         message=result.get("message", "처리 완료"),
     )
+
+
+@router.post("/test-review")
+async def test_review_telegram():
+    """리뷰 텔레그램 메시지 테스트 발송.
+
+    상태 전이 없이, 현재 DB 데이터로 리뷰를 생성하여 텔레그램으로 발송.
+    """
+    import json as _json
+    from app.core.database import async_session
+    from app.workflow.models import WorkflowRun
+    from sqlalchemy import select
+    from datetime import date
+
+    async with async_session() as session:
+        stmt = select(WorkflowRun).where(WorkflowRun.date == date.today())
+        result = await session.execute(stmt)
+        run = result.scalar_one_or_none()
+
+    if not run:
+        raise HTTPException(404, "오늘 워크플로우 실행 기록 없음")
+
+    # TradeReviewer로 세션별 데이터 생성
+    async with async_session() as session:
+        from app.workflow.trade_reviewer import TradeReviewer
+        reviewer = TradeReviewer()
+        review = await reviewer.generate_review(session, run)
+
+    review_summary = review.to_dict()
+
+    # Claude LLM 리뷰 생성
+    from app.core.config import settings
+    review_data = {
+        "date": str(run.date),
+        "initial_capital": int(settings.WORKFLOW_INITIAL_CAPITAL),
+        "num_sessions": len((run.config or {}).get("trading_context_ids", [])),
+        "total_trades": review.trade_count,
+        "total_pnl_amount": review.total_pnl,
+        "total_pnl_pct": round(review.total_pnl_pct, 2),
+        "win_rate": round(review.win_rate, 1),
+        "per_session": review.per_session,
+        "improvements": review.improvements,
+        "time_breakdown": review_summary.get("time_breakdown", {}),
+    }
+
+    try:
+        from app.core.llm._anthropic import chat_simple
+        llm_response = await chat_simple(
+            system=(
+                "당신은 퀀트 트레이딩 일일 리뷰어입니다. "
+                "세션별(팩터별) 매매 결과를 분석하여 텔레그램 리포트를 작성하세요.\n"
+                "- 각 팩터 수식이 무엇을 의미하는지 1줄 설명\n"
+                "- 세션별 성과 비교 (거래수, 승률, 손익)\n"
+                "- 전체 포트폴리오 수익률 (자본금 기준)\n"
+                "- 어떤 팩터가 가장 잘/못했는지 분석\n"
+                "- 개선 방향 1-2줄\n"
+                "HTML 태그(<b>, <i>, <code>)를 사용하세요. "
+                "이모지 적절히 사용. 800자 이내. 한국어로 작성."
+            ),
+            messages=[{
+                "role": "user",
+                "content": _json.dumps(review_data, ensure_ascii=False, default=str),
+            }],
+            max_tokens=1200,
+        )
+        tg_msg = llm_response.text
+    except Exception as e:
+        tg_msg = (
+            f"\U0001f4cb <b>일일 리뷰 (테스트)</b> ({run.date})\n"
+            f"거래 {review.trade_count}건 | 손익 {review.total_pnl:+,.0f}원 ({review.total_pnl_pct:+.2f}%)\n"
+            f"LLM 실패: {e}"
+        )
+
+    # 텔레그램 발송
+    from app.telegram.bot import send_message
+    await send_message(tg_msg, category="review_report", caller="test-review")
+
+    return {"success": True, "message": "리뷰 발송됨", "review_data": review_data}
 
 
 @router.get("/history", response_model=list[WorkflowRunOut])

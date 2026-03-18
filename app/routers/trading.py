@@ -157,8 +157,74 @@ async def stop_trading(session_id: str):
 
 @router.get("/status")
 async def trading_status():
-    """모든 세션 상태."""
-    return [s.to_dict() for s in list_sessions()]
+    """모든 세션 상태.
+
+    Phase 2: Redis 캐시 우선, 실패 시 메모리+DB 폴백.
+    """
+    # Redis에서 읽기 시도
+    try:
+        import json
+        from app.core.redis import get_client
+        r = get_client()
+        session_ids = await r.smembers("sessions:index")
+        if session_ids:
+            result = []
+            for sid in session_ids:
+                cached = await r.hgetall(f"sessions:{sid}")
+                if cached and cached.get("id"):
+                    d = dict(cached)
+                    # JSON 필드 역직렬화
+                    if d.get("positions"):
+                        try:
+                            d["positions"] = json.loads(d["positions"])
+                        except (json.JSONDecodeError, TypeError):
+                            d["positions"] = {}
+                    d["trade_count"] = int(d.get("trade_count", 0))
+                    result.append(d)
+            if result:
+                # Redis에 있으면 DB trade_count 보강
+                for d in result:
+                    if d["trade_count"] == 0:
+                        try:
+                            from app.core.database import async_session
+                            from sqlalchemy import text
+                            import uuid as _uuid
+                            async with async_session() as db:
+                                row = await db.execute(
+                                    text("SELECT COUNT(*) FROM live_trades WHERE context_id = :cid"),
+                                    {"cid": _uuid.UUID(d["id"])},
+                                )
+                                db_count = row.scalar() or 0
+                                if db_count > 0:
+                                    d["trade_count"] = db_count
+                        except Exception:
+                            pass
+                return result
+    except Exception:
+        pass
+
+    # 폴백: 기존 방식 (메모리 + DB)
+    sessions = list_sessions()
+    result = []
+    for s in sessions:
+        d = s.to_dict()
+        if d["trade_count"] == 0:
+            try:
+                from app.core.database import async_session
+                from sqlalchemy import text
+                import uuid as _uuid
+                async with async_session() as db:
+                    row = await db.execute(
+                        text("SELECT COUNT(*) FROM live_trades WHERE context_id = :cid"),
+                        {"cid": _uuid.UUID(s.id)},
+                    )
+                    db_count = row.scalar() or 0
+                    if db_count > 0:
+                        d["trade_count"] = db_count
+            except Exception:
+                pass
+        result.append(d)
+    return result
 
 
 @router.get("/session/{session_id}")
@@ -172,9 +238,9 @@ async def get_session_detail(session_id: str):
 @router.get("/session/{session_id}/trades")
 async def get_session_trades(session_id: str):
     session = get_session(session_id)
-    if session:
+    if session and session.trade_log:
         return session.trade_log
-    # fallback: DB에서 조회 (서버 재시작 전 매매 기록)
+    # 메모리에 없거나 비었으면 DB에서 조회
     try:
         from app.core.database import async_session
         from app.workflow.models import LiveTrade

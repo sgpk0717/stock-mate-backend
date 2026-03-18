@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.telegram.models import TelegramMessageLog
-from app.telegram.schemas import TelegramLogResponse
+from app.telegram.schemas import TelegramLogRequest, TelegramLogResponse
 
 router = APIRouter(prefix="/telegram", tags=["telegram"])
 
@@ -49,3 +49,28 @@ async def get_telegram_logs(
         )
         for r in rows
     ]
+
+
+@router.post("/log", response_model=dict)
+async def log_external_message(
+    body: TelegramLogRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """외부(OpenClaw 등)에서 발송한 텔레그램 메시지를 DB에 기록.
+
+    OpenClaw 크론잡 등에서 텔레그램 발송 후 이 엔드포인트를 호출하여
+    telegram_message_logs 테이블에 히스토리를 남긴다.
+    """
+    from app.core.config import settings
+
+    log = TelegramMessageLog(
+        category=body.category,
+        caller=body.caller,
+        text=body.text[:4000],
+        chat_id=settings.TELEGRAM_CHAT_ID or "",
+        status="success",
+        telegram_message_id=body.telegram_message_id,
+    )
+    db.add(log)
+    await db.commit()
+    return {"ok": True, "id": str(log.id)}
