@@ -2,6 +2,12 @@
 
 pykrx 런타임 동적 조회 + 24시간 인메모리 캐시.
 KOSPI200/KOSDAQ150/KRX300/ALL 유니버스를 symbol list로 변환.
+
+Point-in-Time (PIT) 유니버스:
+  as_of_date가 주어지면 해당 시점에 실제 거래되던 종목 기반으로
+  유동성(거래대금) 상위 N개를 반환한다.
+  stock_candles 테이블의 존재 여부를 거래 가능성 증거로 사용.
+  (정확한 과거 인덱스 구성종목이 아닌 유동성 기반 PIT 근사치)
 """
 
 from __future__ import annotations
@@ -9,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from datetime import date as date_type
+from datetime import timedelta
 from enum import Enum
 
 from pykrx import stock as krx
@@ -41,8 +49,28 @@ _INDEX_CODES: dict[Universe, str] = {
     Universe.KRX300: "1035",
 }
 
+# PIT 유니버스 크기 매핑 (None = 제한 없음)
+_UNIVERSE_SIZE: dict[Universe, int | None] = {
+    Universe.KOSPI200: 200,
+    Universe.KOSDAQ150: 150,
+    Universe.KRX300: 300,
+    Universe.ALL: None,
+}
+
+# PIT 유니버스 마켓 필터 (None = 전체)
+_PIT_MARKET_FILTER: dict[Universe, str | None] = {
+    Universe.KOSPI200: "KOSPI",
+    Universe.KOSDAQ150: "KOSDAQ",
+    Universe.KRX300: None,   # KOSPI + KOSDAQ 전체
+    Universe.ALL: None,
+}
+
 # 인메모리 캐시: universe -> (symbols, timestamp)
 _cache: dict[str, tuple[list[str], float]] = {}
+
+# PIT 유니버스 캐시: "universe:YYYY-MM-DD" -> (symbols, timestamp)
+# 동일 날짜 재조회 방지 (TTL 24시간 — 과거 데이터는 변하지 않으므로 사실상 영구)
+_pit_cache: dict[str, tuple[list[str], float]] = {}
 
 
 def _fetch_index_members(index_code: str) -> list[str]:
@@ -55,17 +83,43 @@ def _fetch_index_members(index_code: str) -> list[str]:
         return []
 
 
-async def resolve_universe(universe: Universe) -> list[str]:
+# [DAILY_MINING] 생존편향 Point-in-Time 유니버스
+# 상태: 구현됨 (유동성 기반 PIT 근사치)
+# 접근법: stock_candles 테이블 존재 여부를 거래 가능성 증거로 사용.
+#   해당 날짜 ±7일 내 캔들 데이터가 있는 종목 중
+#   거래대금(close*volume) 상위 N개를 유니버스로 반환.
+# 한계: 정확한 과거 KOSPI200 구성종목이 아닌 유동성 기반 근사치.
+#   KOSPI200 정기 변경 이력이 DB에 없고, pykrx도 과거 구성종목 미지원.
+# 효과: 상장폐지 종목 제거 + 당시 존재하던 종목 포함으로
+#   생존편향 대폭 완화 (1~4% 연간 수익률 부풀림 방지)
+
+
+async def resolve_universe(
+    universe: Universe,
+    as_of_date: date_type | None = None,
+) -> list[str]:
     """Universe enum → symbol list 변환 (SSOT 패턴).
 
-    조회 순서:
+    Args:
+        universe: 유니버스 종류 (KOSPI200/KOSDAQ150/KRX300/ALL).
+        as_of_date: Point-in-Time 기준일. None이면 현재 유니버스 반환 (기존 동작).
+                    날짜가 주어지면 해당 시점에 거래되던 종목 기반 PIT 유니버스 반환.
+
+    현재 유니버스 (as_of_date=None) 조회 순서:
     1. 메모리 캐시 (24시간 TTL)
     2. Redis 캐시 (24시간 TTL, 컨테이너 재시작 시에도 유지)
     3. DB stock_masters 마켓 기반 폴백 (정확한 인덱스는 아니지만 즉시 사용 가능)
     4. pykrx KRX API (최후 수단, 하루 1회만)
 
+    PIT 유니버스 (as_of_date 지정) 조회 순서:
+    1. PIT 메모리 캐시 (24시간 TTL)
+    2. DB stock_candles 거래대금 기반 상위 N종목
+
     pykrx는 IP 밴 위험이 있으므로 가능한 한 호출하지 않는다.
     """
+    # PIT 유니버스 분기
+    if as_of_date is not None:
+        return await _resolve_pit_universe(universe, as_of_date)
     cache_key = universe.value
     now = time.monotonic()
 
@@ -130,6 +184,128 @@ async def resolve_universe(universe: Universe) -> list[str]:
         f"Universe {universe.value} 구성종목을 가져올 수 없습니다. "
         "Redis/DB/pykrx 모두 실패."
     )
+
+
+async def _resolve_pit_universe(
+    universe: Universe,
+    as_of_date: date_type,
+) -> list[str]:
+    """Point-in-Time 유니버스: 특정 날짜에 실제 거래되던 종목 반환.
+
+    stock_candles 테이블에서 as_of_date ±7일 내 일봉 데이터가 있는 종목을 찾고,
+    거래대금(close*volume) 합산 기준으로 상위 N개를 반환한다.
+
+    이 접근법은:
+    1. 상장폐지 종목 제거 (폐지 후 캔들 데이터 없음)
+    2. 당시 존재하던 종목 포함 (시딩된 과거 데이터가 있으면)
+    3. 유동성 순위로 인덱스 구성종목 근사 (시가총액 대용)
+    4. 추가 데이터 수집 불필요 (기존 stock_candles 활용)
+
+    Args:
+        universe: 유니버스 종류.
+        as_of_date: 기준일.
+
+    Returns:
+        해당 시점 거래 가능 종목의 symbol 리스트 (유동성 내림차순 정렬).
+    """
+    now = time.monotonic()
+    pit_cache_key = f"{universe.value}:{as_of_date.isoformat()}"
+
+    # 1. PIT 메모리 캐시 (과거 데이터는 변하지 않으므로 사실상 영구)
+    if pit_cache_key in _pit_cache:
+        symbols, cached_at = _pit_cache[pit_cache_key]
+        if now - cached_at < _CACHE_TTL_SECONDS and symbols:
+            return symbols
+
+    # 2. DB 조회
+    try:
+        symbols = await _query_pit_symbols(universe, as_of_date)
+    except Exception as e:
+        logger.error(
+            "PIT universe 조회 실패 (universe=%s, date=%s): %s",
+            universe.value, as_of_date, e,
+        )
+        symbols = []
+
+    # 3. 결과가 없으면 현재 유니버스로 폴백
+    if not symbols:
+        logger.warning(
+            "PIT universe 결과 없음 (universe=%s, date=%s) → 현재 유니버스 폴백",
+            universe.value, as_of_date,
+        )
+        return await resolve_universe(universe, as_of_date=None)
+
+    # 4. 캐시 저장
+    _pit_cache[pit_cache_key] = (symbols, now)
+    logger.info(
+        "PIT universe %s (as_of=%s): %d symbols (거래대금 기준)",
+        universe.value, as_of_date, len(symbols),
+    )
+    return symbols
+
+
+async def _query_pit_symbols(
+    universe: Universe,
+    as_of_date: date_type,
+) -> list[str]:
+    """stock_candles + stock_masters 조인으로 PIT 유니버스 조회.
+
+    SQL 전략:
+    - interval='1d'인 일봉 데이터 중 as_of_date ±7일 범위 필터
+    - stock_masters.market으로 KOSPI/KOSDAQ 필터 (해당 시)
+    - close*volume 합산으로 거래대금 순위 산출
+    - 상위 N개 반환 (KOSPI200=200, KOSDAQ150=150, KRX300=300, ALL=무제한)
+    """
+    from sqlalchemy import text as sa_text
+
+    from app.core.database import async_session
+
+    market_filter = _PIT_MARKET_FILTER.get(universe)
+    limit = _UNIVERSE_SIZE.get(universe)
+
+    # ±7일 범위 (주말/공휴일 고려)
+    date_from = as_of_date - timedelta(days=7)
+    date_to = as_of_date + timedelta(days=7)
+
+    # 마켓 필터 WHERE 절
+    market_where = ""
+    if market_filter:
+        market_where = "AND sm.market = :market"
+
+    # LIMIT 절
+    limit_clause = ""
+    if limit is not None:
+        limit_clause = "LIMIT :limit"
+
+    query = sa_text(f"""
+        SELECT sc.symbol
+        FROM stock_candles sc
+        JOIN stock_masters sm ON sc.symbol = sm.symbol
+        WHERE sc.interval = '1d'
+          AND sc.dt::date BETWEEN :date_from AND :date_to
+          AND sc.close > 0
+          AND sc.volume > 0
+          {market_where}
+        GROUP BY sc.symbol
+        HAVING COUNT(*) >= 1
+        ORDER BY SUM(sc.close * sc.volume) DESC
+        {limit_clause}
+    """)
+
+    params: dict = {
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+    if market_filter:
+        params["market"] = market_filter
+    if limit is not None:
+        params["limit"] = limit
+
+    async with async_session() as session:
+        result = await session.execute(query, params)
+        rows = result.fetchall()
+
+    return [row[0] for row in rows]
 
 
 async def prefetch_universe(universe: Universe) -> list[str]:
