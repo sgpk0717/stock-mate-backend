@@ -43,7 +43,8 @@ class ConnectionManager:
                 del self._subscriptions[ch]
 
     async def broadcast(self, channel: str, data: dict):
-        """특정 채널의 모든 구독자에게 JSON 전송."""
+        """특정 채널의 모든 구독자에게 JSON 전송 + Redis Pub/Sub 발행."""
+        # 로컬 WebSocket 전송
         async with self._lock:
             sockets = list(self._subscriptions.get(channel, []))
 
@@ -54,7 +55,32 @@ class ConnectionManager:
             except Exception:
                 dead.append(ws)
 
-        # dead connection 정리
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self._subscriptions[channel].discard(ws)
+                if not self._subscriptions.get(channel):
+                    self._subscriptions.pop(channel, None)
+
+        # Redis Pub/Sub 발행 (다른 컨테이너의 WS 매니저가 수신)
+        try:
+            from app.core.redis import publish
+            await publish(f"ws:{channel}", data)
+        except Exception:
+            pass  # Redis 실패해도 로컬 WS는 정상 동작
+
+    async def _broadcast_local(self, channel: str, data: dict):
+        """로컬 WebSocket에만 전송 (Redis 재발행 안 함 — 브릿지용)."""
+        async with self._lock:
+            sockets = list(self._subscriptions.get(channel, []))
+
+        dead: list[WebSocket] = []
+        for ws in sockets:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+
         if dead:
             async with self._lock:
                 for ws in dead:

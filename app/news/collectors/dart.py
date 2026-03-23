@@ -7,7 +7,7 @@ API 키: https://opendart.fss.or.kr/ 에서 발급.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -16,6 +16,8 @@ from app.core.config import settings
 from .naver import RawArticle
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
 
 DART_LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 
@@ -43,7 +45,7 @@ async def collect_disclosures(
         logger.warning("DART_API_KEY 미설정. 공시 수집 건너뜀.")
         return []
 
-    end_date = datetime.now()
+    end_date = datetime.now(_KST)
     start_date = end_date - timedelta(days=days)
 
     params: dict = {
@@ -87,7 +89,7 @@ async def collect_disclosures(
         try:
             published_at = datetime.strptime(rcept_dt, "%Y%m%d")
         except ValueError:
-            published_at = datetime.now()
+            published_at = datetime.now(_KST)
 
         articles.append(
             RawArticle(

@@ -174,6 +174,7 @@ async def _claude_assessment(
         max_tokens=1500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_content}],
+        caller="agents.risk",
     )
 
     return response.content[0].text

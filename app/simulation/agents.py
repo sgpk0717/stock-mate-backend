@@ -303,6 +303,7 @@ class LLMAgent(BaseAgent):
         resp = await chat(
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
+            caller="simulation.llm_agent",
         )
 
         import json

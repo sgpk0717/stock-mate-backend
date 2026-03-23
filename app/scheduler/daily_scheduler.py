@@ -110,6 +110,21 @@ class DailyScheduler:
 
     # ── 제어 ──
 
+    async def _sync_status_to_redis(self) -> None:
+        """스케줄러 상태를 Redis에 동기화 (Worker→API 간 IPC)."""
+        try:
+            from app.core.redis import hset
+            status = self.get_status()
+            await hset("scheduler:daily", {
+                "running": "1" if status["running"] else "0",
+                "current_job": status["current_job"] or "",
+                "jobs": status["jobs"],
+                "last_run_date": status["last_run_date"] or "",
+                "next_run_at": status["next_run_at"] or "",
+            })
+        except Exception as e:
+            logger.debug("Redis 스케줄러 상태 동기화 실패: %s", e)
+
     async def start(self) -> bool:
         """스케줄러 시작. 이미 실행 중이면 False."""
         async with self._lock:
@@ -119,6 +134,7 @@ class DailyScheduler:
             self._task = asyncio.create_task(self._daily_loop())
             self._tick_task = asyncio.create_task(self._tick_schedule_loop())
             logger.info("Daily scheduler started")
+            await self._sync_status_to_redis()
             return True
 
     async def stop(self) -> bool:
@@ -134,6 +150,7 @@ class DailyScheduler:
                 self._tick_task.cancel()
                 self._tick_task = None
             logger.info("Daily scheduler stopped")
+            await self._sync_status_to_redis()
             return True
 
     def get_status(self) -> dict:
@@ -221,6 +238,7 @@ class DailyScheduler:
                     settings.DAILY_COLLECT_MINUTE,
                 )
                 self._state.next_run_at = next_run.isoformat()
+                await self._sync_status_to_redis()
                 delta = (next_run - _now_kst()).total_seconds()
                 logger.info(
                     "Next daily run at %s (%.0fs later)",
@@ -376,6 +394,15 @@ class DailyScheduler:
         )
         self._state.jobs[job_name] = job
         self._state.current_job = job_name
+        await self._sync_status_to_redis()
+
+        # ManualJobRunner에 자동 잡 등록 (활성 작업 패널 통합 표시)
+        auto_job_id: str | None = None
+        try:
+            from app.scheduler.manual_runner import get_manual_runner
+            auto_job_id = await get_manual_runner().register_auto_job(job_name, date)
+        except Exception:
+            pass
 
         try:
             result = await self._dispatch_job(job_name, date, job)
@@ -399,10 +426,26 @@ class DailyScheduler:
                 end = datetime.fromisoformat(job.completed_at)
                 job.duration_seconds = (end - start).total_seconds()
             self._state.current_job = None
+            await self._sync_status_to_redis()
             await self._broadcast({
                 "type": "job_complete",
                 "job": job.model_dump(),
             })
+
+            # ManualJobRunner 자동 잡 상태 업데이트
+            if auto_job_id:
+                try:
+                    from app.scheduler.manual_runner import get_manual_runner
+                    await get_manual_runner().update_auto_job(
+                        auto_job_id,
+                        status=job.status,
+                        total=job.total,
+                        completed=job.completed,
+                        failed=job.failed,
+                        error=job.error,
+                    )
+                except Exception:
+                    pass
 
             # 텔레그램: 작업 완료 알림
             _display = {

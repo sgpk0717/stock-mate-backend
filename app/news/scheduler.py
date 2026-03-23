@@ -92,6 +92,8 @@ async def collect_and_analyze(
                 title=art.title,
                 content=art.content,
                 url=art.url,
+                # NOTE: 크롤러 원본이 KST naive일 수 있으나, 기존 DB 데이터와의
+                # 호환성을 위해 UTC 태그 유지. 향후 크롤러별 timezone 명시 필요.
                 published_at=art.published_at.replace(tzinfo=timezone.utc)
                 if art.published_at.tzinfo is None
                 else art.published_at,

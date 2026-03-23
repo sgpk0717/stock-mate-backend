@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 _KST = timezone(timedelta(hours=9))
 _running = False
+_task: asyncio.Task | None = None
 _pool: asyncpg.Pool | None = None
 
 # 일별 통계
@@ -131,6 +132,35 @@ async def _send_telegram(text: str) -> None:
         pass
 
 
+async def _update_collector_status(
+    status: str,
+    success: int = 0,
+    failed: int = 0,
+    symbols_total: int = 0,
+    daily_rounds: int = 0,
+    next_at: str = "",
+    error: str = "",
+) -> None:
+    """프로그램 매매 수집기 상태를 Redis에 기록 (모니터링 대시보드용)."""
+    try:
+        from app.core.redis import hset, get_client
+        now_str = _now_kst().strftime("%H:%M:%S")
+        await hset("collector:program_trading", {
+            "status": status,
+            "last_at": now_str,
+            "success": str(success),
+            "failed": str(failed),
+            "symbols_total": str(symbols_total),
+            "daily_rounds": str(daily_rounds),
+            "next_at": next_at,
+            "error": error,
+        })
+        r = get_client()
+        await r.expire("collector:program_trading", 86400)
+    except Exception:
+        pass
+
+
 async def _collect_round(
     client: object,
     symbols: list[str],
@@ -197,7 +227,7 @@ async def _daily_summary() -> None:
 
 async def start_collector() -> None:
     """프로그램 매매 수집기 메인 루프."""
-    global _running, _daily_stats
+    global _running, _task, _daily_stats
     _running = True
     consecutive_failures = 0
 
@@ -233,6 +263,10 @@ async def start_collector() -> None:
                 await _daily_summary()
                 sent_close_summary = True
 
+            await _update_collector_status(
+                "waiting", daily_rounds=_daily_stats["success"],
+                symbols_total=len(symbols) if symbols else 0,
+            )
             wait = min(_seconds_until_market_open(), 300)  # 최대 5분 단위 sleep
             logger.debug("프로그램 매매 수집기: 장외 대기 (%.0f초)", wait)
             await asyncio.sleep(wait)
@@ -259,6 +293,10 @@ async def start_collector() -> None:
         dt = now.replace(second=0, microsecond=0)
 
         # 수집 실행
+        await _update_collector_status(
+            "collecting", symbols_total=len(symbols),
+            daily_rounds=_daily_stats["success"],
+        )
         try:
             success, fail = await _collect_round(client, symbols, dt)
             _daily_stats["total_snapshots"] += success
@@ -270,14 +308,29 @@ async def start_collector() -> None:
                     "프로그램 매매 수집: %d/%d 성공 (실패 %d)",
                     success, len(symbols), fail,
                 )
+                next_kst = _now_kst() + timedelta(seconds=interval_sec)
+                await _update_collector_status(
+                    "idle", success=success, failed=fail,
+                    symbols_total=len(symbols),
+                    daily_rounds=_daily_stats["success"],
+                    next_at=next_kst.strftime("%H:%M"),
+                )
             else:
                 consecutive_failures += 1
                 _daily_stats["fail"] += 1
+                await _update_collector_status(
+                    "idle", success=0, failed=fail,
+                    symbols_total=len(symbols),
+                    daily_rounds=_daily_stats["success"],
+                )
 
         except Exception as e:
             consecutive_failures += 1
             _daily_stats["fail"] += 1
             logger.error("프로그램 매매 수집 라운드 실패: %s", e)
+            await _update_collector_status(
+                "error", symbols_total=len(symbols), error=str(e)[:200],
+            )
 
         # 연속 실패 시 지수 백오프 + 텔레그램 경고
         if consecutive_failures >= 3:
@@ -305,3 +358,19 @@ def stop_collector() -> None:
     global _running
     _running = False
     logger.info("프로그램 매매 수집기 중지")
+
+
+def is_running() -> bool:
+    """수집기 실행 중 여부."""
+    return _running and _task is not None and not _task.done()
+
+
+def set_task(task: asyncio.Task) -> None:
+    """외부에서 태스크 참조 설정."""
+    global _task
+    _task = task
+
+
+def get_task() -> asyncio.Task | None:
+    """태스크 참조 반환."""
+    return _task

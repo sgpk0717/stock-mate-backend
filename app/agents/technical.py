@@ -130,6 +130,7 @@ async def analyze_stock(
             max_tokens=1500,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_content}],
+            caller="agents.technical",
         )
 
         analysis_text = response.content[0].text

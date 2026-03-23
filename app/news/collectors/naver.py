@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
 
 NAVER_FINANCE_NEWS_URL = "https://finance.naver.com/news/news_list.naver"
 NAVER_STOCK_NEWS_URL = "https://finance.naver.com/item/news_news.naver"
@@ -88,7 +90,7 @@ async def collect_stock_news(
                 source="naver",
                 title=title,
                 url=href,
-                published_at=datetime.now(),  # 상세 페이지에서 정확한 날짜 추출 필요
+                published_at=datetime.now(_KST),  # 상세 페이지에서 정확한 날짜 추출 필요
                 symbols=[symbol],
             )
         )

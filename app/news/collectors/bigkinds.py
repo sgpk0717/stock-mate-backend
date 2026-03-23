@@ -7,7 +7,7 @@ API 키: https://www.bigkinds.or.kr/ 에서 발급.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -16,6 +16,8 @@ from app.core.config import settings
 from .naver import RawArticle
 
 logger = logging.getLogger(__name__)
+
+_KST = timezone(timedelta(hours=9))
 
 BIGKINDS_SEARCH_URL = "https://tools.kinds.or.kr:8443/search/news"
 
@@ -43,7 +45,7 @@ async def collect_news(
         logger.warning("BIGKINDS_API_KEY 미설정. BigKinds 수집 건너뜀.")
         return []
 
-    end_date = datetime.now()
+    end_date = datetime.now(_KST)
     start_date = end_date - timedelta(days=days)
 
     payload = {
@@ -107,7 +109,7 @@ async def collect_news(
             try:
                 published_at = datetime.strptime(published, "%Y-%m-%d")
             except ValueError:
-                published_at = datetime.now()
+                published_at = datetime.now(_KST)
 
         # URL: BigKinds 원문 링크 또는 고유 ID
         url = link or f"bigkinds://{doc.get('news_id', title[:50])}"

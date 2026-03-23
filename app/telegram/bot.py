@@ -185,13 +185,22 @@ async def _send_worker_loop() -> None:
 
 
 async def _deliver(fields: dict) -> bool:
-    """단일 메시지 Telegram 발송 + DB 로깅. 성공 시 True."""
+    """단일 메시지 Telegram 발송 + DB 로깅. 성공 시 True.
+
+    HTML 파싱 실패 시 parse_mode 없이 재시도 (평문이라도 발송).
+    """
     kwargs = {"chat_id": fields["chat_id"], "text": fields["text"], "parse_mode": "HTML"}
     rm = fields.get("reply_markup")
     if rm:
         kwargs["reply_markup"] = json.loads(rm) if isinstance(rm, str) else rm
 
     result = await _api("sendMessage", **kwargs)
+
+    # HTML 파싱 실패 시 parse_mode 제거 후 재시도 (평문 발송)
+    if not result:
+        kwargs.pop("parse_mode", None)
+        result = await _api("sendMessage", **kwargs)
+
     status = "success" if result else "failed"
     await _log_message(
         fields.get("category", "system"),
@@ -223,7 +232,7 @@ async def start_telegram_consumer() -> None:
     await ensure_consumer_group(_TG_STREAM, _TG_GROUP)
     logger.info("텔레그램 Redis consumer 시작 (stream=%s, group=%s)", _TG_STREAM, _TG_GROUP)
 
-    # Phase 1: PEL 복구 (미처리 메시지)
+    # Phase 1: PEL 복구 (미처리 메시지) — 실패해도 ACK (무한 재시도 방지)
     try:
         pending = await xreadgroup(
             _TG_GROUP, _TG_CONSUMER, {_TG_STREAM: "0-0"}, count=50, block=0,
@@ -235,8 +244,9 @@ async def start_telegram_consumer() -> None:
                     await xack(_TG_STREAM, _TG_GROUP, msg_id)
                     continue
                 success = await _deliver(fields)
+                # 성공이든 실패든 ACK — 영구 실패 메시지가 PEL에 남아 무한 재시도되는 것 방지
+                await xack(_TG_STREAM, _TG_GROUP, msg_id)
                 if success:
-                    await xack(_TG_STREAM, _TG_GROUP, msg_id)
                     recovered += 1
                 await asyncio.sleep(_MIN_INTERVAL)
         if recovered:
@@ -252,9 +262,9 @@ async def start_telegram_consumer() -> None:
             )
             for _stream_name, messages in results:
                 for msg_id, fields in messages:
-                    success = await _deliver(fields)
-                    if success:
-                        await xack(_TG_STREAM, _TG_GROUP, msg_id)
+                    await _deliver(fields)
+                    # 성공이든 실패든 ACK — 발송 실패는 DB에 기록됨, PEL 적체 방지
+                    await xack(_TG_STREAM, _TG_GROUP, msg_id)
                     await asyncio.sleep(_MIN_INTERVAL)
         except asyncio.CancelledError:
             break

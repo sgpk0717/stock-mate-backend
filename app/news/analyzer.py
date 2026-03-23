@@ -182,6 +182,7 @@ async def _analyze_with_gemini(messages: list[dict]) -> list[SentimentResult]:
         max_tokens=8000,
         temperature=0.1,
         json_mode=True,
+        caller="news.analyzer",
     )
 
     # Gemini JSON 수리 후 파싱
@@ -200,6 +201,7 @@ async def _analyze_with_anthropic(messages: list[dict]) -> list[SentimentResult]
         system=ANALYSIS_PROMPT,
         messages=messages,
         max_tokens=2000,
+        caller="news.analyzer",
     )
 
     results_data = _parse_results(response.text)

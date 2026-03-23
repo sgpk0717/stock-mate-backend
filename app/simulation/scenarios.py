@@ -71,6 +71,7 @@ async def generate_custom_scenario(prompt: str) -> CustomScenarioResponse:
         max_tokens=500,
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
+        caller="simulation.scenarios",
     )
 
     text = resp.content[0].text.strip()

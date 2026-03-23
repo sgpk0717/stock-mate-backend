@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from datetime import date, timedelta
 
@@ -278,6 +279,7 @@ async def get_workflow_status() -> str:
     반환: phase, status, 선택된 팩터, 매매 건수, PnL, 마이닝 상태.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_workflow_status 호출")
 
     # Redis 캐시 우선 (Phase 3: MCP 분리 시 orchestrator import 불필요)
     status = None
@@ -346,6 +348,7 @@ async def get_best_factors(
     반환: 팩터 이름, 수식, IC, Sharpe, MDD, 인과 검증, 복합 점수.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_best_factors 호출 (limit=%d, min_sharpe=%.2f)", limit, min_sharpe)
     from app.workflow.auto_selector import select_best_factors
 
     async with async_session() as session:
@@ -391,6 +394,7 @@ async def get_trading_review(target_date: str = "") -> str:
     반환: 총 수익률, 거래 수, 승률, 평균 보유시간, 개선 방향.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_trading_review 호출 (date=%s)", target_date or "today")
     from datetime import date as d
 
     from app.workflow.models import WorkflowRun
@@ -462,6 +466,7 @@ async def get_trade_details(target_date: str = "", limit: int = 50) -> str:
     반환: Top 수익/손실 거래, 보유시간 분포, 청산유형별 집계, 종합 요약.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_trade_details 호출 (date=%s, limit=%d)", target_date or "today", limit)
     from datetime import date as d
 
     from app.workflow.models import LiveTrade
@@ -590,6 +595,7 @@ async def submit_trading_feedback(
         market_regime: 시장 체제 (예: bull, bear, sideways)
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] submit_trading_feedback 호출 (factor_id=%s)", factor_id[:8] if factor_id else "?")
     from datetime import date as d
 
     from app.workflow.models import WorkflowRun
@@ -637,15 +643,22 @@ async def get_system_health() -> str:
     """
     start_ms = time.monotonic()
 
+    # Docker 네트워크: MCP 컨테이너에서 API는 "app:8007"로 접근
+    api_host = os.environ.get("API_HOST", "app")
+    url = f"http://{api_host}:8007/health/detailed"
+    logger.info("[MCP] get_system_health 호출: %s", url)
+
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get("http://localhost:8007/health/detailed")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
             data = resp.text
     except Exception as e:
+        logger.warning("[MCP] get_system_health 실패: %s", e)
         data = json.dumps({"error": f"헬스 API 호출 실패: {e}"}, ensure_ascii=False)
 
     elapsed = int((time.monotonic() - start_ms) * 1000)
+    logger.info("[MCP] get_system_health 완료 (%dms)", elapsed)
     await audit_log("get_system_health", {}, {}, "success", execution_ms=elapsed)
 
     return data
@@ -723,6 +736,7 @@ async def get_error_logs(limit: int = 20) -> str:
     OpenClaw 버그 탐지용.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_error_logs 호출 (limit=%d)", limit)
     from app.workflow.models import WorkflowEvent
 
     async with async_session() as session:
@@ -772,6 +786,7 @@ async def get_factor_performance(
     반환: 팩터별 일별 PnL, 승률, 거래 수, 백테스트 IC 대비 실매매 IC 갭.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_factor_performance 호출 (factor_id=%s, days=%d)", factor_id[:8] if factor_id else "all", days)
     from datetime import date as d, timedelta
     from uuid import UUID
 
@@ -1029,6 +1044,7 @@ async def get_mining_status() -> str:
     실행 여부, 진행 사이클, 발견 팩터 수, 설정 등을 반환한다.
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_mining_status 호출")
 
     from app.alpha.factory_client import get_factory_client
 
@@ -1082,6 +1098,7 @@ async def get_causal_validation_status(
         job_id: 검증 잡 ID (비어 있으면 최근 잡 자동 선택)
     """
     start_ms = time.monotonic()
+    logger.info("[MCP] get_causal_validation_status 호출 (job_id=%s)", job_id or "latest")
 
     from app.alpha.factory_client import get_factory_client
 
@@ -1101,11 +1118,18 @@ async def get_causal_validation_status(
     else:
         latest = await client.get_latest_validation_job()
         if not latest:
-            result = {"success": False, "message": "진행 중이거나 최근 완료된 인과 검증 잡이 없습니다."}
+            # 잡이 없는 건 정상 상태 — 에러가 아닌 성공으로 반환
+            result = {
+                "success": True,
+                "status": "idle",
+                "message": "현재 진행 중이거나 최근 완료된 인과 검증 잡이 없습니다.",
+                "total": 0, "completed": 0, "robust": 0, "mirage": 0, "failed": 0,
+            }
             elapsed = int((time.monotonic() - start_ms) * 1000)
+            logger.info("[MCP] get_causal_validation_status: 잡 없음 (idle) (%dms)", elapsed)
             await audit_log(
                 "get_causal_validation_status", {},
-                result, "error", "no_jobs", execution_ms=elapsed,
+                result, "success", execution_ms=elapsed,
             )
             return json.dumps(result, ensure_ascii=False)
         result_data = latest

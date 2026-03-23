@@ -102,6 +102,7 @@ async def process_message(
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=api_messages,
+            caller="agents.manager",
         )
 
         # 응답의 content 블록 처리
