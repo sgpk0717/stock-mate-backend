@@ -295,16 +295,20 @@ class KISClient:
         else:
             output = {}
 
+        if output:
+            logger.debug("inquire_program_trading raw keys: %s", list(output.keys()))
+
         def _safe_int(val: Any) -> int:
             try:
                 return int(str(val).replace(",", ""))
             except (ValueError, TypeError):
                 return 0
 
-        sell_qty = _safe_int(output.get("thtm_ntsl_qty", 0))
-        buy_qty = _safe_int(output.get("thtm_ntby_qty", 0))
-        sell_amt = _safe_int(output.get("thtm_ntsl_tr_pbmn", 0))
-        buy_amt = _safe_int(output.get("thtm_ntby_tr_pbmn", 0))
+        # KIS 공식 필드명 (TR FHPPG04600101, 프로그램매매 종합현황)
+        sell_qty = _safe_int(output.get("whol_smtn_seln_vol", 0))
+        buy_qty = _safe_int(output.get("whol_smtn_shnu_vol", 0))
+        sell_amt = _safe_int(output.get("whol_smtn_seln_tr_pbmn", 0))
+        buy_amt = _safe_int(output.get("whol_smtn_shnu_tr_pbmn", 0))
         return {
             "pgm_buy_qty": buy_qty,
             "pgm_sell_qty": sell_qty,

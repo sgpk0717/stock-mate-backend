@@ -147,6 +147,14 @@ class DailyWorkflowOrchestrator:
             session, run, "phase_transition", f"{old_phase} → {new_phase}{forced}"
         )
         logger.info("워크플로우 전이: %s → %s%s", old_phase, new_phase, forced)
+
+        # Redis 캐시 즉시 갱신 (API가 stale phase를 반환하지 않도록)
+        try:
+            from app.core.redis import hset
+            await hset("workflow:status", {"phase": new_phase, "status": run.status or ""})
+        except Exception:
+            pass  # Redis 실패해도 DB는 이미 업데이트됨
+
         return True
 
     # ── step_status 헬퍼 ──
@@ -347,6 +355,12 @@ class DailyWorkflowOrchestrator:
         """09:00 — 최적 팩터 → TradingContext → LiveSession 시작."""
         async with async_session() as session:
             run = await self._get_or_create_today(session)
+
+            # 비거래일 체크
+            if not await self._is_trading_day():
+                logger.info("market_open: 비거래일 — 스킵")
+                await session.commit()
+                return {"success": True, "message": "비거래일 — 매매 스킵"}
 
             # step_status 중복/완료 체크 (force=True면 우회)
             if not force:
@@ -673,6 +687,12 @@ class DailyWorkflowOrchestrator:
         async with async_session() as session:
             run = await self._get_or_create_today(session)
 
+            # 비거래일 체크
+            if not await self._is_trading_day():
+                logger.info("market_close: 비거래일 — 스킵")
+                await session.commit()
+                return {"success": True, "message": "비거래일 — 매매 스킵"}
+
             # step_status 중복/완료 체크 (force=True면 우회)
             if not force:
                 step_info = self._get_step(run, "market_close")
@@ -911,6 +931,12 @@ class DailyWorkflowOrchestrator:
         async with async_session() as session:
             run = await self._get_or_create_today(session)
 
+            # 비거래일 체크
+            if not await self._is_trading_day():
+                logger.info("review: 비거래일 — 스킵")
+                await session.commit()
+                return {"success": True, "message": "비거래일 — 리뷰 스킵"}
+
             # step_status 중복/완료 체크 (force=True면 우회)
             if not force:
                 step_info = self._get_step(run, "review")
@@ -1069,6 +1095,7 @@ class DailyWorkflowOrchestrator:
                         "content": _json.dumps(review_data, ensure_ascii=False, default=str),
                     }],
                     max_tokens=1200,
+                    caller="workflow.review",
                 )
                 tg_msg = llm_response.text
             except Exception as llm_err:
@@ -1130,6 +1157,18 @@ class DailyWorkflowOrchestrator:
 
             mining_context = run.mining_context or "자동 워크플로우 상시 마이닝"
             try:
+                # Redis 플래그 체크: 사용자가 수동 중지한 경우 시작 안 함
+                try:
+                    from app.core.redis import get_client as get_redis
+                    _r = get_redis()
+                    _flag = await _r.get("alpha:factory:user_stopped")
+                    if _flag and str(_flag) == "true":
+                        logger.info("마이닝 사용자 중지 플래그 감지 — 시작 건너뜀")
+                        await self._set_step(session, run, "mining", "skipped_user_stopped")
+                        return
+                except Exception:
+                    pass
+
                 from app.alpha.factory_client import get_factory_client
                 factory = get_factory_client()
                 if not (await factory.get_status())["running"]:
@@ -1215,12 +1254,22 @@ class DailyWorkflowOrchestrator:
     ]
 
     def _expected_phase_now(self) -> tuple[str, str]:
-        """현재 KST 시간 기준 기대 페이즈 + 핸들러 이름."""
+        """현재 KST 시간 기준 기대 페이즈 + 핸들러 이름.
+
+        비거래일(주말)이면 항상 MINING 반환.
+        공휴일은 pykrx 비동기 호출이 필요해서 여기서는 주말만 체크.
+        (공휴일은 각 핸들러의 _is_trading_day()에서 걸러짐)
+        """
         from datetime import timezone as tz
         KST = tz(timedelta(hours=9))
-        now_kst = datetime.now(KST).time()
+        now_kst = datetime.now(KST)
+
+        # 주말이면 항상 마이닝
+        if now_kst.weekday() >= 5:  # 5=토, 6=일
+            return "MINING", "handle_mining"
+
         for start, end, phase, handler in self._PHASE_SCHEDULE:
-            if start <= now_kst < end:
+            if start <= now_kst.time() < end:
                 return phase, handler
         # 23:59:59 이후 (사실상 없지만 안전장치)
         return "MINING", "handle_mining"
@@ -1598,7 +1647,24 @@ class DailyWorkflowOrchestrator:
         """팩토리가 안 돌고 있으면 재시작 (마이닝 상시가동 보장)."""
         try:
             from app.alpha.scheduler import get_scheduler
+
+            # Redis 플래그 체크: 프론트/API에서 user_stopped 설정 시 와치독 비활성화
+            try:
+                from app.core.redis import get_client as get_redis
+                _redis = get_redis()
+                _user_stopped_flag = await _redis.get("alpha:factory:user_stopped")
+                if _user_stopped_flag and str(_user_stopped_flag) == "true":
+                    return  # 와치독 비활성화 — 재시작 안 함
+            except Exception:
+                pass
+
             scheduler = get_scheduler()
+
+            # ★ task가 살아있으면 (실행 중이면) 재시작 안 함
+            # get_status()는 state.running과 task.done() 불일치 시 오보 가능
+            if scheduler._task and not scheduler._task.done():
+                return
+
             status = scheduler.get_status()
             if not status["running"]:
                 # 사용자가 의도적으로 중지한 경우 watchdog 재시작 안 함
@@ -1775,6 +1841,10 @@ class DailyWorkflowOrchestrator:
                     k: _json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else str(v) if v is not None else ""
                     for k, v in data.items()
                 })
+                # 12시간 TTL — 날짜 변경 시 stale 캐시 자동 만료
+                from app.core.redis import get_client
+                r = get_client()
+                await r.expire("workflow:status", 43200)
             except Exception:
                 pass
 
@@ -1935,30 +2005,31 @@ class DailyWorkflowOrchestrator:
             self._scheduler = scheduler
 
             # 08:30 KST — PRE_MARKET
+            # 매매 관련: 평일(월~금)만 실행 — 공휴일은 핸들러 내 _is_trading_day()에서 차단
             await scheduler.add_schedule(
                 self.handle_pre_market,
-                CronTrigger(hour=8, minute=30, timezone="Asia/Seoul"),
+                CronTrigger(hour=8, minute=30, day_of_week="mon-fri", timezone="Asia/Seoul"),
                 id="workflow_pre_market",
             )
-            # 09:00 KST — MARKET_OPEN
+            # 09:00 KST — MARKET_OPEN (평일만)
             await scheduler.add_schedule(
                 self.handle_market_open,
-                CronTrigger(hour=9, minute=0, timezone="Asia/Seoul"),
+                CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone="Asia/Seoul"),
                 id="workflow_market_open",
             )
-            # 15:30 KST — MARKET_CLOSE
+            # 15:30 KST — MARKET_CLOSE (평일만)
             await scheduler.add_schedule(
                 self.handle_market_close,
-                CronTrigger(hour=15, minute=30, timezone="Asia/Seoul"),
+                CronTrigger(hour=15, minute=30, day_of_week="mon-fri", timezone="Asia/Seoul"),
                 id="workflow_market_close",
             )
-            # 16:30 KST — REVIEW
+            # 16:30 KST — REVIEW (평일만)
             await scheduler.add_schedule(
                 self.handle_review,
-                CronTrigger(hour=16, minute=30, timezone="Asia/Seoul"),
+                CronTrigger(hour=16, minute=30, day_of_week="mon-fri", timezone="Asia/Seoul"),
                 id="workflow_review",
             )
-            # 18:00 KST — MINING (리뷰 후 자동 시작이 실패했을 때의 안전장치)
+            # 18:00 KST — MINING (매일 실행 — 주말/공휴일에도 마이닝)
             await scheduler.add_schedule(
                 self.handle_mining,
                 CronTrigger(hour=18, minute=0, timezone="Asia/Seoul"),

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +17,8 @@ from app.workflow.models import LiveFeedback
 
 logger = logging.getLogger(__name__)
 
+_KST = timezone(timedelta(hours=9))
+
 
 async def check_staleness(session: AsyncSession) -> dict:
     """활성 팩터의 스탈니스 검사.
@@ -24,7 +26,7 @@ async def check_staleness(session: AsyncSession) -> dict:
     Returns:
         {"warned": int, "stale": int, "retired": int}
     """
-    now = datetime.now()
+    now = datetime.now(_KST)
     warned = 0
     stale_count = 0
     retired_count = 0

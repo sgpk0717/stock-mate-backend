@@ -307,6 +307,7 @@ class SimulationRunner:
         self.executor = MockExecutor(market.lob)
         self.om = OrderManager(self.executor)
         self.event_log = EventLog()
+        self.decisions: list[dict] = []  # 의사결정 로그 (decision_logger 공통 포맷)
         self.positions: dict[str, dict] = {}
         self.cash: float = 100_000_000
         self.initial_capital: float = 100_000_000
@@ -354,28 +355,31 @@ class SimulationRunner:
             self._log(tick, "CANCEL", cancelled.symbol,
                       f"취소 확인: 체결 {cancelled.filled_qty}주")
 
-        # 리스크 체크
+        # 리스크 체크 — decision_logic.evaluate_risk 사용
+        from app.trading.decision_logger import log_decision as _ld
+        from app.trading.decision_logic import evaluate_risk, evaluate_buy
+
         for sym, pos in list(self.positions.items()):
             if pos["qty"] <= 0:
                 continue
             if price > pos.get("highest_price", 0):
                 pos["highest_price"] = price
 
-            if pos["avg_price"] > 0:
-                loss_pct = (price - pos["avg_price"]) / pos["avg_price"] * 100
-                if loss_pct <= -stop_loss_pct:
-                    self._log(tick, "RISK", sym,
-                              f"손절: {loss_pct:+.2f}% (기준 -{stop_loss_pct}%) → MARKET SELL")
-                    await self.om.submit_sell(sym, pos["qty"], reason="stop_loss", urgent=True)
+            risk_decision = evaluate_risk(
+                avg_price=pos.get("avg_price", 0),
+                highest_price=pos.get("highest_price", 0),
+                current_price=price,
+                qty=pos["qty"],
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+            )
+            if risk_decision is not None:
+                self._log(tick, "RISK", sym, f"{risk_decision.reason} → MARKET SELL")
+                _ld(self.decisions, sym, risk_decision.action, risk_decision.reason,
+                    risk=risk_decision.risk)
+                await self.om.submit_sell(sym, pos["qty"], reason=risk_decision.risk.get("type", "risk"), urgent=True)
+                if risk_decision.action != "PARTIAL_EXIT":
                     continue
-
-            hp = pos.get("highest_price", 0)
-            if hp > 0:
-                drop = (hp - price) / hp * 100
-                if drop >= trailing_stop_pct:
-                    self._log(tick, "RISK", sym,
-                              f"트레일링: 고점 {hp:,} → {price:,} = -{drop:.1f}% → MARKET SELL")
-                    await self.om.submit_sell(sym, pos["qty"], reason="trailing", urgent=True)
 
         # 시그널
         if signal != 0 and signal_detail:
@@ -384,28 +388,51 @@ class SimulationRunner:
         if symbol in self.hooks.blocked_symbols:
             if signal != 0:
                 self._log(tick, "SKIP", symbol, "blocked_symbols → 스킵")
+                _ld(self.decisions, symbol, "SKIP_BUY" if signal == 1 else "SKIP_SELL",
+                    "blocked_symbols", signal=signal)
             return
 
         if self.om.has_pending(symbol):
             if signal != 0:
                 self._log(tick, "SKIP", symbol, "미체결 주문 존재 → 스킵")
+                _ld(self.decisions, symbol, "SKIP_PENDING",
+                    "미체결 주문 존재", signal=signal)
             return
 
+        # 매수 판단 — decision_logic.evaluate_buy 사용
         if signal == 1 and symbol not in self.positions:
-            alloc = min(self.initial_capital * 0.1, self.cash * 0.95)
-            qty = int(alloc / price)
-            if qty <= 0:
+            buy_decision = evaluate_buy(
+                signal=1, symbol=symbol, has_position=False,
+                current_positions=len(self.positions),
+                max_positions=999,  # sim_engine은 포지션 상한 없음
+                cash=self.cash,
+                initial_capital=self.initial_capital,
+                position_size_pct=0.1,
+                close_price=price, buy_price=price,
+                row={}, strategy={},
+                ps_cfg={"mode": "fixed", "conviction": 1.0},
+            )
+
+            if buy_decision.action == "SKIP_BUY":
+                _ld(self.decisions, symbol, "SKIP_BUY", buy_decision.reason,
+                    signal=1, sizing=buy_decision.sizing)
                 return
 
-            if self.hooks.on_before_order:
-                if not self.hooks.on_before_order({"symbol": symbol, "side": "BUY", "qty": qty, "price": price}):
-                    self._log(tick, "SKIP", symbol, "on_before_order 훅 거부")
-                    return
+            if buy_decision.action == "BUY":
+                qty = buy_decision.qty
+                if self.hooks.on_before_order:
+                    if not self.hooks.on_before_order({"symbol": symbol, "side": "BUY", "qty": qty, "price": price}):
+                        self._log(tick, "SKIP", symbol, "on_before_order 훅 거부")
+                        _ld(self.decisions, symbol, "SKIP_BUY", "훅 거부", signal=1)
+                        return
 
-            managed = await self.om.submit_buy(symbol, qty, price)
-            if managed:
-                self._log(tick, "SUBMIT", symbol,
-                          f"LIMIT BUY {qty}주 @ {managed.price:,} (TTL={managed.ttl_seconds:.0f}s)")
+                managed = await self.om.submit_buy(symbol, qty, price)
+                if managed:
+                    self._log(tick, "SUBMIT", symbol,
+                              f"LIMIT BUY {qty}주 @ {managed.price:,} (TTL={managed.ttl_seconds:.0f}s)")
+                    _ld(self.decisions, symbol, "BUY",
+                        f"매수 주문: {qty}주 @ {managed.price:,}",
+                        signal=1, sizing=buy_decision.sizing)
 
         elif signal == -1 and symbol in self.positions:
             pos = self.positions[symbol]
@@ -415,12 +442,16 @@ class SimulationRunner:
             if self.hooks.on_before_order:
                 if not self.hooks.on_before_order({"symbol": symbol, "side": "SELL", "qty": pos["qty"], "price": price}):
                     self._log(tick, "SKIP", symbol, "on_before_order 훅 거부")
+                    _ld(self.decisions, symbol, "SKIP_SELL", "훅 거부", signal=-1)
                     return
 
             managed = await self.om.submit_sell(symbol, pos["qty"], price, reason="signal")
             if managed:
                 self._log(tick, "SUBMIT", symbol,
                           f"LIMIT SELL {pos['qty']}주 @ {managed.price:,} (TTL={managed.ttl_seconds:.0f}s)")
+                _ld(self.decisions, symbol, "SELL",
+                    f"매도 주문: {pos['qty']}주 @ {managed.price:,}",
+                    signal=-1)
 
         if self.hooks.on_tick_end:
             self.hooks.on_tick_end(tick, {

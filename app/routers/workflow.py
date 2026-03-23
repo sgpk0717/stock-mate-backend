@@ -31,8 +31,10 @@ async def get_workflow_status() -> dict:
         import json
         from app.core.redis import hgetall
         cached = await hgetall("workflow:status")
-        if cached and cached.get("phase"):
-            # JSON 필드 역직렬화
+        # 날짜 체크: 캐시가 오늘 것이 아니면 무시
+        from datetime import date
+        cached_date = cached.get("date", "") if cached else ""
+        if cached and cached.get("phase") and cached_date == str(date.today()):
             result = {}
             for k, v in cached.items():
                 if k in ("step_status",) and v:
@@ -158,6 +160,7 @@ async def test_review_telegram():
                 "content": _json.dumps(review_data, ensure_ascii=False, default=str),
             }],
             max_tokens=1200,
+            caller="workflow.review_api",
         )
         tg_msg = llm_response.text
     except Exception as e:

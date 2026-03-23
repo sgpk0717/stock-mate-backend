@@ -353,3 +353,142 @@ async def get_buyable(symbol: str, price: int = 0, is_mock: bool = True):
     """매수 가능 수량 조회."""
     client = get_kis_client(is_mock=is_mock)
     return await client.inquire_psbl_order(symbol, price)
+
+
+@router.get("/history/{date}")
+async def get_trading_history_by_date(date: str):
+    """특정 날짜의 매매 기록 조회 (live_trades)."""
+    from datetime import datetime
+
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.core.database import async_session
+    from app.workflow.models import LiveTrade, WorkflowRun
+
+    try:
+        target_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, "날짜 형식: YYYY-MM-DD")
+
+    async with async_session() as db:
+        # 해당 날짜의 workflow_run에서 context_ids 조회
+        run_stmt = select(WorkflowRun).where(WorkflowRun.date == target_date)
+        run_result = await db.execute(run_stmt)
+        run = run_result.scalar_one_or_none()
+
+        if not run or not run.config:
+            return {"date": date, "trades": [], "trade_count": 0}
+
+        context_ids = run.config.get("trading_context_ids", [])
+        if not context_ids:
+            return {"date": date, "trades": [], "trade_count": 0}
+
+        # live_trades 조회
+        import uuid
+
+        trade_stmt = (
+            select(LiveTrade)
+            .where(LiveTrade.context_id.in_([uuid.UUID(c) for c in context_ids]))
+            .order_by(LiveTrade.executed_at.desc())
+        )
+        trade_result = await db.execute(trade_stmt)
+        trades = trade_result.scalars().all()
+
+        return {
+            "date": date,
+            "trade_count": len(trades),
+            "trades": [
+                {
+                    "id": str(t.id),
+                    "context_id": str(t.context_id),
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "step": t.step,
+                    "qty": t.qty,
+                    "price": t.price,
+                    "pnl_pct": t.pnl_pct,
+                    "pnl_amount": t.pnl_amount,
+                    "holding_minutes": getattr(t, "holding_minutes", None),
+                    "executed_at": t.executed_at.isoformat() if t.executed_at else None,
+                }
+                for t in trades
+            ],
+        }
+
+
+# ── 알파 스코어 랭킹 ─────────────────────────────────────
+
+
+@router.get("/alpha-ranking")
+async def alpha_ranking(top_n: int = 10):
+    """실시간 알파 스코어 랭킹 — 매수/매도 임박 종목 TOP N.
+
+    Redis Sorted Set에서 즉시 읽기 (<50ms).
+    """
+    try:
+        from app.core.redis import get_client
+
+        r = get_client()
+
+        # 매수 후보 (score 높은 순)
+        buy_raw = await r.zrevrange("alpha:buy_ranking", 0, top_n - 1, withscores=True)
+        buy_candidates = []
+        for sym, score in buy_raw:
+            detail = await r.hgetall(f"alpha:detail:{sym}")
+            buy_candidates.append({
+                "symbol": sym,
+                "name": detail.get("name", sym),
+                "score": round(score, 4),
+                "close": detail.get("close", "0"),
+                "rsi": detail.get("rsi", "0"),
+                "volume_ratio": detail.get("volume_ratio", "0"),
+                "delta_to_buy": round(max(0, 0.7 - score), 4),
+            })
+
+        # 매도 후보 (score 낮은 순 = 1-score 높은 순)
+        sell_raw = await r.zrevrange("alpha:sell_ranking", 0, top_n - 1, withscores=True)
+        sell_candidates = []
+        for sym, inv_score in sell_raw:
+            actual_score = round(1.0 - inv_score, 4)
+            detail = await r.hgetall(f"alpha:detail:{sym}")
+            sell_candidates.append({
+                "symbol": sym,
+                "name": detail.get("name", sym),
+                "score": actual_score,
+                "close": detail.get("close", "0"),
+                "rsi": detail.get("rsi", "0"),
+                "volume_ratio": detail.get("volume_ratio", "0"),
+                "delta_to_sell": round(max(0, actual_score - 0.3), 4),
+            })
+
+        updated_at = await r.get("alpha:updated_at")
+        version = await r.get("alpha:version")
+
+        return {
+            "buy_candidates": buy_candidates,
+            "sell_candidates": sell_candidates,
+            "updated_at": updated_at or "",
+            "version": int(version) if version else 0,
+            "scored_count": await r.zcard("alpha:buy_ranking"),
+        }
+    except Exception as e:
+        # Redis 미연결 또는 스코어 엔진 미시작
+        return {
+            "buy_candidates": [],
+            "sell_candidates": [],
+            "updated_at": "",
+            "version": 0,
+            "scored_count": 0,
+            "error": str(e)[:100],
+        }
+
+
+@router.get("/alpha-ranking/status")
+async def alpha_ranking_status():
+    """알파 스코어 엔진 상태."""
+    try:
+        from app.trading.alpha_score_engine import get_score_engine
+        return get_score_engine().get_status()
+    except Exception:
+        return {"running": False, "error": "엔진 미초기화"}

@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -51,7 +51,7 @@ class TradingContext:
     symbols: list[str] = field(default_factory=list)
 
     # 메타
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = field(default_factory=lambda: datetime.now(timezone(timedelta(hours=9))).isoformat())
     source_backtest_id: str | None = None  # 원본 백테스트 run ID
     source_factor_id: str | None = None  # 원본 알파 팩터 ID
 

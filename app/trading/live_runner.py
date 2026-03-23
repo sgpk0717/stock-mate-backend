@@ -11,8 +11,11 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+# KST timezone (프로젝트 전역 사용)
+_KST = timezone(timedelta(hours=9))
 
 import polars as pl
 
@@ -20,9 +23,13 @@ from app.backtest.cost_model import CostConfig, effective_buy_price, effective_s
 from app.backtest.engine import generate_signals
 from app.core.stock_master import get_stock_name
 from app.services.ws_manager import manager
+from app.strategy.pipeline import StrategyPipeline
 from .context import TradingContext
 
 logger = logging.getLogger(__name__)
+
+# 전략 파이프라인 싱글턴 — 세션 시작 시 초기화
+_strategy_pipeline: StrategyPipeline | None = None
 
 # 전체 지표 스냅샷 키 목록 — trade_log.snapshot에 모두 기록
 _FULL_SNAP_KEYS = (
@@ -80,7 +87,7 @@ class LiveSession:
     context: TradingContext
     status: str = "stopped"  # "running" | "stopped" | "error"
     positions: dict[str, LivePosition] = field(default_factory=dict)
-    pending_orders: list[dict] = field(default_factory=list)
+    pending_orders: list[dict] = field(default_factory=list)  # Paper 지정가 미체결 주문
     trade_log: list[dict] = field(default_factory=list)
     decision_log: list[dict] = field(default_factory=list)  # 판단 기록 (스킵 포함)
     error_message: str = ""
@@ -122,13 +129,18 @@ _sessions: dict[str, LiveSession] = {}
 _intraday_collector_task: asyncio.Task | None = None
 
 
-async def _sync_session_to_redis(session: LiveSession) -> None:
+async def _sync_session_to_redis(
+    session: LiveSession,
+    tick_summary: dict | None = None,
+) -> None:
     """세션 상태를 Redis Hash에 동기화 (Phase 1: 이중 기록)."""
     try:
         from app.core.redis import hset
         import json
         d = session.to_dict()
-        await hset(f"sessions:{session.id}", {
+        from app.core.redis import get_client
+        key = f"sessions:{session.id}"
+        data = {
             "id": d["id"],
             "context_id": d["context_id"],
             "mode": d["mode"],
@@ -139,7 +151,14 @@ async def _sync_session_to_redis(session: LiveSession) -> None:
             "error_message": d["error_message"],
             "started_at": d["started_at"],
             "stopped_at": d["stopped_at"],
-        })
+        }
+        # tick 요약 (모니터링용)
+        if tick_summary:
+            data.update(tick_summary)
+        await hset(key, data)
+        # 12시간 TTL — 날짜 변경 시 자동 만료
+        r = get_client()
+        await r.expire(key, 43200)
     except Exception:
         pass  # Redis 실패해도 기존 동작에 영향 없음
 
@@ -159,11 +178,17 @@ async def _sync_sessions_index_to_redis() -> None:
 
 async def start_session(ctx: TradingContext) -> LiveSession:
     """전략 실거래 세션 시작."""
+    global _strategy_pipeline
+    if _strategy_pipeline is None:
+        _strategy_pipeline = StrategyPipeline.default()
+        logger.info("전략 파이프라인 초기화: %s", _strategy_pipeline.get_stats())
+    _strategy_pipeline.reset_daily()
+
     session = LiveSession(
         id=ctx.id,
         context=ctx,
         status="running",
-        started_at=datetime.now().isoformat(),
+        started_at=datetime.now(_KST).isoformat(),
         _cash=ctx.initial_capital,
     )
 
@@ -178,8 +203,11 @@ async def start_session(ctx: TradingContext) -> LiveSession:
             ))
             last_trade_dt = row.scalar()
             if last_trade_dt:
+                # DB는 UTC aware → enriched candles의 naive KST와 맞추기 위해 변환
+                if hasattr(last_trade_dt, 'astimezone'):
+                    last_trade_dt = last_trade_dt.astimezone(_KST).replace(tzinfo=None)
                 session._last_processed_dt = str(last_trade_dt)
-                logger.info("세션 %s: 오늘 마지막 매매 시각 복구 — %s", session.id[:8], last_trade_dt)
+                logger.info("세션 %s: 오늘 마지막 매매 시각 복구 — %s (KST naive)", session.id[:8], last_trade_dt)
     except Exception as e:
         logger.debug("마지막 매매 시각 복구 실패: %s", e)
 
@@ -208,7 +236,7 @@ async def stop_session(session_id: str) -> LiveSession | None:
         return None
 
     session.status = "stopped"
-    session.stopped_at = datetime.now().isoformat()
+    session.stopped_at = datetime.now(_KST).isoformat()
 
     if session._task and not session._task.done():
         session._task.cancel()
@@ -224,6 +252,9 @@ async def stop_session(session_id: str) -> LiveSession | None:
 
     # Redis 동기화 (Phase 1)
     await _sync_session_to_redis(session)
+
+    # _sessions에서 제거 → sessions:index에서도 사라짐
+    _sessions.pop(session_id, None)
     await _sync_sessions_index_to_redis()
 
     await manager.broadcast("trading:status", {
@@ -314,20 +345,16 @@ def _log_decision(
     sizing: dict | None = None,
     risk: dict | None = None,
 ) -> None:
-    """판단 기록 (매매 실행 여부와 무관하게 모든 판단을 남긴다)."""
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "symbol": symbol,
-        "name": get_stock_name(symbol),
-        "action": action,  # BUY, SELL, SKIP_BUY, SKIP_SELL, RISK_STOP, RISK_TRAIL 등
-        "reason": reason,
-        "signal": signal,
-        "conditions": conditions,
-        "snapshot": snapshot,
-        "sizing": sizing,
-        "risk": risk,
-    }
-    session.decision_log.append(entry)
+    """판단 기록 — decision_logger.log_decision 래퍼.
+
+    기존 호출부 14곳 변경 없이 공통 모듈을 사용한다.
+    """
+    from app.trading.decision_logger import log_decision
+    log_decision(
+        session.decision_log, symbol, action, reason,
+        signal=signal, conditions=conditions, snapshot=snapshot,
+        sizing=sizing, risk=risk,
+    )
 
 
 # ── 분할매매 헬퍼 ────────────────────────────────────────────
@@ -441,6 +468,34 @@ async def _run_loop(session: LiveSession) -> None:
         logger.error("실거래 루프 치명적 에러: %s", e, exc_info=True)
 
 
+async def _update_collector_status(
+    collector_id: str,
+    status: str,
+    last_count: int = 0,
+    symbols_total: int = 0,
+    next_at: str = "",
+    error: str = "",
+) -> None:
+    """수집기 상태를 Redis에 기록 (모니터링 대시보드용)."""
+    try:
+        from datetime import timezone, timedelta
+        from app.core.redis import hset, get_client
+        KST = timezone(timedelta(hours=9))
+        now_str = datetime.now(KST).strftime("%H:%M:%S")
+        await hset(f"collector:{collector_id}", {
+            "status": status,
+            "last_at": now_str,
+            "last_count": str(last_count),
+            "symbols_total": str(symbols_total),
+            "next_at": next_at,
+            "error": error,
+        })
+        r = get_client()
+        await r.expire(f"collector:{collector_id}", 86400)
+    except Exception:
+        pass
+
+
 async def start_intraday_candle_collector(symbols: list[str]) -> None:
     """장중 1분봉 수집기 시작 — live_runner와 독립적으로 실행.
 
@@ -469,15 +524,32 @@ async def _intraday_collect_loop(symbols: list[str]) -> None:
             # 15:30 이후면 종료
             if now_kst.hour > 15 or (now_kst.hour == 15 and now_kst.minute >= 30):
                 logger.info("장중 분봉 수집기 종료 (15:30 이후)")
+                await _update_collector_status("intraday", "stopped", symbols_total=len(symbols))
                 break
 
             today = now_kst.date()
+            await _update_collector_status("intraday", "collecting", symbols_total=len(symbols))
             collected = await _collect_missing_candles(symbols, today, now_kst)
+            # 1분봉 수집 후 완성된 5분봉 구간을 DB에서 리샘플링+저장
             if collected > 0:
-                logger.info("장중 분봉 수집: %d봉 추가", collected)
+                try:
+                    five_min_count = await _build_5m_from_db(symbols, today, now_kst)
+                except Exception as e:
+                    logger.warning("5분봉 빌드 실패: %s", e)
+                    five_min_count = 0
+            else:
+                five_min_count = 0
+            next_at = (now_kst + timedelta(minutes=5)).strftime("%H:%M")
+            await _update_collector_status(
+                "intraday", "idle",
+                last_count=collected, symbols_total=len(symbols), next_at=next_at,
+            )
+            if collected > 0:
+                logger.info("장중 분봉 수집: %d봉 추가 (5m: %d봉)", collected, five_min_count)
 
         except Exception as e:
             logger.warning("장중 분봉 수집 루프 오류: %s", e)
+            await _update_collector_status("intraday", "error", error=str(e)[:200])
 
         await asyncio.sleep(300)  # 5분 대기
 
@@ -505,7 +577,7 @@ async def _collect_missing_candles(
                     "SELECT MAX(dt) FROM stock_candles "
                     "WHERE symbol = :sym AND interval = '1m' AND dt >= :start"
                 ),
-                {"sym": sample_sym, "start": market_open_kst.replace(tzinfo=None)},
+                {"sym": sample_sym, "start": market_open_kst},  # KST aware → PostgreSQL이 자동 UTC 변환
             )
             last_dt = row.scalar()
     except Exception as e:
@@ -578,6 +650,106 @@ async def _collect_missing_candles(
     except Exception as e:
         logger.warning("장중 분봉 수집 전체 실패: %s", e)
         return 0
+
+
+async def _build_5m_from_db(
+    symbols: list[str], today: "date", now_kst: datetime,
+) -> int:
+    """DB의 1분봉에서 완성된 5분봉 구간만 리샘플링하여 저장.
+
+    각 종목별로:
+    1. DB에서 오늘 5분봉의 MAX(dt) 조회 → 마지막 저장 시각
+    2. 그 이후의 1분봉만 DB에서 가져옴
+    3. 완성된 5분 버킷(5개 1분봉)만 리샘플링
+    4. 미완성 버킷(현재 진행 중)은 건너뜀
+    """
+    from datetime import timedelta, timezone as tz
+    from app.core.database import async_session as get_session
+    from app.services.candle_writer import write_candles_bulk
+    from sqlalchemy import text
+
+    KST = tz(timedelta(hours=9))
+    total_5m = 0
+
+    # 현재 시각 기준 완성된 마지막 5분 경계
+    # 예: 10:37 → 10:35가 마지막 완성 버킷 시작 (10:31~10:35)
+    min_since_open = (now_kst.hour - 9) * 60 + now_kst.minute
+    last_complete_slot = (min_since_open // 5) * 5  # 완성된 마지막 슬롯 (분)
+    complete_boundary = now_kst.replace(
+        hour=9, minute=0, second=0, microsecond=0,
+    ) + timedelta(minutes=last_complete_slot)
+
+    # 종목을 배치로 처리 (DB 쿼리 횟수 절약)
+    async with get_session() as db:
+        for symbol in symbols:
+            try:
+                # 1. 이 종목의 오늘 5분봉 마지막 시각
+                r = await db.execute(
+                    text(
+                        "SELECT MAX(dt) FROM stock_candles "
+                        "WHERE symbol = :sym AND interval = '5m' AND dt >= :start"
+                    ),
+                    {"sym": symbol, "start": datetime(today.year, today.month, today.day, 0, 0, tzinfo=KST)},
+                )
+                last_5m_dt = r.scalar()
+
+                # 2. 이후의 1분봉 가져오기 (완성 경계까지만)
+                if last_5m_dt:
+                    if last_5m_dt.tzinfo is None:
+                        last_5m_dt = last_5m_dt.replace(tzinfo=KST)
+                    fetch_from = last_5m_dt + timedelta(minutes=1)
+                else:
+                    fetch_from = datetime(today.year, today.month, today.day, 9, 0, tzinfo=KST)
+
+                if fetch_from >= complete_boundary:
+                    continue  # 새로 만들 5분봉 없음
+
+                rows = await db.execute(
+                    text(
+                        "SELECT dt, open, high, low, close, volume FROM stock_candles "
+                        "WHERE symbol = :sym AND interval = '1m' "
+                        "AND dt >= :start AND dt < :end "
+                        "ORDER BY dt"
+                    ),
+                    {"sym": symbol, "start": fetch_from, "end": complete_boundary + timedelta(minutes=5)},
+                )
+                candles_1m = [
+                    {
+                        "dt": row[0] if row[0].tzinfo else row[0].replace(tzinfo=KST),
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                        "volume": int(row[5]),
+                    }
+                    for row in rows.fetchall()
+                ]
+
+                if not candles_1m:
+                    continue
+
+                # 3. 리샘플링 (완성된 버킷만)
+                five_min = _resample_candles(candles_1m, 5)
+                # 미완성 버킷 제거: 마지막 버킷이 complete_boundary 이후면 제외
+                if five_min:
+                    five_min = [
+                        b for b in five_min
+                        if b["dt"] < complete_boundary
+                        or b["dt"] == complete_boundary  # 경계 포함
+                    ]
+
+                if five_min:
+                    await write_candles_bulk(symbol, five_min, "5m")
+                    total_5m += len(five_min)
+
+            except Exception as e:
+                logger.debug("5분봉 빌드 실패 (%s): %s", symbol, e)
+                continue
+
+    if total_5m > 0:
+        logger.info("5분봉 빌드 완료: %d종목에서 %d봉", len(symbols), total_5m)
+
+    return total_5m
 
 
 def _resample_candles(candles_1m: list[dict], interval_min: int) -> list[dict]:
@@ -675,13 +847,14 @@ async def _paper_loop_tick(
     )
 
     try:
-        # to_thread: 데이터 로딩을 스레드풀에서 실행 → 메인 이벤트 루프 해방
+        # Worker 분리 후 to_thread 불필요 (API 이벤트 루프와 독립)
+        # to_thread + new_event_loop은 DB 세션 누수(idle in transaction) 유발
         if is_alpha:
-            from app.backtest.data_loader import load_enriched_candles_sync
-            df = await asyncio.to_thread(load_enriched_candles_sync, scan_symbols, start, end, interval)
+            from app.backtest.data_loader import load_enriched_candles
+            df = await load_enriched_candles(scan_symbols, start, end, interval)
         else:
-            from app.backtest.data_loader import load_candles_sync
-            df = await asyncio.to_thread(load_candles_sync, scan_symbols, start, end, interval)
+            from app.backtest.data_loader import load_candles
+            df = await load_candles(scan_symbols, start, end, interval)
     except Exception as e:
         logger.warning("캔들 로딩 실패: %s", e)
         return
@@ -779,12 +952,23 @@ async def _paper_loop_tick(
             pass
 
     if not sym_frames:
-        logger.info(
-            "paper_tick: 오늘 봉 0개 — skip_data=%d, skip_error=%d, no_today=%d "
-            "(interval=%s, market_open=%s, symbols=%d)",
-            _skip_data, _skip_error, _no_today,
-            interval, today_market_open.isoformat(), len(scan_symbols),
+        logger.warning(
+            "[tick %s] 오늘봉 0 | skip_data=%d skip_error=%d no_today=%d | 보유 %d/%d | 현금 %s",
+            session.id[:8], _skip_data, _skip_error, _no_today,
+            len(session.positions), ctx.max_positions, f"{session._cash:,.0f}",
         )
+        # Redis에도 빈 tick 상태 동기화
+        await _sync_session_to_redis(session, tick_summary={
+            "last_tick_at": datetime.now(_KST).isoformat(),
+            "bars_count": "0",
+            "buy_signals": "0", "sell_signals": "0",
+            "skip_buy": "0", "hold_count": "0",
+            "positions": str(len(session.positions)),
+            "max_positions": str(ctx.max_positions),
+            "cash": f"{session._cash:,.0f}",
+            "trade_count": str(len(session.trade_log)),
+            "status_detail": f"no_bars(skip={_skip_data},err={_skip_error},no_today={_no_today})",
+        })
         return
 
     logger.info(
@@ -821,99 +1005,67 @@ async def _paper_loop_tick(
             continue
         _seen_bars.add(bar_key)
 
-        # ── 고가 갱신 + 리스크 관리 (보유 포지션) ──
+        # ── Paper 지정가: pending_orders 체결 확인 ──
+        from app.core.config import settings as _cfg
+        if _cfg.PAPER_USE_LIMIT_ORDERS:
+            _process_pending_orders(session, row, cost, candle_dt_str)
+
+        # ── 전략 파이프라인 필터 (매수 시그널만 필터링, 매도/리스크 관리 통과) ──
+        if signal == 1 and _strategy_pipeline is not None:
+            filt = _strategy_pipeline.evaluate(signal, row, ctx)
+            if filt.get("skip"):
+                _log_decision(
+                    session, sym, "SKIP_STRATEGY_FILTER",
+                    filt.get("reason", "전략 필터 거부"),
+                    signal=signal,
+                    snapshot=_collect_snapshot(row),
+                    risk={"filter": filt.get("filter", "unknown")},
+                )
+                continue
+
+        # ── 고가 갱신 + 리스크 관리 (보유 포지션) ── decision_logic.evaluate_risk 사용
         if sym in session.positions:
+            from app.trading.decision_logic import evaluate_risk
+
             pos = session.positions[sym]
             if close_price > pos.highest_price:
                 pos.highest_price = close_price
 
-            # 고정 손절
-            if stop_loss_pct is not None and pos.avg_price > 0:
-                loss_pct = (close_price - pos.avg_price) / pos.avg_price * 100
-                if loss_pct <= -stop_loss_pct:
-                    sell_price = effective_sell_price(close_price, cost)
-                    risk_snap = {
-                        "close": close_price, "avg_price": round(pos.avg_price),
-                        "highest_price": round(pos.highest_price),
-                        "loss_pct": round(loss_pct, 4),
-                    }
-                    _log_decision(
-                        session, sym, "RISK_STOP",
-                        f"손절 발동: 현재가 {close_price:,.0f} / 평단 {pos.avg_price:,.0f} = {loss_pct:+.2f}%",
-                        risk={"type": "stop_loss", "loss_pct": round(loss_pct, 4), "threshold": stop_loss_pct},
-                    )
+            _scaling = scaling or {}
+            risk_decision = evaluate_risk(
+                avg_price=pos.avg_price,
+                highest_price=pos.highest_price,
+                current_price=close_price,
+                qty=pos.qty,
+                stop_loss_pct=stop_loss_pct,
+                trailing_stop_pct=trailing_stop_pct,
+                atr_val=(row.get("atr_14", 0) or 0) if atr_stop_mult else None,
+                atr_stop_mult=atr_stop_mult,
+                partial_exit_gain_pct=_scaling.get("partial_exit_gain_pct") if scaling_enabled else None,
+                partial_exit_pct=_scaling.get("partial_exit_pct", 0.5),
+                has_partial_exited=pos.has_partial_exited,
+                scaling_enabled=scaling_enabled,
+            )
+
+            if risk_decision is not None:
+                sell_price = effective_sell_price(close_price, cost)
+                _log_decision(session, sym, risk_decision.action, risk_decision.reason,
+                              risk=risk_decision.risk)
+
+                if risk_decision.action == "PARTIAL_EXIT":
+                    _paper_sell(session, sym, risk_decision.qty, close_price, sell_price, cost,
+                                step="S-HALF", reason=risk_decision.reason,
+                                snapshot={"close": close_price, "avg_price": round(pos.avg_price)},
+                                candle_dt=candle_dt_str, partial=True)
+                    pos.has_partial_exited = True
+                else:
+                    step = "S-TRAIL" if risk_decision.action == "RISK_TRAIL" else "S-STOP"
                     _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
-                                step="S-STOP",
-                                reason=f"손절: 평단 대비 {loss_pct:+.2f}% (기준 -{stop_loss_pct}%)",
-                                snapshot=risk_snap, candle_dt=candle_dt_str)
+                                step=step, reason=risk_decision.reason,
+                                snapshot={"close": close_price, "avg_price": round(pos.avg_price),
+                                          "highest_price": round(pos.highest_price)},
+                                candle_dt=candle_dt_str)
                     continue
-
-            # 트레일링 스탑
-            if trailing_stop_pct is not None and pos.highest_price > 0:
-                drop_pct = (pos.highest_price - close_price) / pos.highest_price * 100
-                if drop_pct >= trailing_stop_pct:
-                    sell_price = effective_sell_price(close_price, cost)
-                    risk_snap = {
-                        "close": close_price, "highest_price": round(pos.highest_price),
-                        "drop_pct": round(drop_pct, 4),
-                    }
-                    _log_decision(
-                        session, sym, "RISK_TRAIL",
-                        f"트레일링: 고점 {pos.highest_price:,.0f} → {close_price:,.0f} = -{drop_pct:.2f}%",
-                        risk={"type": "trailing_stop", "drop_pct": round(drop_pct, 4), "threshold": trailing_stop_pct},
-                    )
-                    _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
-                                step="S-TRAIL",
-                                reason=f"트레일링: 고점 대비 -{drop_pct:.2f}% (기준 -{trailing_stop_pct}%)",
-                                snapshot=risk_snap, candle_dt=candle_dt_str)
-                    continue
-
-            # ATR 동적 손절
-            if atr_stop_mult is not None and pos.avg_price > 0:
-                atr_val = row.get("atr_14", 0) or 0
-                if atr_val > 0:
-                    stop_line = pos.avg_price - atr_val * atr_stop_mult
-                    if close_price <= stop_line:
-                        sell_price = effective_sell_price(close_price, cost)
-                        risk_snap = {
-                            "close": close_price, "avg_price": round(pos.avg_price),
-                            "atr_14": round(atr_val, 2), "stop_line": round(stop_line),
-                        }
-                        _log_decision(
-                            session, sym, "RISK_ATR_STOP",
-                            f"ATR 스탑: {close_price:,.0f} <= {stop_line:,.0f} (평단-ATR×{atr_stop_mult})",
-                            risk={"type": "atr_stop", "stop_line": round(stop_line), "atr": round(atr_val, 2)},
-                        )
-                        _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
-                                    step="S-STOP",
-                                    reason=f"ATR 스탑: {close_price:,.0f} <= {stop_line:,.0f}",
-                                    snapshot=risk_snap, candle_dt=candle_dt_str)
-                        continue
-
-            # S-HALF 부분 익절
-            if scaling_enabled and not pos.has_partial_exited and pos.qty > 1:
-                _scaling = scaling or {}
-                partial_gain_pct = _scaling.get("partial_exit_gain_pct", 5.0)
-                partial_exit_ratio = _scaling.get("partial_exit_pct", 0.5)
-                if pos.avg_price > 0:
-                    gain_pct = (close_price - pos.avg_price) / pos.avg_price * 100
-                    if gain_pct >= partial_gain_pct:
-                        sell_qty = max(1, int(pos.qty * partial_exit_ratio))
-                        if sell_qty >= pos.qty:
-                            sell_qty = pos.qty - 1
-                        if sell_qty > 0:
-                            sell_price = effective_sell_price(close_price, cost)
-                            _log_decision(
-                                session, sym, "PARTIAL_EXIT",
-                                f"부분 익절: +{gain_pct:.2f}% >= {partial_gain_pct}% → {sell_qty}주 매도",
-                            )
-                            _paper_sell(session, sym, sell_qty, close_price, sell_price, cost,
-                                        step="S-HALF",
-                                        reason=f"부분 익절: 평단 대비 +{gain_pct:.2f}%",
-                                        snapshot={"close": close_price, "avg_price": round(pos.avg_price),
-                                                  "gain_pct": round(gain_pct, 2)},
-                                        candle_dt=candle_dt_str, partial=True)
-                            pos.has_partial_exited = True
 
         snapshot = _collect_snapshot(row)
         conditions = _collect_conditions_detail(row, strategy, signal)
@@ -929,125 +1081,152 @@ async def _paper_loop_tick(
                 for c in conditions.get("sell_conditions", []))
             _log_decision(session, sym, "SELL", sell_reason,
                           signal=signal, conditions=conditions, snapshot=snapshot)
-            _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
-                        step="", reason=sell_reason,
-                        snapshot=snapshot, conditions=conditions, candle_dt=candle_dt_str)
+
+            if _cfg.PAPER_USE_LIMIT_ORDERS:
+                from app.trading.tick_size import round_to_tick
+                limit_sell_price = round_to_tick(int(close_price), "down")
+                if limit_sell_price <= 0:
+                    limit_sell_price = int(close_price)
+                session.pending_orders.append({
+                    "symbol": sym, "side": "SELL",
+                    "price": limit_sell_price, "qty": pos.qty, "step": "",
+                    "created_at": candle_dt_str,
+                    "ttl_bars": _cfg.PAPER_LIMIT_TTL_BARS,
+                    "elapsed_bars": 0,
+                    "snapshot": snapshot, "conditions": conditions,
+                })
+                _log_decision(session, sym, "LIMIT_ORDER_PLACED",
+                              f"지정가 매도 등록: {pos.qty}주 @ {limit_sell_price:,.0f} "
+                              f"(TTL={_cfg.PAPER_LIMIT_TTL_BARS}봉)")
+            else:
+                _paper_sell(session, sym, pos.qty, close_price, sell_price, cost,
+                            step="", reason=sell_reason,
+                            snapshot=snapshot, conditions=conditions, candle_dt=candle_dt_str)
             continue
 
-        # ── B2 분할매수 ──
+        # ── B2 분할매수 ── decision_logic.evaluate_scale_in 사용
         if scaling_enabled and sym in session.positions:
+            from app.trading.decision_logic import evaluate_scale_in
+
             _scaling = scaling or {}
             pos = session.positions[sym]
-            max_scale = _scaling.get("max_scale_in", 1)
-            if pos.scale_in_count < max_scale and pos.qty > 0 and pos.avg_price > 0:
-                drop_trigger = _scaling.get("scale_in_drop_pct", 3.0)
-                drop_pct = (pos.avg_price - close_price) / pos.avg_price * 100
-                if drop_pct >= drop_trigger:
-                    remaining_qty = pos.target_qty - pos.qty
-                    if remaining_qty > 0:
-                        buy_p = effective_buy_price(close_price, cost)
-                        cost_amount = buy_p * remaining_qty
-                        # 현금 부족 시 수량 축소
-                        if cost_amount > session._cash * 0.95:
-                            remaining_qty = int(session._cash * 0.95 / buy_p)
-                        if remaining_qty > 0:
-                            total_cost = buy_p * remaining_qty
-                            session._cash -= total_cost
-                            pos.entries.append(LiveScaleEntry(
-                                date=candle_dt_str, price=buy_p,
-                                qty=remaining_qty, step="B2",
-                            ))
-                            pos.scale_in_count += 1
-                            result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
-                                       "message": f"시뮬 추가매수 체결 @ {buy_p:,.0f}"}
-                            _log_decision(
-                                session, sym, "SCALE_IN",
-                                f"B2 추가매수: 평단 대비 -{drop_pct:.2f}% (기준 -{drop_trigger}%) → {remaining_qty}주",
-                                snapshot=snapshot,
-                            )
-                            _log_trade(session, sym, "BUY", "B2", remaining_qty, buy_p, result,
-                                       reason=f"분할매수: 평단 대비 -{drop_pct:.2f}%",
-                                       snapshot=snapshot, candle_dt=candle_dt_str,
-                                       sizing={"drop_pct": round(drop_pct, 2), "target_qty": pos.target_qty,
-                                               "current_qty": pos.qty, "scale_in_count": pos.scale_in_count})
-
-        # ── 매수 시그널 (B1 신규 진입) ──
-        if signal == 1 and sym not in session.positions:
-            if len(session.positions) >= ctx.max_positions:
-                _log_decision(session, sym, "SKIP_BUY",
-                              f"최대 포지션: {len(session.positions)}/{ctx.max_positions}",
-                              signal=signal, conditions=conditions, snapshot=snapshot)
-                continue
-
-            conviction = _calc_conviction_live(strategy, ps_cfg or {}, row)
-            alloc = ctx.initial_capital * ctx.position_size_pct * conviction
-            if scaling_enabled:
-                initial_pct = (scaling or {}).get("initial_pct", 0.5)
-            else:
-                initial_pct = 1.0
-            alloc *= initial_pct
-            alloc = min(alloc, session._cash * 0.95)
-            buy_price = effective_buy_price(close_price, cost)
-            qty = int(alloc / buy_price)
-
-            # target_qty: 분할매수 활성 시 전체 목표 수량
-            if scaling_enabled and initial_pct > 0:
-                target_qty = int(qty / initial_pct) if initial_pct < 1.0 else qty
-            else:
-                target_qty = qty
-
-            sizing = {
-                "initial_capital": ctx.initial_capital,
-                "position_size_pct": ctx.position_size_pct,
-                "conviction": round(conviction, 4),
-                "initial_pct": initial_pct,
-                "scaling_enabled": scaling_enabled,
-                "alloc_raw": ctx.initial_capital * ctx.position_size_pct,
-                "alloc_effective": round(alloc, 2),
-                "close_price": close_price,
-                "buy_price_effective": round(buy_price, 2),
-                "qty": qty,
-                "target_qty": target_qty,
-                "total_cost": round(buy_price * qty, 2),
-                "cash_before": round(session._cash, 2),
-                "positions_count": len(session.positions),
-                "max_positions": ctx.max_positions,
-            }
-
-            if qty <= 0:
-                _log_decision(session, sym, "SKIP_BUY",
-                              f"수량 0: 배분금 {alloc:,.0f} / 매수가 {buy_price:,.0f}",
-                              signal=signal, conditions=conditions, snapshot=snapshot, sizing=sizing)
-                continue
-
-            total_cost = buy_price * qty
-            if total_cost > session._cash:
-                _log_decision(session, sym, "SKIP_BUY",
-                              f"현금 부족: {total_cost:,.0f} > {session._cash:,.0f}",
-                              signal=signal, conditions=conditions, snapshot=snapshot, sizing=sizing)
-                continue
-
-            session._cash -= total_cost
-            session.positions[sym] = LivePosition(
-                symbol=sym,
-                entries=[LiveScaleEntry(
-                    date=candle_dt_str, price=buy_price, qty=qty, step="B1",
-                )],
-                highest_price=close_price,
-                conviction=conviction,
-                target_qty=target_qty,
-                entry_candle_dt=candle_dt_str,
+            scale_decision = evaluate_scale_in(
+                avg_price=pos.avg_price,
+                current_price=close_price,
+                current_qty=pos.qty,
+                target_qty=pos.target_qty,
+                scale_in_count=pos.scale_in_count,
+                max_scale_in=_scaling.get("max_scale_in", 1),
+                scale_in_drop_pct=_scaling.get("scale_in_drop_pct", 3.0),
             )
-            result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
-                       "message": f"시뮬 매수 체결 @ {buy_price:,.0f}"}
-            buy_reason = "매수 시그널: " + ", ".join(
-                f"{c['indicator']}{c['op']}{c['threshold']} (실제={c['actual']})"
-                for c in conditions.get("buy_conditions", []))
-            _log_decision(session, sym, "BUY", buy_reason,
-                          signal=signal, conditions=conditions, snapshot=snapshot, sizing=sizing)
-            _log_trade(session, sym, "BUY", "B1", qty, buy_price, result,
-                       reason=buy_reason, snapshot=snapshot,
-                       conditions=conditions, sizing=sizing, candle_dt=candle_dt_str)
+            if scale_decision is not None:
+                buy_p = effective_buy_price(close_price, cost)
+                remaining_qty = scale_decision.qty
+                cost_amount = buy_p * remaining_qty
+                # 현금 부족 시 수량 축소
+                if cost_amount > session._cash * 0.95:
+                    remaining_qty = int(session._cash * 0.95 / buy_p)
+                if remaining_qty > 0:
+                    total_cost = buy_p * remaining_qty
+                    session._cash -= total_cost
+                    pos.entries.append(LiveScaleEntry(
+                        date=candle_dt_str, price=buy_p,
+                        qty=remaining_qty, step="B2",
+                    ))
+                    pos.scale_in_count += 1
+                    result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
+                               "message": f"시뮬 추가매수 체결 @ {buy_p:,.0f}"}
+                    _log_decision(session, sym, "SCALE_IN", scale_decision.reason,
+                                  snapshot=snapshot, sizing=scale_decision.sizing)
+                    _log_trade(session, sym, "BUY", "B2", remaining_qty, buy_p, result,
+                               reason=scale_decision.reason,
+                               snapshot=snapshot, candle_dt=candle_dt_str,
+                               sizing=scale_decision.sizing)
+
+        # ── 매수 시그널 (B1 신규 진입) ── decision_logic.evaluate_buy 사용
+        if signal == 1 and sym not in session.positions:
+            from app.trading.decision_logic import evaluate_buy
+
+            buy_price = effective_buy_price(close_price, cost)
+            buy_decision = evaluate_buy(
+                signal=signal,
+                symbol=sym,
+                has_position=False,
+                current_positions=len(session.positions),
+                max_positions=ctx.max_positions,
+                cash=session._cash,
+                initial_capital=ctx.initial_capital,
+                position_size_pct=ctx.position_size_pct,
+                close_price=close_price,
+                buy_price=buy_price,
+                row=row,
+                strategy=strategy,
+                ps_cfg=ps_cfg or {},
+                scaling=scaling if scaling_enabled else None,
+            )
+
+            if buy_decision.action == "SKIP_BUY":
+                _log_decision(session, sym, "SKIP_BUY", buy_decision.reason,
+                              signal=signal, conditions=conditions, snapshot=snapshot,
+                              sizing=buy_decision.sizing)
+                continue
+
+            if buy_decision.action == "BUY":
+                qty = buy_decision.qty
+                total_cost = buy_price * qty
+                buy_reason = "매수 시그널: " + ", ".join(
+                    f"{c['indicator']}{c['op']}{c['threshold']} (실제={c['actual']})"
+                    for c in conditions.get("buy_conditions", []))
+
+                # 지정가 vs 즉시 체결 분기
+                if _cfg.PAPER_USE_LIMIT_ORDERS:
+                    # pending 중 같은 종목 중복 방지
+                    if any(o["symbol"] == sym and o["side"] == "BUY" for o in session.pending_orders):
+                        _log_decision(session, sym, "SKIP_BUY",
+                                      f"이미 지정가 매수 대기 중",
+                                      signal=signal, conditions=conditions, snapshot=snapshot)
+                        continue
+                    session._cash -= total_cost  # 현금 예약
+                    session.pending_orders.append({
+                        "symbol": sym, "side": "BUY",
+                        "price": buy_price, "qty": qty, "step": "B1",
+                        "conviction": buy_decision.conviction,
+                        "target_qty": buy_decision.target_qty,
+                        "created_at": candle_dt_str,
+                        "ttl_bars": _cfg.PAPER_LIMIT_TTL_BARS,
+                        "elapsed_bars": 0,
+                        "reserved_cash": total_cost,
+                        "snapshot": snapshot, "conditions": conditions,
+                        "sizing": buy_decision.sizing,
+                    })
+                    _log_decision(session, sym, "LIMIT_ORDER_PLACED",
+                                  f"지정가 매수 등록: {qty}주 @ {buy_price:,.0f} "
+                                  f"(TTL={_cfg.PAPER_LIMIT_TTL_BARS}봉) — {buy_reason}",
+                                  signal=signal, conditions=conditions, snapshot=snapshot,
+                                  sizing=buy_decision.sizing)
+                else:
+                    # 기존 즉시 체결 로직
+                    session._cash -= total_cost
+                    session.positions[sym] = LivePosition(
+                        symbol=sym,
+                        entries=[LiveScaleEntry(
+                            date=candle_dt_str, price=buy_price, qty=qty, step="B1",
+                        )],
+                        highest_price=close_price,
+                        conviction=buy_decision.conviction,
+                        target_qty=buy_decision.target_qty,
+                        entry_candle_dt=candle_dt_str,
+                    )
+                    result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
+                               "message": f"시뮬 매수 체결 @ {buy_price:,.0f}"}
+                    _log_decision(session, sym, "BUY", buy_reason,
+                                  signal=signal, conditions=conditions, snapshot=snapshot,
+                                  sizing=buy_decision.sizing)
+                    _log_trade(session, sym, "BUY", "B1", qty, buy_price, result,
+                               reason=buy_reason, snapshot=snapshot,
+                               conditions=conditions, sizing=buy_decision.sizing, candle_dt=candle_dt_str)
+                    if _strategy_pipeline is not None:
+                        _strategy_pipeline.record_buy()
 
     # 중복 봉 요약
     if _dup_count > 0:
@@ -1090,18 +1269,44 @@ async def _paper_loop_tick(
                     reason=f"포트폴리오 MDD 서킷브레이커: -{dd:.2f}%",
                 )
             session.status = "stopped"
-            session.stopped_at = datetime.now().isoformat()
+            session.stopped_at = datetime.now(_KST).isoformat()
             session.error_message = f"포트폴리오 MDD 서킷브레이커: -{dd:.2f}%"
             return
 
-    logger.info(
-        "루프 체크 [paper]: cash=%s, positions=%d/%d, trades=%d, decisions=%d",
-        f"{session._cash:,.0f}", len(session.positions), ctx.max_positions,
-        len(session.trade_log), len(session.decision_log),
+    # ── tick 요약 로그 (의사결정 모니터링) ──
+    # decision_log에서 이번 tick의 판단을 집계
+    _tick_decisions = session.decision_log[-len(scan_symbols):]  # 최근 tick 분
+    _buy_sigs = sum(1 for d in _tick_decisions if d.get("action") == "BUY")
+    _sell_sigs = sum(1 for d in _tick_decisions if d.get("action") in ("SELL", "RISK_STOP", "RISK_TRAIL", "RISK_ATR_STOP", "PARTIAL_EXIT"))
+    _skip_buys = sum(1 for d in _tick_decisions if d.get("action") == "SKIP_BUY")
+    _holds = len(sym_frames) - _buy_sigs - _sell_sigs - _skip_buys
+
+    logger.warning(
+        "[tick %s] 봉=%d종목 | BUY %d | SELL %d | SKIP_BUY %d | HOLD %d | 보유 %d/%d | 현금 %s | 매매 %d건",
+        session.id[:8],
+        len(sym_frames),
+        _buy_sigs, _sell_sigs, _skip_buys, max(_holds, 0),
+        len(session.positions), ctx.max_positions,
+        f"{session._cash:,.0f}",
+        len(session.trade_log),
     )
 
+    # tick 요약을 Redis에도 저장 (프론트엔드 모니터링용)
+    _tick_summary = {
+        "last_tick_at": datetime.now(_KST).isoformat(),
+        "bars_count": str(len(sym_frames)),
+        "buy_signals": str(_buy_sigs),
+        "sell_signals": str(_sell_sigs),
+        "skip_buy": str(_skip_buys),
+        "hold_count": str(max(_holds, 0)),
+        "positions": str(len(session.positions)),
+        "max_positions": str(ctx.max_positions),
+        "cash": f"{session._cash:,.0f}",
+        "trade_count": str(len(session.trade_log)),
+    }
+
     # Redis 동기화 (Phase 1: 매 tick마다)
-    await _sync_session_to_redis(session)
+    await _sync_session_to_redis(session, tick_summary=_tick_summary)
 
     # workflow_events에 매매 요약 기록 (내부 로직 관측 — 텔레그램과 독립)
     new_trades = len(session.trade_log) - getattr(session, "_prev_trade_count", 0)
@@ -1134,6 +1339,123 @@ async def _paper_loop_tick(
         "trades": len(session.trade_log),
         "cash": session._cash,
     })
+
+
+def _process_pending_orders(
+    session: LiveSession,
+    row: dict[str, Any],
+    cost: CostConfig,
+    candle_dt_str: str,
+) -> None:
+    """매 봉마다 pending_orders 체결/TTL 만료 확인 (Paper 지정가 시뮬레이션)."""
+    sym = row.get("symbol", "")
+    low = row.get("low", float("inf"))
+    high = row.get("high", 0)
+    close = row.get("close", 0)
+
+    still_pending: list[dict] = []
+    for order in session.pending_orders:
+        if order["symbol"] != sym:
+            still_pending.append(order)
+            continue
+
+        order["elapsed_bars"] = order.get("elapsed_bars", 0) + 1
+
+        if order["side"] == "BUY":
+            if low <= order["price"]:
+                _fill_pending_buy(session, order, candle_dt_str, cost)
+                continue
+            if order["elapsed_bars"] >= order.get("ttl_bars", 2):
+                market_price = effective_buy_price(close, cost)
+                reserved = order.get("reserved_cash", 0)
+                cash_diff = market_price * order["qty"] - reserved
+                if cash_diff > 0 and cash_diff > session._cash:
+                    order["qty"] = int((reserved + session._cash * 0.95) / market_price)
+                if order["qty"] > 0:
+                    session._cash -= max(0, cash_diff)
+                    order["price"] = market_price
+                    _fill_pending_buy(session, order, candle_dt_str, cost)
+                    _log_decision(
+                        session, sym, "LIMIT_EXPIRED_MARKET",
+                        f"매수 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
+                    )
+                else:
+                    session._cash += reserved
+                    _log_decision(
+                        session, sym, "LIMIT_EXPIRED_CANCEL",
+                        f"매수 TTL 만료 + 현금 부족 → 취소 (반환 {reserved:,.0f})",
+                    )
+                continue
+            still_pending.append(order)
+
+        elif order["side"] == "SELL":
+            if high >= order["price"]:
+                _fill_pending_sell(session, order, candle_dt_str, cost)
+                continue
+            if order["elapsed_bars"] >= order.get("ttl_bars", 2):
+                market_price = effective_sell_price(close, cost)
+                order["price"] = market_price
+                _fill_pending_sell(session, order, candle_dt_str, cost)
+                _log_decision(
+                    session, sym, "LIMIT_EXPIRED_MARKET",
+                    f"매도 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
+                )
+                continue
+            still_pending.append(order)
+
+    session.pending_orders = still_pending
+
+
+def _fill_pending_buy(
+    session: LiveSession, order: dict, candle_dt_str: str, cost: CostConfig,
+) -> None:
+    """pending 매수 주문 체결 → 포지션 생성."""
+    sym = order["symbol"]
+    session.positions[sym] = LivePosition(
+        symbol=sym,
+        entries=[LiveScaleEntry(
+            date=candle_dt_str, price=order["price"],
+            qty=order["qty"], step=order.get("step", "B1"),
+        )],
+        highest_price=order["price"],
+        conviction=order.get("conviction", 1.0),
+        target_qty=order.get("target_qty", order["qty"]),
+        entry_candle_dt=candle_dt_str,
+    )
+    result = {"success": True, "order_id": f"SIM-LMT-{uuid.uuid4().hex[:8]}",
+              "message": f"지정가 체결 @ {order['price']:,.0f}"}
+    _log_trade(
+        session, sym, "BUY", order.get("step", "B1"), order["qty"], order["price"], result,
+        reason=f"지정가 매수 체결 (대기 {order.get('elapsed_bars', 0)}봉)",
+        snapshot=order.get("snapshot"), conditions=order.get("conditions"),
+        sizing=order.get("sizing"), candle_dt=candle_dt_str,
+    )
+    if _strategy_pipeline is not None:
+        _strategy_pipeline.record_buy()
+
+
+def _fill_pending_sell(
+    session: LiveSession, order: dict, candle_dt_str: str, cost: CostConfig,
+) -> None:
+    """pending 매도 주문 체결 → 포지션 제거."""
+    sym = order["symbol"]
+    pos = session.positions.get(sym)
+    if not pos:
+        return
+    actual_qty = min(order["qty"], pos.qty)
+    if actual_qty <= 0:
+        return
+    proceeds = order["price"] * actual_qty
+    session._cash += proceeds
+    result = {"success": True, "order_id": f"SIM-LMT-{uuid.uuid4().hex[:8]}",
+              "message": f"지정가 체결 @ {order['price']:,.0f}"}
+    _log_trade(
+        session, sym, "SELL", order.get("step", ""), actual_qty, order["price"], result,
+        reason=f"지정가 매도 체결 (대기 {order.get('elapsed_bars', 0)}봉)",
+        snapshot=order.get("snapshot"), conditions=order.get("conditions"),
+        candle_dt=candle_dt_str, position=pos,
+    )
+    session.positions.pop(sym, None)
 
 
 def _paper_sell(
@@ -1230,7 +1552,7 @@ async def _real_loop_tick(
             pos = session.positions[fsym]
             step = getattr(filled, "meta", {}).get("step", "B1") if hasattr(filled, "meta") else "B1"
             pos.entries.append(LiveScaleEntry(
-                date=datetime.now().isoformat(),
+                date=datetime.now(_KST).isoformat(),
                 price=filled.filled_avg_price,
                 qty=filled.filled_qty,
                 step=step,
@@ -1243,7 +1565,7 @@ async def _real_loop_tick(
             session.positions[fsym] = LivePosition(
                 symbol=fsym,
                 entries=[LiveScaleEntry(
-                    date=datetime.now().isoformat(),
+                    date=datetime.now(_KST).isoformat(),
                     price=filled.filled_avg_price,
                     qty=filled.filled_qty,
                     step=meta.get("step", "B1"),
@@ -1251,7 +1573,7 @@ async def _real_loop_tick(
                 highest_price=filled.filled_avg_price,
                 conviction=meta.get("conviction", 1.0),
                 target_qty=meta.get("target_qty", filled.filled_qty),
-                entry_candle_dt=datetime.now().isoformat(),
+                entry_candle_dt=datetime.now(_KST).isoformat(),
             )
         elif filled.side == "SELL" and fsym in session.positions:
             pos = session.positions[fsym]
@@ -1329,7 +1651,7 @@ async def _real_loop_tick(
                 logger.warning("서킷브레이커 이벤트 기록 실패: %s", e)
             # 세션 중지
             session.status = "stopped"
-            session.stopped_at = datetime.now().isoformat()
+            session.stopped_at = datetime.now(_KST).isoformat()
             session.error_message = f"포트폴리오 MDD 서킷브레이커 발동: -{portfolio_dd:.2f}%"
             await _clear_session_state(session.id)
             await manager.broadcast("trading:status", {
@@ -1351,14 +1673,14 @@ async def _real_loop_tick(
             elif kis_qty > local_qty:
                 # 외부 매수 발생 — synthetic entry 추가
                 pos.entries.append(LiveScaleEntry(
-                    date=datetime.now().isoformat(),
+                    date=datetime.now(_KST).isoformat(),
                     price=kis_avg, qty=kis_qty - local_qty, step="B-EXT",
                 ))
         else:
             session.positions[sym] = LivePosition(
                 symbol=sym,
                 entries=[LiveScaleEntry(
-                    date=datetime.now().isoformat(),
+                    date=datetime.now(_KST).isoformat(),
                     price=kis_avg, qty=kis_qty, step="B-EXT",
                 )],
                 highest_price=kp.get("current_price", kis_avg),
@@ -1505,6 +1827,18 @@ async def _real_check_signals(
         snapshot = _collect_snapshot(last_row)
         conditions = _collect_conditions_detail(last_row, strategy, signal)
 
+        # ── 전략 파이프라인 필터 (매수 시그널만 필터링) ──
+        if signal == 1 and _strategy_pipeline is not None:
+            filt = _strategy_pipeline.evaluate(signal, last_row, ctx)
+            if filt.get("skip"):
+                _log_decision(
+                    session, sym, "SKIP_STRATEGY_FILTER",
+                    filt.get("reason", "전략 필터 거부"),
+                    signal=signal, snapshot=snapshot,
+                    risk={"filter": filt.get("filter", "unknown")},
+                )
+                continue
+
         # ATR 캐시 (real 모드 리스크 체크에서 사용)
         atr_val = last_row.get("atr_14", 0) or 0
         if atr_val > 0:
@@ -1623,6 +1957,8 @@ async def _real_check_signals(
                        reason="매수 시그널", snapshot=snapshot, conditions=conditions,
                        sizing={"conviction": round(conviction, 4), "initial_pct": initial_pct,
                                "target_qty": target_qty, "scaling_enabled": scaling_enabled})
+            if managed and _strategy_pipeline is not None:
+                _strategy_pipeline.record_buy()
 
 
 # ── 공통 유틸 ────────────────────────────────────────────────
@@ -1699,7 +2035,7 @@ def _log_trade(
                 pass
 
     # 타임스탬프: 캔들 dt가 있으면 캔들 시각, 없으면 현재 시각
-    ts = candle_dt if candle_dt else datetime.now().isoformat()
+    ts = candle_dt if candle_dt else datetime.now(_KST).isoformat()
 
     entry = {
         "symbol": symbol,
@@ -1788,10 +2124,11 @@ async def _persist_trade(context_id: str, entry: dict) -> None:
 async def _send_trade_telegram(entry: dict) -> None:
     """매매 체결 텔레그램 알림 (fire-and-forget)."""
     try:
+        import html as _html
         from app.telegram.bot import send_message
 
         symbol = entry.get("symbol", "")
-        name = entry.get("name", symbol)
+        name = _html.escape(entry.get("name", symbol))
         side = entry.get("side", "")
         step = entry.get("step", "")
         qty = entry.get("qty", 0)
@@ -1817,7 +2154,7 @@ async def _send_trade_telegram(entry: dict) -> None:
                     msg += f" (현금 {cash_before:,.0f} \u2192 {cash_after:,.0f})"
                 msg += "\n"
             if reason:
-                msg += f"  사유: {reason[:80]}\n"
+                msg += f"  사유: {_html.escape(reason[:80])}\n"
             msg += f"  시각: {ts[:19]}"
 
         elif side == "SELL":
@@ -1856,7 +2193,7 @@ async def _send_trade_telegram(entry: dict) -> None:
                 else:
                     msg += f"  보유: {int(holding)}분\n"
             if reason:
-                msg += f"  사유: {reason[:80]}\n"
+                msg += f"  사유: {_html.escape(reason[:80])}\n"
             msg += f"  시각: {ts[:19]}"
         else:
             return
