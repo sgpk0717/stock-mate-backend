@@ -163,6 +163,58 @@ async def main() -> None:
         except Exception as e:
             logger.warning("인과 검증 스케줄러 실패: %s", e)
 
+    # 알파 스코어 엔진 (실시간 랭킹)
+    if settings.WORKFLOW_ENABLED:
+        try:
+            from app.trading.alpha_score_engine import start_score_engine_loop
+
+            # 현재 활성 팩터 설정 로드
+            async def _load_and_start_score_engine() -> None:
+                from app.core.database import async_session
+                from sqlalchemy import text
+                import json
+
+                factor_configs = []
+                async with async_session() as db:
+                    # 활성 세션의 팩터 수식 로드
+                    r = await db.execute(text(
+                        "SELECT strategy::text FROM trading_contexts "
+                        "WHERE status = 'active' AND strategy IS NOT NULL "
+                        "ORDER BY created_at DESC LIMIT 10"
+                    ))
+                    for row in r.fetchall():
+                        try:
+                            s = json.loads(row[0])
+                            fid = s.get("factor_id")
+                            expr = s.get("expression_str")
+                            if fid and expr:
+                                factor_configs.append({"id": fid, "expression_str": expr})
+                        except Exception:
+                            pass
+
+                if not factor_configs:
+                    logger.info("알파 스코어 엔진: 활성 팩터 없음 — 대기")
+                    return
+
+                # 유니버스 로드
+                try:
+                    from app.alpha.universe import resolve_universe, Universe
+                    symbols = await resolve_universe(Universe("KOSPI200"))
+                except Exception:
+                    from app.core.stock_master import get_all_stocks
+                    symbols = [s["symbol"] for s in get_all_stocks()[:200]]
+
+                logger.info(
+                    "알파 스코어 엔진 시작: %d종목, %d팩터",
+                    len(symbols), len(factor_configs),
+                )
+                await start_score_engine_loop(symbols, factor_configs, interval_seconds=300)
+
+            tasks.append(asyncio.create_task(_load_and_start_score_engine()))
+            logger.info("알파 스코어 엔진 태스크 등록")
+        except Exception as e:
+            logger.warning("알파 스코어 엔진 시작 실패: %s", e)
+
     # 일일 배치 스케줄러
     if settings.DAILY_SCHEDULER_ENABLED:
         try:
@@ -172,6 +224,15 @@ async def main() -> None:
             logger.info("일일 배치 스케줄러 시작")
         except Exception as e:
             logger.warning("일일 스케줄러 실패: %s", e)
+
+    # 수동 수집 러너 (Redis 명령 소비자)
+    try:
+        from app.scheduler.manual_runner import get_manual_runner
+        runner = get_manual_runner()
+        tasks.append(asyncio.create_task(runner.start_command_consumer()))
+        logger.info("수동 수집 명령 소비자 시작")
+    except Exception as e:
+        logger.warning("수동 수집 러너 실패: %s", e)
 
     logger.info("=== Worker 실행 중 (tasks=%d) ===", len(tasks))
 

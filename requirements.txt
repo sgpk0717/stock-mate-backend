@@ -28,3 +28,5 @@ apscheduler>=4.0.0a5
 psutil>=5.9.0
 opendartreader>=0.2.0
 google-genai>=1.0.0
+numba>=0.59.0
+vectorbt>=0.26.0

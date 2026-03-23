@@ -14,6 +14,47 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+async def _start_redis_ws_bridge() -> None:
+    """Redis Pub/Sub → WebSocket 브릿지.
+
+    Worker 컨테이너의 broadcast가 Redis에 발행한 메시지를
+    API의 WebSocket 매니저로 재전달. (서비스 분리 후 WS 이벤트 전달용)
+    """
+    import json
+    try:
+        from app.core.redis import get_client
+        from app.services.ws_manager import manager
+
+        r = get_client()
+        pubsub = r.pubsub()
+        # 주요 WS 채널 구독
+        await pubsub.subscribe(
+            "ws:alpha:factory",
+            "ws:trading:status",
+            "ws:trading:update",
+        )
+        logger.info("Redis→WS 브릿지 시작 (alpha:factory, trading:*)")
+
+        async for msg in pubsub.listen():
+            if msg["type"] != "message":
+                continue
+            try:
+                channel = msg["channel"]
+                if isinstance(channel, bytes):
+                    channel = channel.decode()
+                # "ws:alpha:factory" → "alpha:factory"
+                ws_channel = channel.removeprefix("ws:")
+                data = json.loads(msg["data"])
+                # 로컬 WS에만 전달 (Redis 재발행 안 함 — 무한 루프 방지)
+                await manager._broadcast_local(ws_channel, data)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning("Redis→WS 브릿지 실패: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: load stock master cache from DB
@@ -169,6 +210,10 @@ async def lifespan(app: FastAPI):
     from app.telegram.bot import start_bot as start_telegram_bot
     await start_telegram_bot()
 
+    # Redis→WS 브릿지 (Worker의 broadcast를 API의 WebSocket으로 재전달)
+    if settings.WORKER_MODE == "external":
+        asyncio.create_task(_start_redis_ws_bridge())
+
     yield
 
     # Shutdown
@@ -281,6 +326,9 @@ app.include_router(system.router)
 
 from app.routers import sim_replay
 app.include_router(sim_replay.router)
+
+from app.routers import hooks
+app.include_router(hooks.router)
 
 
 @app.get("/")

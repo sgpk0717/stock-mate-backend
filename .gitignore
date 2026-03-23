@@ -76,6 +76,7 @@ data/
 !package-lock.json
 !tsconfig.json
 !components.json
+!docs/mining_improvements.json
 
 # PDF docs
 *.pdf
