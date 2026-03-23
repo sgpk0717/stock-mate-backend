@@ -23,6 +23,7 @@ from app.alpha.schemas import (
     AlphaMineResponse,
     AlphaMiningRunResponse,
     AlphaMiningRunSummary,
+    AutoOptimizeRequest,
     CompositeFactorBuildRequest,
     CompositeFactorResponse,
     CorrelationRequest,
@@ -196,6 +197,8 @@ async def list_factors(
     min_ic: float | None = None,
     causal_robust: bool | None = None,
     interval: str | None = None,
+    factor_type: str | None = None,
+    search: str | None = None,
     sort_by: str = "ic_mean",
     order: str = "desc",
     offset: int = 0,
@@ -232,6 +235,14 @@ async def list_factors(
         filters.append(AlphaFactor.causal_robust == causal_robust)
     if interval:
         filters.append(AlphaFactor.interval == interval)
+    if factor_type:
+        filters.append(AlphaFactor.factor_type == factor_type)
+    if search:
+        like_pat = f"%{search}%"
+        filters.append(
+            AlphaFactor.expression_str.ilike(like_pat)
+            | AlphaFactor.name.ilike(like_pat)
+        )
 
     # 전체 개수 (ORDER BY 없이 — 정렬은 COUNT에 불필요)
     count_q = select(func.count()).select_from(AlphaFactor)
@@ -421,6 +432,9 @@ async def backtest_with_factor(
             interval=bt_interval,
             stop_loss_pct=data.stop_loss_pct,
             max_drawdown_pct=data.max_drawdown_pct,
+            eod_liquidation=data.eod_liquidation,
+            skip_opening_minutes=data.skip_opening_minutes,
+            engine=data.engine,
         )
     )
 
@@ -518,10 +532,18 @@ async def get_validation_status(job_id: str):
 
 @router.post("/factory/start", response_model=AlphaFactoryStatusResponse)
 async def start_factory(data: AlphaFactoryStartRequest):
-    """알파 팩토리 시작."""
+    """알파 팩토리 시작. data_interval별 독립 인스턴스."""
     from app.alpha.factory_client import get_factory_client
+    from app.core.redis import get_client as get_redis
 
-    client = get_factory_client()
+    # Redis 플래그 해제 — 와치독 재시작 허용
+    try:
+        redis = get_redis()
+        await redis.delete("alpha:factory:user_stopped")
+    except Exception:
+        pass
+
+    client = get_factory_client(interval=data.data_interval)
     result = await client.start(
         context=data.context,
         universe=data.universe,
@@ -537,33 +559,65 @@ async def start_factory(data: AlphaFactoryStartRequest):
     )
 
     if not result["started"]:
-        raise HTTPException(409, "팩토리가 이미 실행 중입니다")
+        raise HTTPException(409, f"팩토리({data.data_interval})가 이미 실행 중입니다")
 
     return AlphaFactoryStatusResponse(**result["status"])
 
 
 @router.post("/factory/stop", response_model=AlphaFactoryStatusResponse)
-async def stop_factory():
-    """알파 팩토리 중지."""
+async def stop_factory(interval: str = "5m"):
+    """알파 팩토리 중지. interval별. Redis 플래그로 와치독 재시작도 방지."""
     from app.alpha.factory_client import get_factory_client
+    from app.core.redis import get_client as get_redis
 
-    client = get_factory_client()
+    # Redis 플래그 설정 — 와치독이 재시작하지 않도록
+    try:
+        redis = get_redis()
+        await redis.set("alpha:factory:user_stopped", "true")
+    except Exception:
+        pass
+
+    client = get_factory_client(interval=interval)
     result = await client.stop()
 
-    if not result["stopped"]:
-        raise HTTPException(409, "팩토리가 실행 중이 아닙니다")
+    # ExternalFactoryClient는 DB에 명령만 넣으므로, DB 상태도 직접 업데이트
+    try:
+        from app.core.database import async_session
+        from app.models.base import WorkerState
+        from sqlalchemy import update as sa_update
 
-    return AlphaFactoryStatusResponse(**result["status"])
+        async with async_session() as db:
+            await db.execute(
+                sa_update(WorkerState).where(WorkerState.id == 1).values(
+                    factory_status={"running": False, "user_stopped": True}
+                )
+            )
+            await db.commit()
+    except Exception:
+        pass
+
+    return AlphaFactoryStatusResponse(**{**result["status"], "running": False, "user_stopped": True})
 
 
 @router.get("/factory/status", response_model=AlphaFactoryStatusResponse)
-async def get_factory_status():
-    """알파 팩토리 상태 조회."""
+async def get_factory_status(interval: str = "5m"):
+    """알파 팩토리 상태 조회. interval별."""
     from app.alpha.factory_client import get_factory_client
 
-    client = get_factory_client()
+    client = get_factory_client(interval=interval)
     status = await client.get_status()
     return AlphaFactoryStatusResponse(**status)
+
+
+@router.get("/factory/status/all")
+async def get_all_factory_status():
+    """모든 인터벌의 팩토리 상태 조회."""
+    from app.alpha.scheduler import get_all_schedulers
+
+    result = {}
+    for interval, scheduler in get_all_schedulers().items():
+        result[interval] = scheduler.get_status()
+    return result
 
 
 # ── Phase 3: 팩터 포트폴리오 ──
@@ -631,6 +685,158 @@ async def get_correlation(
         raise HTTPException(400, str(e))
 
     return CorrelationMatrixResponse(**result)
+
+
+@router.post("/portfolio/auto-optimize", status_code=202)
+async def auto_optimize(
+    data: AutoOptimizeRequest,
+):
+    """자동 최적 복합 팩터 조합 (비동기).
+
+    즉시 job_id를 반환하고 백그라운드에서 실행.
+    GET /alpha/portfolio/auto-optimize/{job_id} 로 상태 폴링.
+    """
+    import json as _json
+    from app.core.redis import get_client as get_redis
+
+    job_id = uuid.uuid4().hex[:16]
+    redis_key = f"alpha:optimize:{job_id}"
+
+    # Redis에 PENDING 상태 초기화
+    try:
+        redis = get_redis()
+        await redis.hset(redis_key, mapping={
+            "status": "pending",
+            "logs": "[]",
+            "result": "",
+            "error": "",
+        })
+        await redis.expire(redis_key, 86400)
+    except Exception as e:
+        logger.warning("Redis init failed for optimize job %s: %s", job_id, e)
+
+    asyncio.create_task(_run_auto_optimize(job_id, data))
+
+    return {"job_id": job_id}
+
+
+async def _run_auto_optimize(job_id: str, data: AutoOptimizeRequest) -> None:
+    """백그라운드에서 auto_optimize_composite를 실행하고 결과를 Redis에 저장."""
+    import json as _json
+    from app.alpha.portfolio import auto_optimize_composite
+    from app.core.database import async_session
+    from app.core.redis import get_client as get_redis
+
+    redis_key = f"alpha:optimize:{job_id}"
+
+    try:
+        async with async_session() as db:
+            result = await auto_optimize_composite(
+                db=db,
+                min_ic=data.min_ic,
+                min_turnover=data.min_turnover,
+                max_k=data.max_k,
+                lambda_decorr=data.lambda_decorr,
+                shrinkage_delta=data.shrinkage_delta,
+                interval=data.interval,
+                causal_only=data.causal_only,
+                job_id=job_id,
+            )
+        # 완료 — portfolio.py 내부에서 이미 Redis에 결과 저장됨
+        logger.info("auto_optimize job %s completed: best_k=%d", job_id, result.best_k)
+
+        # best-K 복합 팩터를 DB에 영구 저장
+        best_opt = next((r for r in result.results if r.k == result.best_k), None)
+        if best_opt:
+            try:
+                async with async_session() as db2:
+                    from app.alpha.models import AlphaFactor
+                    composite = AlphaFactor(
+                        name=f"Auto K={best_opt.k} (IC={best_opt.composite_ic:.4f})",
+                        expression_str=best_opt.expression_str,
+                        factor_type="composite",
+                        interval=data.interval or "5m",
+                        ic_mean=best_opt.composite_ic,
+                        icir=best_opt.composite_icir,
+                        sharpe=best_opt.composite_sharpe,
+                        component_ids=best_opt.factor_ids,
+                        causal_robust=True,  # 구성 팩터가 이미 인과 통과 → 복합은 자동 통과
+                    )
+                    db2.add(composite)
+                    await db2.commit()
+                    logger.info("auto_optimize: best composite saved to DB (K=%d, id=%s)", best_opt.k, composite.id)
+            except Exception as e:
+                logger.warning("auto_optimize: DB save failed: %s", e)
+    except ValueError as e:
+        logger.error("auto_optimize job %s ValueError: %s", job_id, e)
+        try:
+            redis = get_redis()
+            await redis.hset(redis_key, mapping={
+                "status": "failed",
+                "error": str(e),
+            })
+            await redis.expire(redis_key, 86400)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("auto_optimize job %s unexpected error: %s", job_id, e)
+        try:
+            redis = get_redis()
+            await redis.hset(redis_key, mapping={
+                "status": "failed",
+                "error": str(e)[:500],
+            })
+            await redis.expire(redis_key, 86400)
+        except Exception:
+            pass
+
+
+@router.get("/portfolio/auto-optimize/{job_id}")
+async def get_auto_optimize_status(job_id: str):
+    """자동 최적 조합 잡 상태 폴링.
+
+    Redis Hash에서 status, result, error, logs를 읽어 반환.
+    status: pending | running | completed | failed
+    """
+    import json as _json
+    from app.core.redis import get_client as get_redis
+
+    redis_key = f"alpha:optimize:{job_id}"
+
+    try:
+        redis = get_redis()
+        raw = await redis.hgetall(redis_key)
+    except Exception as e:
+        logger.warning("Redis read failed for optimize job %s: %s", job_id, e)
+        raise HTTPException(503, "Redis 연결 실패")
+
+    if not raw:
+        raise HTTPException(404, "Optimization job not found")
+
+    status = raw.get("status", "pending")
+    error = raw.get("error", "") or None
+    logs_raw = raw.get("logs", "[]")
+    result_raw = raw.get("result", "")
+
+    # JSON 파싱
+    try:
+        logs = _json.loads(logs_raw) if logs_raw else []
+    except Exception:
+        logs = []
+
+    result = None
+    if result_raw:
+        try:
+            result = _json.loads(result_raw)
+        except Exception:
+            pass
+
+    return {
+        "status": status,
+        "result": result,
+        "error": error,
+        "logs": logs,
+    }
 
 
 # ── 팩터 AI 채팅 ──
@@ -865,3 +1071,23 @@ def _factor_to_response(f: AlphaFactor) -> AlphaFactorResponse:
         created_at=f.created_at.isoformat(),
         updated_at=f.updated_at.isoformat(),
     )
+
+
+# ── 마이닝 개선 히스토리 ──
+
+
+@router.get("/improvement-history")
+async def get_improvement_history():
+    """마이닝 개선 히스토리 JSON 반환."""
+    import json
+    from pathlib import Path
+
+    json_path = Path(__file__).parent.parent.parent / "docs" / "mining_improvements.json"
+    if not json_path.exists():
+        return {"rounds": []}
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        return data
+    except Exception:
+        return {"rounds": []}
