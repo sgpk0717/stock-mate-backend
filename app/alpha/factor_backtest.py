@@ -273,6 +273,36 @@ def _precompute_factor_values(
                 ).alias(zscore_alias)
             )
 
+    # ── Phase 2b: 섹터 횡단면 피처 보정 ──
+    # Phase 1에서 단일 종목 파티션으로 계산된 sector 피처를
+    # 전체 DF에서 올바른 횡단면으로 재계산한다.
+    if "sector_id" in full.columns and "price_change_pct" in full.columns:
+        if "sector_return" in full.columns:
+            full = full.with_columns(
+                pl.col("price_change_pct")
+                .mean()
+                .over(["dt", "sector_id"])
+                .alias("sector_return")
+            )
+        if "sector_rel_strength" in full.columns:
+            full = full.with_columns(
+                (pl.col("price_change_pct") - pl.col("sector_return"))
+                .alias("sector_rel_strength")
+            )
+        if "sector_rank" in full.columns:
+            full = full.with_columns(
+                pl.col("price_change_pct")
+                .rank()
+                .over(["dt", "sector_id"])
+                .truediv(
+                    pl.col("price_change_pct")
+                    .count()
+                    .over(["dt", "sector_id"])
+                    .clip(lower_bound=1)
+                )
+                .alias("sector_rank")
+            )
+
     # ── Phase 3: 팩터 수식 적용 + 횡단면 퍼센타일 랭크 ──
     full = full.with_columns(polars_expr.alias("_raw_factor"))
 
@@ -336,7 +366,7 @@ def _precompute_factor_values(
 
 
 def _get_rebalance_dates(
-    all_dates: list, freq: str
+    all_dates: list, freq: str, skip_opening_minutes: int = 0,
 ) -> list:
     """리밸런싱 날짜/시간 목록 생성.
 
@@ -349,14 +379,22 @@ def _get_rebalance_dates(
         return list(all_dates)
 
     if freq == "daily":
-        # 분봉 데이터: 캘린더 날짜별 첫 바만 리밸런스 (일봉은 그대로 전체)
+        # 분봉 데이터: 캘린더 날짜별 첫 바(또는 skip_opening_minutes 이후) 리밸런스
         result: list = []
-        seen_days: set = set()
+        # skip 적용: 각 날짜의 첫 봉 시각 + skip_opening_minutes 이후 첫 봉
+        day_bars: dict = {}  # date → list[datetime]
         for d in all_dates:
             d_date = d.date() if isinstance(d, datetime) else d
-            if d_date not in seen_days:
-                seen_days.add(d_date)
-                result.append(d)
+            day_bars.setdefault(d_date, []).append(d)
+        for d_date in sorted(day_bars.keys()):
+            bars = day_bars[d_date]
+            if skip_opening_minutes > 0 and isinstance(bars[0], datetime):
+                earliest = bars[0]
+                threshold = earliest + timedelta(minutes=skip_opening_minutes)
+                picked = next((b for b in bars if b >= threshold), bars[-1])
+                result.append(picked)
+            else:
+                result.append(bars[0])
         return result
 
     if freq == "hourly":
@@ -427,6 +465,9 @@ async def run_factor_backtest(
     interval: str = "1d",
     stop_loss_pct: float = 0.0,
     max_drawdown_pct: float = 0.0,
+    eod_liquidation: bool = True,
+    skip_opening_minutes: int = 0,
+    engine: str = "loop",
 ) -> BacktestResult:
     """횡단면 포트폴리오 기반 알파 팩터 백테스트.
 
@@ -521,7 +562,18 @@ async def run_factor_backtest(
             metrics={"error": "시뮬레이션 가능한 거래일이 부족합니다."}
         )
 
-    rebalance_dates_set = set(_get_rebalance_dates(all_dates, rebalance_freq))
+    rebalance_dates_set = set(_get_rebalance_dates(all_dates, rebalance_freq, skip_opening_minutes))
+
+    # EOD 강제 청산용: 각 캘린더 날짜의 마지막 봉 사전 계산
+    eod_bar_set: set = set()
+    if intraday and eod_liquidation:
+        for i in range(len(all_dates) - 1):
+            d_cur = all_dates[i]
+            d_next = all_dates[i + 1]
+            if d_cur.date() != d_next.date():
+                eod_bar_set.add(d_cur)
+        if all_dates:
+            eod_bar_set.add(all_dates[-1])
 
     has_volume = "volume" in factor_df.columns
     has_factor_value = "factor_value" in factor_df.columns
@@ -545,7 +597,43 @@ async def run_factor_backtest(
     if progress_cb:
         await progress_cb(40, 100, "포트폴리오 시뮬레이션 시작")
 
-    # ── 4. 포트폴리오 시뮬레이션 ──
+    # ── VectorBT 엔진 분기 ──
+    if engine == "vectorbt":
+        from app.alpha.factor_backtest_vbt import run_factor_backtest_vbt
+        result = run_factor_backtest_vbt(
+            all_dates=all_dates,
+            date_data=date_data,
+            symbols=loaded_symbols,
+            initial_capital=initial_capital,
+            top_pct=top_pct,
+            max_positions=max_positions,
+            rebalance_dates_set=rebalance_dates_set,
+            eod_bar_set=eod_bar_set,
+            cost_config=cost_config,
+            stop_loss_pct=stop_loss_pct,
+            max_drawdown_pct=max_drawdown_pct,
+            band_threshold=band_threshold,
+            eod_liquidation=eod_liquidation,
+            intraday=intraday,
+            get_stock_name=get_stock_name,
+            interval=interval,
+        )
+        # 추가 메트릭 (engine 공통)
+        result.metrics["backtest_mode"] = "cross_sectional_portfolio"
+        result.metrics["top_pct"] = top_pct
+        result.metrics["max_positions"] = max_positions
+        result.metrics["rebalance_freq"] = rebalance_freq
+        result.metrics["band_threshold"] = band_threshold
+        result.metrics["stop_loss_pct"] = stop_loss_pct
+        result.metrics["max_drawdown_pct"] = max_drawdown_pct
+        result.metrics["symbols_count"] = len(loaded_symbols)
+        result.metrics["interval"] = interval
+        result.metrics["skip_opening_minutes"] = skip_opening_minutes
+        if progress_cb:
+            await progress_cb(100, 100, "완료")
+        return result
+
+    # ── 4. 포트폴리오 시뮬레이션 (loop 엔진) ──
     cutoff = 1.0 - top_pct  # 예: top_pct=0.2 → cutoff=0.8
 
     cash = initial_capital
@@ -560,9 +648,13 @@ async def run_factor_backtest(
     total_sells = 0
     rebalance_count = 0
     stop_loss_count = 0
+    eod_close_count = 0
+    total_band_trades_saved = 0
     circuit_breaker_triggered = False
     peak_equity = initial_capital
     prev_day_data: dict[str, dict] | None = None  # T-1 시그널용
+    _accumulating_day_data: dict[str, dict] = {}  # 당일 봉 누적 (종목별 최신)
+    _current_calendar_day = None
 
     for day_idx, current_date in enumerate(all_dates):
         today = date_data.get(current_date, {})
@@ -725,6 +817,11 @@ async def run_factor_backtest(
                     target_symbols.add(sym)
 
             # 리밸런싱: 보유 종목 유지/퇴출 결정 (전일 factor_rank 기준)
+            # band_threshold > 0: 기존 보유 종목은 rank가 exit_rank_threshold 미만일 때만 매도
+            # (핑퐁 방지: 상위 20% 진입 → threshold 미만 이탈 시에만 퇴출)
+            exit_rank_threshold = (1.0 - top_pct) * (1.0 - band_threshold) if band_threshold > 0 else None
+            band_trades_saved = 0
+
             sell_list: list[str] = []
             for sym in list(holdings.keys()):
                 if sym not in prev_day_data:
@@ -734,6 +831,12 @@ async def run_factor_backtest(
                 if sym not in today:
                     continue
                 if sym not in target_symbols:
+                    # band 적용: rank가 exit_rank_threshold 이상이면 유지
+                    if exit_rank_threshold is not None:
+                        sym_rank = prev_day_data[sym].get("factor_rank", 0)
+                        if sym_rank >= exit_rank_threshold:
+                            band_trades_saved += 1
+                            continue
                     sell_list.append(sym)
 
             # 신규 매수 결정
@@ -866,8 +969,52 @@ async def run_factor_backtest(
 
             if sell_list or buy_list:
                 rebalance_count += 1
+            total_band_trades_saved += band_trades_saved
 
-        prev_day_data = today
+        # ── 장 종료 강제 청산 (장중 단타 원칙) ──
+        if intraday and eod_liquidation and current_date in eod_bar_set and holdings and not circuit_breaker_triggered:
+            for sym in list(holdings.keys()):
+                pos = holdings.pop(sym)
+                price = today.get(sym, {}).get("close", pos.get("last_close", pos["avg_price"]))
+                _sv_eod = today.get(sym, {}).get("volume", 0) if has_volume else 0
+                sell_price = effective_sell_price(price, cost_config, order_qty=pos["qty"], bar_volume=_sv_eod)
+                pnl = (sell_price - pos["avg_price"]) * pos["qty"]
+                pnl_pct = (sell_price / pos["avg_price"] - 1) * 100 if pos["avg_price"] > 0 else 0
+                holding_days = _calc_holding_days(current_date, pos["entry_date"], intraday)
+                cash += sell_price * pos["qty"]
+                dt_str = _dt_to_str(current_date)
+                trades.append(Trade(
+                    symbol=sym,
+                    name=get_stock_name(sym),
+                    entry_date=_dt_to_str(pos["entry_date"]),
+                    entry_price=pos["avg_price"],
+                    exit_date=dt_str,
+                    exit_price=sell_price,
+                    qty=pos["qty"],
+                    pnl=pnl,
+                    pnl_pct=pnl_pct,
+                    holding_days=holding_days,
+                    scale_step="S-EOD",
+                    exit_reason="장 종료 강제 청산",
+                    entry_reason=_make_entry_reason(pos),
+                    exit_reason_detail=_make_exit_reason_detail(
+                        "장중 단타 원칙: 장 마감 시 전량 청산",
+                        pos,
+                    ),
+                    entry_snapshot=_make_entry_snapshot(pos),
+                    exit_snapshot=_make_exit_snapshot(pos, today.get(sym)),
+                ))
+                total_sells += 1
+                eod_close_count += 1
+
+        # prev_day_data 누적: 장후 시간외(15:35) 봉에 7종목만 있어도
+        # 정규 장중(09:00~15:30) 전체 종목 데이터가 유지되도록 한다.
+        current_cal_day = current_date.date() if isinstance(current_date, datetime) else current_date
+        if _current_calendar_day is not None and current_cal_day != _current_calendar_day:
+            prev_day_data = _accumulating_day_data
+            _accumulating_day_data = {}
+        _current_calendar_day = current_cal_day
+        _accumulating_day_data.update(today)
 
         # ── 포트폴리오 평가 ──
         portfolio_value = cash
@@ -930,6 +1077,7 @@ async def run_factor_backtest(
     metrics = compute_metrics(
         trades, equity_curve, initial_capital,
         annualize=bars_per_year(interval),
+        intraday=intraday,
     )
 
     # 추가 메트릭
@@ -937,6 +1085,9 @@ async def run_factor_backtest(
     metrics["total_sells"] = total_sells
     metrics["rebalance_count"] = rebalance_count
     metrics["stop_loss_count"] = stop_loss_count
+    metrics["eod_close_count"] = eod_close_count
+    metrics["eod_liquidation"] = eod_liquidation and intraday
+    metrics["band_trades_saved"] = total_band_trades_saved
     metrics["circuit_breaker_triggered"] = circuit_breaker_triggered
     metrics["backtest_mode"] = "cross_sectional_portfolio"
     metrics["top_pct"] = top_pct
@@ -947,6 +1098,62 @@ async def run_factor_backtest(
     metrics["max_drawdown_pct"] = max_drawdown_pct
     metrics["symbols_count"] = len(loaded_symbols)
     metrics["interval"] = interval
+    metrics["skip_opening_minutes"] = skip_opening_minutes
+    metrics["engine"] = "loop"
+
+    # ── 장중 전용 메트릭 (4-B, 4-C, 4-D) ──
+    if intraday and equity_curve:
+        # 4-B: 시간대별 수익률 분해
+        pnl_by_session = {"morning": 0.0, "midday": 0.0, "afternoon": 0.0}
+        for t in trades:
+            if not t.exit_date:
+                continue
+            try:
+                exit_dt = datetime.fromisoformat(t.exit_date)
+                hour = exit_dt.hour
+                if hour < 10:
+                    pnl_by_session["morning"] += t.pnl
+                elif hour < 14:
+                    pnl_by_session["midday"] += t.pnl
+                else:
+                    pnl_by_session["afternoon"] += t.pnl
+            except (ValueError, AttributeError):
+                pass
+        metrics["pnl_by_session"] = {
+            k: round(v) for k, v in pnl_by_session.items()
+        }
+
+        # 4-C: 장중 MDD (일별 봉간 고점-저점)
+        day_intraday_mdds: list[float] = []
+        day_equities: dict[str, list[float]] = {}
+        for pt in equity_curve:
+            d = pt["date"][:10]
+            day_equities.setdefault(d, []).append(pt["equity"])
+        for d_key in sorted(day_equities.keys()):
+            eqs = day_equities[d_key]
+            peak = eqs[0]
+            worst_dd = 0.0
+            for eq in eqs:
+                if eq > peak:
+                    peak = eq
+                dd = (peak - eq) / peak * 100 if peak > 0 else 0
+                worst_dd = max(worst_dd, dd)
+            day_intraday_mdds.append(worst_dd)
+        metrics["intraday_mdd_avg"] = round(sum(day_intraday_mdds) / max(len(day_intraday_mdds), 1), 2)
+        metrics["intraday_mdd_worst"] = round(max(day_intraday_mdds) if day_intraday_mdds else 0, 2)
+
+        # 4-D: Gross vs Net 수익률
+        gross_pnl = sum(abs(t.pnl_pct) * (1 if t.pnl > 0 else -1) for t in trades if t.exit_date)
+        net_pnl = metrics.get("total_return", 0)
+        metrics["total_return_gross"] = round(net_pnl, 2)  # 현재 이미 비용 포함
+        # 거래 비용 추정: 총 매수/매도 × 비용율
+        total_traded_value = sum(
+            t.entry_price * t.qty + (t.exit_price or t.entry_price) * t.qty
+            for t in trades if t.exit_date
+        )
+        estimated_cost = total_traded_value * (cost_config.buy_commission + cost_config.sell_commission + cost_config.slippage_pct * 2)
+        cost_drag_pct = estimated_cost / initial_capital * 100 if initial_capital > 0 else 0
+        metrics["cost_drag_pct"] = round(cost_drag_pct, 2)
 
     if progress_cb:
         await progress_cb(100, 100, "완료")
@@ -973,6 +1180,9 @@ async def execute_factor_backtest(
     interval: str = "1d",
     stop_loss_pct: float = 0.0,
     max_drawdown_pct: float = 0.0,
+    eod_liquidation: bool = True,
+    skip_opening_minutes: int = 0,
+    engine: str = "loop",
 ) -> None:
     """DB 래퍼: BacktestRun에 결과를 저장한다."""
     channel = f"backtest:{run_id}"
@@ -1019,6 +1229,9 @@ async def execute_factor_backtest(
             interval=interval,
             stop_loss_pct=stop_loss_pct,
             max_drawdown_pct=max_drawdown_pct,
+            eod_liquidation=eod_liquidation,
+            skip_opening_minutes=skip_opening_minutes,
+            engine=engine,
         )
 
         if "error" in result.metrics:

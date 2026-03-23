@@ -46,24 +46,27 @@ class FactoryClient(ABC):
 class InlineFactoryClient(FactoryClient):
     """기존 동작: API 프로세스 내에서 직접 실행."""
 
+    def __init__(self, interval: str = "5m") -> None:
+        self._interval = interval
+
     async def start(self, **kwargs) -> dict:
         from app.alpha.scheduler import get_scheduler
 
-        scheduler = get_scheduler()
+        scheduler = get_scheduler(self._interval)
         started = await scheduler.start(**kwargs)
         return {"started": started, "status": scheduler.get_status()}
 
     async def stop(self) -> dict:
         from app.alpha.scheduler import get_scheduler
 
-        scheduler = get_scheduler()
+        scheduler = get_scheduler(self._interval)
         stopped = await scheduler.stop()
         return {"stopped": stopped, "status": scheduler.get_status()}
 
     async def get_status(self) -> dict:
         from app.alpha.scheduler import get_scheduler
 
-        return get_scheduler().get_status()
+        return get_scheduler(self._interval).get_status()
 
     async def start_validation_batch(self, factor_ids: list, job_id: str, total: int) -> None:
         from app.alpha.causal_runner import start_validation_job, validate_factors_by_ids
@@ -201,8 +204,8 @@ class ExternalFactoryClient(FactoryClient):
         return {"job_id": latest_id, **jobs[latest_id]}
 
 
-def get_factory_client() -> FactoryClient:
-    """WORKER_MODE에 따라 적절한 클라이언트 반환."""
+def get_factory_client(interval: str = "5m") -> FactoryClient:
+    """WORKER_MODE에 따라 적절한 클라이언트 반환. interval별 독립 인스턴스."""
     if settings.WORKER_MODE == "external":
         return ExternalFactoryClient()
-    return InlineFactoryClient()
+    return InlineFactoryClient(interval=interval)

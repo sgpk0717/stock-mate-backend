@@ -432,6 +432,7 @@ async def process_message(
             system=system_prompt,
             tools=TOOLS,
             messages=api_messages,
+            caller="alpha.factor_chat",
         )
 
         assistant_text = ""

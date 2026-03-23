@@ -113,23 +113,12 @@ class EvolutionEngine:
         )
         factors = list(result.scalars().all())
 
-        # 엘리트 아카이브: validated 팩터 중 비활성 상태인 것을 랜덤 샘플링
-        archive_size = max(5, int(self._population_size * 0.15))
-        archive_result = await self._db.execute(
-            select(AlphaFactor).where(
-                AlphaFactor.status == "validated",
-                AlphaFactor.population_active == False,  # noqa: E712
-            ).order_by(func.random()).limit(archive_size)
+        # MAP-Elites 행동 아카이브: 8 family × 4 complexity = 32셀 그리드
+        # 각 셀의 최고 fitness 팩터를 로드하고, 활성 모집단에서 과소 대표된 패밀리 우선 선택
+        archive_injected = await self._load_map_elites_archive(
+            existing_ids={f.id for f in factors},
+            active_factors=factors,
         )
-        archive_factors = list(archive_result.scalars().all())
-
-        existing_ids = {f.id for f in factors}
-        archive_injected = [f for f in archive_factors if f.id not in existing_ids]
-        if archive_injected:
-            logger.info(
-                "Elite archive: injecting %d validated factors into population",
-                len(archive_injected),
-            )
 
         population: list[ScoredFactor] = []
         for f in factors:
@@ -152,19 +141,26 @@ class EvolutionEngine:
                     tree_size=f.tree_size or 0,
                     expression_hash=f.expression_hash or "",
                     operator_origin=f.operator_origin or "",
+                    genotypic_age=f.genotypic_age if hasattr(f, "genotypic_age") else 0,
                 ))
             except (ASTConversionError, Exception) as e:
                 logger.debug("Skipping unparseable factor %s: %s", f.id, e)
 
-        # 아카이브 팩터: fitness를 모집단 중앙값으로 리셋 (다른 유니버스 stale fitness 방지)
-        median_fitness = 0.0
+        # 아카이브 팩터: 감쇄 적합도 공식 (기존 중앙값 리셋 대체)
+        # f_reinjected = f_archived × exp(-λ × age_gens), floor = 25th percentile
+        fitness_floor = 0.0
         if population:
             sorted_fitness = sorted(f.fitness_composite for f in population)
-            median_fitness = sorted_fitness[len(sorted_fitness) // 2]
+            fitness_floor = sorted_fitness[len(sorted_fitness) // 4]  # 25th percentile
 
         for f in archive_injected:
             try:
                 expr = parse_expression(f.expression_str)
+                # 감쇄 적합도: 원래 fitness를 세대 경과에 따라 감쇄
+                original_fitness = f.fitness_composite or 0.0
+                age_gens = max(0, self._generation - (f.birth_generation or 0))
+                decay = math.exp(-0.05 * age_gens)  # λ=0.05
+                decayed_fitness = max(fitness_floor, original_fitness * decay)
                 population.append(ScoredFactor(
                     expression=expr,
                     expression_str=f.expression_str,
@@ -177,11 +173,12 @@ class EvolutionEngine:
                     max_drawdown=f.max_drawdown or 0.0,
                     generation=f.birth_generation or 0,
                     factor_id=str(f.id),
-                    fitness_composite=median_fitness,  # 중앙값으로 리셋
+                    fitness_composite=decayed_fitness,
                     tree_depth=f.tree_depth or 0,
                     tree_size=f.tree_size or 0,
                     expression_hash=f.expression_hash or "",
                     operator_origin=f.operator_origin or "archive",
+                    genotypic_age=0,  # AFPO: 아카이브 재주입 = 새 유전자 취급
                 ))
             except (ASTConversionError, Exception) as e:
                 logger.debug("Skipping archive factor %s: %s", f.id, e)
@@ -229,19 +226,39 @@ class EvolutionEngine:
         logger.info("세대 %d: 엘리트 %d개 선택, Train/Val 분할 시작", self._generation, len(elites))
 
         # 2b. 수렴 감지 → LLM 재시드 주입
+        self._diversity_injection_needed = False  # Phase 3 후 시드 주입 플래그
         if len(population) >= 10:
             from collections import Counter as _Counter
+
+            # 조건 1 (기존): 단일 피처가 top 10 중 8개 이상
             _feat_counts = _Counter()
             _top10 = sorted(population, key=lambda x: x.fitness_composite, reverse=True)[:10]
             for _f in _top10:
                 for _sym in _f.expression.free_symbols:
                     _feat_counts[str(_sym)] += 1
             _dominant = _feat_counts.most_common(1)
-            if _dominant and _dominant[0][1] >= 8:
+            _feat_converged = _dominant and _dominant[0][1] >= 8
+
+            # 조건 2 (신규): 니치 분포에서 하나의 패밀리가 60% 이상
+            from app.alpha.ast_converter import classify_niche as _classify
+            _niche_counts = _Counter(_classify(f.expression) for f in population)
+            _max_niche_pct = max(_niche_counts.values()) / len(population) if population else 0
+            _niche_converged = _max_niche_pct >= 0.6
+
+            if _feat_converged or _niche_converged:
+                _reason = []
+                if _feat_converged:
+                    _reason.append(f"피처 '{_dominant[0][0]}' top10 중 {_dominant[0][1]}개")
+                if _niche_converged:
+                    _top_niche = _niche_counts.most_common(1)[0]
+                    _reason.append(f"니치 '{_top_niche[0]}' {_max_niche_pct:.0%}")
                 logger.warning(
-                    "세대 %d: 모집단 수렴 감지 — '%s' 상위 10개 중 %d개. LLM 시드 주입 시도.",
-                    self._generation, _dominant[0][0], _dominant[0][1],
+                    "세대 %d: 수렴 감지 — %s. LLM 시드 + 다양성 시드 주입.",
+                    self._generation, " / ".join(_reason),
                 )
+                self._diversity_injection_needed = True
+
+                # 기존 LLM 시드 주입 (5개)
                 _injected = 0
                 for _ in range(5):
                     try:
@@ -306,7 +323,15 @@ class EvolutionEngine:
             parent_ids = [parent.factor_id] if parent.factor_id else []
 
             if op_name.startswith("llm_"):
-                coro = self._llm_seed() if op_name == "llm_seed" else self._llm_mutate(parent)
+                if op_name == "llm_seed":
+                    coro = self._llm_seed()
+                elif op_name == "llm_crossover":
+                    # 시맨틱 교차: 서로 다른 패밀리의 부모 2개 사용
+                    if len(parents) >= 2:
+                        parent_ids = parent_ids + ([parents[1].factor_id] if parents[1].factor_id else [])
+                    coro = self._llm_semantic_crossover(parent, parents[1] if len(parents) >= 2 else parent)
+                else:
+                    coro = self._llm_mutate(parent)
                 llm_coros.append((op_name, parent, parent_ids, coro))
             else:
                 child_expr = self._apply_ast_op(parents, op_name)
@@ -365,10 +390,12 @@ class EvolutionEngine:
                                 )
                                 await asyncio.sleep(wait)
                                 # 코루틴 재생성 (await된 코루틴은 재사용 불가)
-                                active_coro = (
-                                    self._llm_seed() if op_name == "llm_seed"
-                                    else self._llm_mutate(parent)
-                                )
+                                if op_name == "llm_seed":
+                                    active_coro = self._llm_seed()
+                                elif op_name == "llm_crossover":
+                                    active_coro = self._llm_semantic_crossover(parent, parent)
+                                else:
+                                    active_coro = self._llm_mutate(parent)
                                 last_err = e
                             else:
                                 # 파싱/변환 에러: 재시도 의미 없음
@@ -531,9 +558,26 @@ class EvolutionEngine:
                 ],
             })
 
+        # 4.5. 다양성 시드 주입 (수렴 감지 시에만)
+        if getattr(self, '_diversity_injection_needed', False):
+            diversity_seeds = self._make_diversity_seeds(offspring)
+            if diversity_seeds:
+                offspring.extend(diversity_seeds)
+                logger.warning(
+                    "세대 %d: 다양성 시드 %d개 offspring에 주입",
+                    self._generation, len(diversity_seeds),
+                )
+
         # 5. 중복 제거
         all_new = elites + offspring
         all_new = self._deduplicate(all_new)
+
+        # 5.5. 표현형 클러스터 갱신 (10세대마다)
+        if self._generation % 10 == 0 and train_data is not None:
+            try:
+                self._update_phenotypic_clusters(all_new, train_data)
+            except Exception as e:
+                logger.debug("Phenotypic cluster update failed: %s", e)
 
         # 6. 모집단 크기 제한 (niche-based diversity cap)
         final_population = self._niche_cap_trim(all_new, self._population_size)
@@ -603,11 +647,22 @@ class EvolutionEngine:
         new_discovered: list[DiscoveredFactor] = []
         cpcv_candidates: list[ScoredFactor] = []
 
-        _BATCH_SIZE = settings.ALPHA_EVAL_BATCH_SIZE
+        _BATCH_SIZE = getattr(self, "_dynamic_batch_size", settings.ALPHA_EVAL_BATCH_SIZE)
         _is_intraday = is_intraday(self._interval)
         _rtc = default_round_trip_cost(self._interval)
 
         for batch_start in range(0, len(all_children), _BATCH_SIZE):
+            # 동적 배치 사이즈: OOM 발생 시에만 축소, 여유 시 복구
+            try:
+                import psutil
+                mem_pct = psutil.virtual_memory().percent
+                if mem_pct < 60 and _BATCH_SIZE < settings.ALPHA_EVAL_BATCH_SIZE:
+                    old = _BATCH_SIZE
+                    _BATCH_SIZE = min(settings.ALPHA_EVAL_BATCH_SIZE, _BATCH_SIZE + 1)
+                    self._dynamic_batch_size = _BATCH_SIZE
+                    logger.info("메모리 %.0f%% — 배치 크기 %d→%d 복구", mem_pct, old, _BATCH_SIZE)
+            except Exception:
+                pass
             batch = all_children[batch_start:batch_start + _BATCH_SIZE]
 
             # Step 1: 배치 with_columns (유효 식만)
@@ -838,13 +893,18 @@ class EvolutionEngine:
         sorted_pop = sorted(population, key=lambda f: f.fitness_composite, reverse=True)
         return sorted_pop[:n_elite]
 
+    # 표현형 클러스터 캐시 (10세대마다 갱신)
+    _phenotypic_cluster_cache: dict[str, str] | None = None  # expression_hash → cluster_id
+    _phenotypic_cluster_gen: int = -1  # 마지막 갱신 세대
+
     def _niche_cap_trim(
         self, population: list[ScoredFactor], target_size: int,
     ) -> list[ScoredFactor]:
         """니치(피처 패밀리)별 최대 점유율을 적용하여 모집단 크기 제한.
 
         Algorithm:
-        1. 각 팩터를 dominant feature family(니치)로 분류
+        0. 글로벌 상위 엘리트를 사전 분리 — 니치캡 면제
+        1. 니치 분류: 표현형 클러스터 (10세대마다) 또는 구조적 패밀리 (폴백)
         2. fitness 내림차순 정렬
         3. Pass 1: 니치별 max_per_niche까지만 수용, 초과 시 overflow로
         4. Pass 2: 미달 시 overflow에서 보충 (항상 target_size 유지)
@@ -856,14 +916,34 @@ class EvolutionEngine:
 
         max_pct = settings.ALPHA_NICHE_MAX_PCT
         if max_pct >= 1.0:
-            # 비활성화: 기존 fitness 순 트리밍
             population.sort(key=lambda f: f.fitness_composite, reverse=True)
             return population[:target_size]
 
-        max_per_niche = max(2, int(target_size * max_pct))
+        # Step 0: 글로벌 상위 엘리트를 니치캡 면제
+        n_protected = max(1, math.ceil(target_size * self._elite_pct))
+        sorted_all = sorted(population, key=lambda f: f.fitness_composite, reverse=True)
+        protected_elites = sorted_all[:n_protected]
+        protected_ids = {id(f) for f in protected_elites}
+        non_protected = [f for f in population if id(f) not in protected_ids]
+        remaining_target = target_size - len(protected_elites)
 
-        # 니치 분류 + fitness 내림차순 정렬
-        labeled = [(f, classify_niche(f.expression)) for f in population]
+        if remaining_target <= 0:
+            return protected_elites[:target_size]
+
+        max_per_niche = max(2, int(remaining_target * max_pct))
+
+        # Step 1: 니치 분류 — 표현형 클러스터 (10세대마다) 또는 구조적 패밀리
+        use_phenotypic = (
+            self._phenotypic_cluster_cache is not None
+            and len(self._phenotypic_cluster_cache) > 0
+        )
+
+        def _get_niche(factor: ScoredFactor) -> str:
+            if use_phenotypic and factor.expression_hash in self._phenotypic_cluster_cache:
+                return self._phenotypic_cluster_cache[factor.expression_hash]
+            return classify_niche(factor.expression)
+
+        labeled = [(f, _get_niche(f)) for f in non_protected]
         labeled.sort(key=lambda x: x[0].fitness_composite, reverse=True)
 
         # Pass 1: 니치별 캡 적용
@@ -876,29 +956,305 @@ class EvolutionEngine:
             if count < max_per_niche:
                 accepted.append(factor)
                 niche_counts[niche] = count + 1
-                if len(accepted) >= target_size:
+                if len(accepted) >= remaining_target:
                     break
             else:
                 overflow.append(factor)
 
         # Pass 2: 미달분 overflow에서 보충
-        if len(accepted) < target_size:
-            remaining = target_size - len(accepted)
+        if len(accepted) < remaining_target:
+            remaining = remaining_target - len(accepted)
             accepted.extend(overflow[:remaining])
+
+        final_population = protected_elites + accepted
 
         # 니치 분포 로그
         final_dist: dict[str, int] = {}
-        for factor in accepted:
-            n = classify_niche(factor.expression)
-            final_dist[n] = final_dist.get(n, 0) + 1
+        for factor in final_population:
+            final_dist[_get_niche(factor)] = final_dist.get(_get_niche(factor), 0) + 1
 
+        niche_mode = "phenotypic" if use_phenotypic else "structural"
         logger.warning(
-            "Niche cap trim: %d → %d (max_per_niche=%d). Distribution: %s",
-            len(population), len(accepted), max_per_niche,
+            "Niche cap trim (%s): %d → %d (protected=%d, max_per_niche=%d). Distribution: %s",
+            niche_mode,
+            len(population), len(final_population), len(protected_elites), max_per_niche,
             {k: v for k, v in sorted(final_dist.items(), key=lambda x: -x[1])},
         )
 
-        return accepted
+        return final_population
+
+    def _update_phenotypic_clusters(
+        self, population: list[ScoredFactor], data: pl.DataFrame,
+    ) -> None:
+        """10세대마다 호출: 팩터 output 상관 기반 표현형 클러스터링.
+
+        각 팩터의 Polars expression을 데이터에 적용하여 output 벡터를 생성하고,
+        pairwise Pearson 상관으로 거리 행렬을 구성한 뒤 계층적 클러스터링 수행.
+        결과를 _phenotypic_cluster_cache에 캐시.
+        """
+        import numpy as np
+
+        if len(population) < 5:
+            return
+
+        # 1. 각 팩터의 output 벡터 계산 (일별 평균)
+        outputs: list[tuple[ScoredFactor, list[float]]] = []
+        sample_data = data
+        # 메모리 절약: 최근 100일만 샘플링
+        if "dt" in data.columns:
+            dates = data.select("dt").unique().sort("dt")["dt"].to_list()
+            if len(dates) > 100:
+                cutoff = dates[-100]
+                sample_data = data.filter(pl.col("dt") >= cutoff)
+
+        for factor in population:
+            try:
+                pe = sympy_to_polars(factor.expression)
+                col_name = "_pheno_tmp"
+                df = sample_data.with_columns(pe.alias(col_name))
+                # 행별 값 추출 (횡단면 또는 시계열)
+                vals = df[col_name].to_list()
+                # NaN/Inf 제거
+                clean = [float(v) for v in vals if v is not None and not math.isinf(float(v)) and not math.isnan(float(v))]
+                if len(clean) >= 10:
+                    outputs.append((factor, clean))
+            except Exception:
+                continue
+
+        if len(outputs) < 5:
+            logger.debug("Phenotypic clustering skipped: only %d valid outputs", len(outputs))
+            return
+
+        # 2. 길이 통일 (최소 공통 길이)
+        min_len = min(len(o[1]) for o in outputs)
+        matrix = np.array([o[1][:min_len] for o in outputs], dtype=np.float64)
+
+        # 3. Pearson 상관 행렬 → 거리 행렬
+        try:
+            corr = np.corrcoef(matrix)
+            # NaN 처리
+            corr = np.nan_to_num(corr, nan=0.0)
+            dist = 1.0 - np.abs(corr)  # 상관이 높을수록(양/음) 거리 작음
+            np.fill_diagonal(dist, 0.0)
+        except Exception as e:
+            logger.debug("Phenotypic correlation failed: %s", e)
+            return
+
+        # 4. 계층적 클러스터링
+        try:
+            from scipy.cluster.hierarchy import fcluster, linkage
+            from scipy.spatial.distance import squareform
+
+            condensed = squareform(dist, checks=False)
+            Z = linkage(condensed, method="average")
+            # 상관 0.7 이상이면 같은 클러스터 (거리 0.3 이하)
+            labels = fcluster(Z, t=0.3, criterion="distance")
+        except Exception as e:
+            logger.debug("Phenotypic clustering failed: %s", e)
+            return
+
+        # 5. 캐시 저장: expression_hash → "pheno_N"
+        cache: dict[str, str] = {}
+        for i, (factor, _) in enumerate(outputs):
+            cluster_id = f"pheno_{labels[i]}"
+            if factor.expression_hash:
+                cache[factor.expression_hash] = cluster_id
+
+        self._phenotypic_cluster_cache = cache
+        self._phenotypic_cluster_gen = self._generation
+
+        n_clusters = len(set(labels))
+        logger.warning(
+            "Phenotypic clustering: %d factors → %d clusters (gen %d)",
+            len(outputs), n_clusters, self._generation,
+        )
+
+    # ── MAP-Elites 행동 아카이브 ──
+
+    # complexity bin 경계: depth 1-2, 3, 4, 5-6
+    _COMPLEXITY_BINS = [3, 4, 5, 7]  # upper bounds (exclusive)
+
+    async def _load_map_elites_archive(
+        self,
+        existing_ids: set,
+        active_factors: list,
+        max_inject: int = 15,
+    ) -> list:
+        """MAP-Elites 그리드 기반 아카이브 로드.
+
+        8 family × 4 complexity bin = 32셀 그리드.
+        각 셀에 최고 fitness 팩터 1개만 보존.
+        활성 모집단에서 과소 대표된 패밀리의 셀을 우선 선택하여 재주입.
+        """
+        from app.alpha.ast_converter import classify_niche
+
+        # 1. validated + 비활성 팩터 전부 로드
+        archive_result = await self._db.execute(
+            select(AlphaFactor).where(
+                AlphaFactor.status == "validated",
+                AlphaFactor.population_active == False,  # noqa: E712
+            )
+        )
+        all_archived = list(archive_result.scalars().all())
+
+        if not all_archived:
+            return []
+
+        # 2. 그리드 구축: (family, complexity_bin) → 최고 fitness 팩터
+        grid: dict[tuple[str, int], AlphaFactor] = {}
+        for f in all_archived:
+            if f.id in existing_ids:
+                continue
+            # 패밀리 분류 (expression 파싱 없이 DB 필드 활용)
+            try:
+                expr = parse_expression(f.expression_str)
+                family = classify_niche(expr)
+            except Exception:
+                family = "unknown"
+
+            depth = f.tree_depth or 1
+            c_bin = 0
+            for i, upper in enumerate(self._COMPLEXITY_BINS):
+                if depth < upper:
+                    c_bin = i
+                    break
+            else:
+                c_bin = len(self._COMPLEXITY_BINS) - 1
+
+            cell_key = (family, c_bin)
+            current = grid.get(cell_key)
+            if current is None or (f.fitness_composite or 0) > (current.fitness_composite or 0):
+                grid[cell_key] = f
+
+        if not grid:
+            return []
+
+        # 3. 활성 모집단의 패밀리 분포 계산 → 과소 대표 패밀리 우선
+        active_family_counts: dict[str, int] = {}
+        for af in active_factors:
+            try:
+                expr = parse_expression(af.expression_str)
+                fam = classify_niche(expr)
+            except Exception:
+                fam = "unknown"
+            active_family_counts[fam] = active_family_counts.get(fam, 0) + 1
+        total_active = max(len(active_factors), 1)
+
+        # 4. 셀별 가중치: (1 - family_share) × staleness_decay × fitness
+        weighted_cells: list[tuple[float, tuple, AlphaFactor]] = []
+        for cell_key, factor in grid.items():
+            family = cell_key[0]
+            family_share = active_family_counts.get(family, 0) / total_active
+            age_gens = max(0, self._generation - (factor.birth_generation or 0))
+            staleness = math.exp(-0.03 * age_gens)
+            fitness = factor.fitness_composite or 0.0
+            weight = (1.0 - family_share) * staleness * max(fitness, 0.001)
+            weighted_cells.append((weight, cell_key, factor))
+
+        # 가중치 내림차순 정렬 → 상위 max_inject개 선택
+        weighted_cells.sort(key=lambda x: x[0], reverse=True)
+        selected = weighted_cells[:max_inject]
+
+        injected = [f for _, _, f in selected]
+
+        # 5. 로깅: 그리드 상태
+        occupied = len(grid)
+        total_cells = 8 * len(self._COMPLEXITY_BINS)
+        injected_families = {}
+        for _, cell_key, _ in selected:
+            fam = cell_key[0]
+            injected_families[fam] = injected_families.get(fam, 0) + 1
+
+        logger.info(
+            "MAP-Elites archive: grid %d/%d occupied, injecting %d (families: %s)",
+            occupied, total_cells, len(injected),
+            {k: v for k, v in sorted(injected_families.items(), key=lambda x: -x[1])},
+        )
+
+        return injected
+
+    # ── 비volume 다양성 시드 (OHLCV + 기술적 지표 기반만 사용) ──
+    _DIVERSITY_TEMPLATES: dict[str, list[str]] = {
+        "price": [
+            "close / sma_20 - 1",
+            "(close - bb_lower) / (bb_upper - bb_lower + 0.001)",
+            "ema_5 / ema_60 - 1",
+            "(high - low) / close",
+        ],
+        "momentum": [
+            "rsi_7 - rsi_21",
+            "return_5d / (atr_7 + 0.001)",
+            "macd_hist * sign(return_20d)",
+            "return_5d - return_20d",
+        ],
+        "volatility": [
+            "atr_7 / (atr_21 + 0.001)",
+            "atr_14 / (close + 0.001) * 100",
+            "(bb_upper - bb_lower) / (sma_20 + 0.001)",
+        ],
+        "mixed_no_volume": [
+            "rsi / 100 * (close / sma_20 - 1)",
+            "(close - sma_20) / (atr_14 + 0.001)",
+            "price_change_pct / (atr_14 + 0.001)",
+            "macd_hist / (atr_14 + 0.001)",
+            "abs(return_5d) / (atr_7 + 0.001) * rsi_7 / 100",
+        ],
+    }
+
+    def _make_diversity_seeds(
+        self, offspring: list[ScoredFactor],
+    ) -> list[ScoredFactor]:
+        """비volume 다양성 시드 생성. offspring의 중앙 fitness로 삽입.
+
+        OHLCV + 기술적 지표 기반만 사용 (외부 데이터 피처 제외).
+        수렴 감지 시에만 호출됨.
+        """
+        import random as _rand
+
+        # offspring 중앙 fitness
+        if offspring:
+            _sorted = sorted(o.fitness_composite for o in offspring)
+            median_fitness = _sorted[len(_sorted) // 2]
+        else:
+            median_fitness = 0.0
+
+        seeds: list[ScoredFactor] = []
+        all_templates = []
+        for family, tmpls in self._DIVERSITY_TEMPLATES.items():
+            for t in tmpls:
+                all_templates.append((family, t))
+
+        # 셔플 → 최대 15개 시도
+        _rand.shuffle(all_templates)
+        for family, tmpl in all_templates[:15]:
+            try:
+                expr = parse_expression(tmpl)
+                code_str = sympy_to_code_string(expr)
+                depth = calc_tree_depth(expr)
+                size = calc_tree_size(expr)
+
+                seeds.append(ScoredFactor(
+                    expression=expr,
+                    expression_str=code_str,
+                    hypothesis=f"[diversity-seed:{family}]",
+                    ic_mean=0.0,
+                    ic_std=0.0,
+                    icir=0.0,
+                    turnover=0.0,
+                    sharpe=0.0,
+                    max_drawdown=0.0,
+                    generation=self._generation,
+                    fitness_composite=median_fitness,
+                    tree_depth=depth,
+                    tree_size=size,
+                    expression_hash=expression_hash(expr),
+                    operator_origin=f"diversity_seed_{family}",
+                    genotypic_age=0,  # AFPO: 다양성 시드 = 새 유전자
+                ))
+            except Exception as e:
+                logger.debug("Diversity seed '%s' failed: %s", tmpl, e)
+
+        return seeds
 
     def _split_train_val(self) -> tuple[pl.DataFrame, pl.DataFrame | None]:
         """데이터를 Train(70%) / Validation(30%) 분할."""
@@ -1018,6 +1374,7 @@ class EvolutionEngine:
                     tree_size=size,
                     expression_hash=expression_hash(expr),
                     operator_origin="seed",
+                    genotypic_age=0,  # AFPO: 시드 = 새 유전자
                 ))
             except (ASTConversionError, Exception) as e:
                 logger.debug("Seed %s failed: %s", tmpl, e)
@@ -1134,6 +1491,9 @@ class EvolutionEngine:
             delta = fitness - parent.fitness_composite
             self._operator_registry.update(operator_name, delta_fitness=delta)
 
+            # AFPO: LLM 생성 = 새 유전자(age=0), AST 변이 = 부모 age + 1
+            child_age = 0 if operator_name.startswith("llm_") else parent.genotypic_age + 1
+
             return ScoredFactor(
                 expression=child_expr,
                 expression_str=str(child_expr),
@@ -1151,6 +1511,7 @@ class EvolutionEngine:
                 tree_size=size,
                 expression_hash=expression_hash(child_expr),
                 operator_origin=operator_name,
+                genotypic_age=child_age,
             )
 
         except (ASTConversionError, Exception) as e:
@@ -1235,6 +1596,9 @@ class EvolutionEngine:
         self._operator_registry.update(op_name, delta_fitness=delta)
         funnel["eval_success"] += 1
 
+        # AFPO: LLM 생성 = 새 유전자(age=0), AST 변이 = 부모 age + 1
+        child_age = 0 if op_name.startswith("llm_") else parent.genotypic_age + 1
+
         return ScoredFactor(
             expression=child_expr,
             expression_str=str(child_expr),
@@ -1252,6 +1616,7 @@ class EvolutionEngine:
             tree_size=size,
             expression_hash=expression_hash(child_expr),
             operator_origin=op_name,
+            genotypic_age=child_age,
         )
 
     # eval 실패 샘플 로깅 카운터 (세대당 리셋)
@@ -1268,31 +1633,95 @@ class EvolutionEngine:
             self.__class__._FEATURE_LIST = _build_available_features(data_cols)
         return self._FEATURE_LIST
 
+    def _get_underrepresented_families(self) -> list[str]:
+        """현재 모집단에서 과소 대표된 피처 패밀리 식별."""
+        from app.alpha.ast_converter import classify_niche
+
+        if not self._population:
+            return []
+
+        family_counts: dict[str, int] = {}
+        for f in self._population:
+            try:
+                expr = parse_expression(f.expression_str)
+                fam = classify_niche(expr)
+            except Exception:
+                fam = "unknown"
+            family_counts[fam] = family_counts.get(fam, 0) + 1
+
+        total = max(len(self._population), 1)
+        all_families = ["price", "volume", "momentum", "volatility", "supply", "fundamental", "sentiment", "market_micro"]
+        # 점유율 5% 미만이거나 아예 없는 패밀리
+        underrep = [f for f in all_families if family_counts.get(f, 0) / total < 0.05]
+        return underrep
+
+    async def _llm_call(self, prompt: str) -> str:
+        """LLM 호출 통합 래퍼. ALPHA_LLM_PROVIDER 설정에 따라 Gemini/Anthropic 선택."""
+        if settings.ALPHA_LLM_PROVIDER == "gemini":
+            from app.core.llm import chat_gemini
+            response = await chat_gemini(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                caller="alpha.evolution_engine",
+            )
+            return response.text.strip()
+        else:
+            from app.core.llm import chat_simple
+            response = await chat_simple(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                caller="alpha.evolution_engine",
+            )
+            return response.text.strip()
+
     async def _llm_seed(self) -> sympy.Basic | None:
-        """Claude API로 새 수식 생성."""
+        """LLM으로 새 수식 생성. MAP-Elites 빈 셀 타겟팅."""
         try:
             import random as _random
 
-            from anthropic import AsyncAnthropic
             from app.alpha.miner import _CATEGORY_EXAMPLES, _CATEGORIES
 
-            client = AsyncAnthropic()
             feature_list = self._get_feature_list()
 
-            # 카테고리 지시문: 매 호출마다 랜덤 카테고리
-            category = _random.choice(_CATEGORIES)
-            examples = _CATEGORY_EXAMPLES[category]
-            example_strs = "; ".join(e["formula"] for e in examples[:2])
+            # MAP-Elites 타겟팅: 과소 대표 패밀리가 있으면 50% 확률로 해당 패밀리 강제
+            underrep = self._get_underrepresented_families()
+            if underrep and _random.random() < 0.5:
+                category = _random.choice(underrep)
+                family_features = {
+                    "price": "close, open, high, low, sma_20, ema_20, bb_upper, bb_lower",
+                    "momentum": "rsi, macd_hist, price_change_pct, return_5d, return_20d",
+                    "volatility": "atr_14, atr_7, bb_width, true_range",
+                    "supply": "foreign_net_norm, inst_net_norm, retail_net_norm",
+                    "fundamental": "eps, bps, earnings_yield, book_yield, operating_margin",
+                    "sentiment": "sentiment_score, event_score, article_count",
+                    "market_micro": "margin_rate, short_balance_rate, pgm_net_norm",
+                }
+                target_features = family_features.get(category, "")
+                example_strs = ""
+                prompt = (
+                    f"Generate a single alpha factor formula.\n\n"
+                    f"{feature_list}\n\n"
+                    f"Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
+                    f"sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
+                    f"IMPORTANT: You MUST primarily use features from the '{category}' category: {target_features}.\n"
+                    f"Do NOT use volume or zscore_volume as the main component.\n"
+                    f"Return ONLY the formula, nothing else."
+                )
+            else:
+                # 기존 랜덤 카테고리 방식
+                category = _random.choice(_CATEGORIES)
+                examples = _CATEGORY_EXAMPLES[category]
+                example_strs = "; ".join(e["formula"] for e in examples[:2])
 
-            prompt = (
-                f"Generate a single alpha factor formula.\n\n"
-                f"{feature_list}\n\n"
-                f"Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
-                f"sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
-                f"Focus on '{category}' type factors. Examples: {example_strs}\n"
-                f"Create a DIFFERENT formula from the examples.\n"
-                f"Return ONLY the formula, nothing else."
-            )
+                prompt = (
+                    f"Generate a single alpha factor formula.\n\n"
+                    f"{feature_list}\n\n"
+                    f"Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
+                    f"sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
+                    f"Focus on '{category}' type factors. Examples: {example_strs}\n"
+                    f"Create a DIFFERENT formula from the examples.\n"
+                    f"Return ONLY the formula, nothing else."
+                )
 
             # RAG 경험 추가
             if self._vector_memory:
@@ -1306,23 +1735,15 @@ class EvolutionEngine:
             if self._context:
                 prompt += f"\n\n{self._context}"
 
-            response = await client.messages.create(
-                model=settings.AGENT_MODEL,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            formula = response.content[0].text.strip()
+            formula = await self._llm_call(prompt)
             return parse_expression(formula)
         except Exception as e:
             logger.debug("LLM seed failed: %s", e)
             return None
 
     async def _llm_mutate(self, parent: ScoredFactor) -> sympy.Basic | None:
-        """Claude API로 기존 수식 변이 (다차원 메트릭 피드백)."""
+        """LLM으로 기존 수식 변이 (다차원 메트릭 피드백)."""
         try:
-            from anthropic import AsyncAnthropic
-
-            client = AsyncAnthropic()
             feature_list = self._get_feature_list()
             prompt = (
                 f"Mutate this alpha factor formula to improve it:\n"
@@ -1346,15 +1767,49 @@ class EvolutionEngine:
                 if rag and rag != "아직 탐색 이력이 없습니다.":
                     prompt += f"\n\nSimilar past attempts:\n{rag}"
 
-            response = await client.messages.create(
-                model=settings.AGENT_MODEL,
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            formula = response.content[0].text.strip()
+            formula = await self._llm_call(prompt)
             return parse_expression(formula)
         except Exception as e:
             logger.debug("LLM mutate failed: %s", e)
+            return None
+
+    async def _llm_semantic_crossover(
+        self, parent_a: ScoredFactor, parent_b: ScoredFactor,
+    ) -> sympy.Basic | None:
+        """LLM 시맨틱 교차: 두 부모의 금융 논리를 보존하면서 결합.
+
+        LMX (Meyerson et al., 2023) + QuantaAlpha (2025) 패러다임.
+        무작위 서브트리 교환 대신 LLM이 의미론적으로 유의미한 결합을 수행.
+        """
+        try:
+            feature_list = self._get_feature_list()
+
+            prompt = (
+                f"You are an expert quantitative researcher. "
+                f"Combine the predictive insights of these two alpha factor formulas "
+                f"into a single new formula.\n\n"
+                f"Parent A (IC={parent_a.ic_mean:.4f}, Sharpe={parent_a.sharpe:.2f}):\n"
+                f"  {parent_a.expression_str}\n\n"
+                f"Parent B (IC={parent_b.ic_mean:.4f}, Sharpe={parent_b.sharpe:.2f}):\n"
+                f"  {parent_b.expression_str}\n\n"
+                f"{feature_list}\n"
+                f"Available functions: +, -, *, /, log(), exp(), sqrt(), abs(), "
+                f"sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
+                f"Maximum depth: 6. Preserve the strongest sub-expressions from each parent.\n"
+                f"Return ONLY the combined formula, nothing else."
+            )
+
+            # RAG 경험 추가
+            if self._vector_memory:
+                query = f"{parent_a.expression_str} {parent_b.expression_str}"
+                rag = self._vector_memory.format_rag_context(query)
+                if rag and rag != "아직 탐색 이력이 없습니다.":
+                    prompt += f"\n\nPast experience:\n{rag}"
+
+            formula = await self._llm_call(prompt)
+            return parse_expression(formula)
+        except Exception as e:
+            logger.debug("LLM semantic crossover failed: %s", e)
             return None
 
     def _evaluate_on_data(self, expr: sympy.Basic, data: pl.DataFrame) -> float:
@@ -1482,6 +1937,7 @@ class EvolutionEngine:
                         max_drawdown=factor.max_drawdown,
                         is_elite=is_elite_now,
                         birth_generation=factor.generation,
+                        genotypic_age=factor.genotypic_age,
                         interval=self._interval,
                     )
                 )
@@ -1509,6 +1965,7 @@ class EvolutionEngine:
                     population_active=True,
                     is_elite=is_elite_now,
                     birth_generation=self._generation,
+                    genotypic_age=factor.genotypic_age,
                     status="population",
                     interval=self._interval,
                     parent_ids=factor.parent_ids if factor.parent_ids else None,

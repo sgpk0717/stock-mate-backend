@@ -111,6 +111,9 @@ class AlphaFactorBacktestRequest(BaseModel):
     band_threshold: float = Field(0.05, ge=0.0, le=0.2)  # 밴드 리밸런싱 임계값
     stop_loss_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포지션 손절 (0=비활성, 0.05=5%)
     max_drawdown_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포트폴리오 서킷 브레이커 (0=비활성)
+    eod_liquidation: bool = Field(True, description="장중 단타: 매일 장 마감 시 전량 청산")
+    skip_opening_minutes: int = Field(0, ge=0, le=120, description="장 시작 N분 회피 (0=비활성, 30=09:30부터 리밸런싱)")
+    engine: str = Field("loop", pattern=r"^(loop|vectorbt)$", description="시뮬레이션 엔진 (loop=기본, vectorbt=Numba 가속)")
 
 
 class CausalValidationResponse(BaseModel):
@@ -186,6 +189,47 @@ class CorrelationMatrixResponse(BaseModel):
     factor_ids: list[str]
     factor_names: list[str]
     matrix: list[list[float]]
+
+
+class AutoOptimizeRequest(BaseModel):
+    min_ic: float = Field(0.03, ge=0.01, le=0.5)
+    min_turnover: float = Field(0.02, ge=0.0, le=1.0)
+    max_k: int = Field(7, ge=3, le=15)
+    lambda_decorr: float = Field(0.5, ge=0.0, le=2.0)
+    shrinkage_delta: float = Field(0.5, ge=0.0, le=1.0)
+    interval: str = Field("5m", pattern=r"^(1m|3m|5m|15m|30m|1h|1d)$")
+    causal_only: bool = False
+
+
+class SelectionStepResponse(BaseModel):
+    step: int
+    selected_id: str
+    selected_name: str
+    niche: str
+    ic: float
+    reason: str
+    cumulative_ir2: float
+    avg_correlation: float
+
+
+class OptimizationResultResponse(BaseModel):
+    k: int
+    factor_ids: list[str]
+    factor_names: list[str]
+    weights: dict[str, float]
+    composite_ic: float
+    composite_icir: float
+    composite_sharpe: float
+    avg_correlation: float
+    expression_str: str
+
+
+class AutoOptimizeResponse(BaseModel):
+    best_k: int
+    results: list[OptimizationResultResponse]
+    selection_log: list[SelectionStepResponse]
+    correlation_matrix: CorrelationMatrixResponse
+    candidate_count: int
 
 
 class AlphaExperienceResponse(BaseModel):

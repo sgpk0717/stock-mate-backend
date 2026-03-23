@@ -495,6 +495,17 @@ def ensure_alpha_features(
     """
     existing = set(df.columns)
 
+    # ── 전이적 의존성 확장 ──
+    # sector 피처는 price_change_pct → sector_return → sector_rel_strength 체인 필요
+    if required_cols is not None:
+        expanded = set(required_cols)
+        _SECTOR_COLS = {"sector_return", "sector_rel_strength", "sector_rank"}
+        if expanded & _SECTOR_COLS:
+            expanded.add("price_change_pct")
+        if "sector_rel_strength" in expanded:
+            expanded.add("sector_return")
+        required_cols = expanded
+
     def _need(col: str) -> bool:
         """이 컬럼을 계산해야 하는지 판단."""
         if col in existing:

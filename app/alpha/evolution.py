@@ -207,6 +207,7 @@ class ScoredFactor:
     turnover: float = 0.0          # 포지션 턴오버 (일별 포트폴리오 변경 비율)
     sharpe: float = 0.0            # Long-only Sharpe (상위 분위 포트폴리오)
     max_drawdown: float = 0.0
+    genotypic_age: int = 0         # AFPO: 유전 물질의 연령 (세대 수 기반)
 
 
 def hoist_mutation(expr: sympy.Basic) -> sympy.Basic | None:
@@ -292,11 +293,12 @@ def tournament_select(
             tournament = size_sorted[:keep_n]
 
         if multi_objective and len(tournament) > 1:
-            # 3축 mini-lexicase: [ic_mean, long_only_sharpe, -position_turnover]
+            # 4축 mini-lexicase: [ic_mean, long_only_sharpe, -turnover, -age (AFPO)]
             objectives = [
                 ("ic_mean", lambda f: f.ic_mean if f.ic_mean is not None else 0.0),
                 ("long_only_sharpe", lambda f: f.sharpe if f.sharpe is not None else 0.0),
                 ("low_turnover", lambda f: -(f.turnover if f.turnover is not None else 0.0)),
+                ("youth", lambda f: -getattr(f, "genotypic_age", 0)),  # AFPO: 젊은 개체 선호
             ]
             random.shuffle(objectives)
             candidates = list(tournament)

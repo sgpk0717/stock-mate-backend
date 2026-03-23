@@ -241,12 +241,12 @@ class FactorMirageFilter:
 
         mid = len(data) // 2
         if mid < _MIN_SAMPLES:
-            # 데이터 부족 — 검증 불가이므로 통과 처리
+            # 데이터 부족 → 자동 기각 (이전: 자동 통과)
             logger.warning(
-                "Insufficient data for regime split: %d rows (need %d per half)",
+                "Insufficient data for regime split: %d rows (need %d per half) → REJECT",
                 len(data), _MIN_SAMPLES,
             )
-            return True, 0.0, 0.0
+            return False, 0.0, 0.0
 
         first_half = data.iloc[:mid].reset_index(drop=True)
         second_half = data.iloc[mid:].reset_index(drop=True)
@@ -529,7 +529,31 @@ class FactorMirageFilter:
         ate = _sanitize(float(beta[-1]))
         p_value = _sanitize(float(p_values[-1]), default=1.0)
 
-        # ── Step 4a: 플라시보 검증 (treatment 셔플) ──
+        # ── Step 3.5: t-stat 게이트 (Harvey, Liu, Zhu 2016 — 다중검정 t>3.0) ──
+        # p-value에서 t-stat 역산: t = |ppf(p/2, df)|
+        dof = len(y) - X_full.shape[1]
+        if dof > 0 and 0 < p_value < 1:
+            t_stat_ate = abs(float(t_dist.ppf(p_value / 2, df=dof)))
+        else:
+            t_stat_ate = 0.0
+
+        if t_stat_ate < 3.0:
+            logger.info(
+                "Causal t-stat gate: ATE=%.6f, t=%.2f < 3.0 → REJECT (Harvey et al. 2016)",
+                ate, t_stat_ate,
+            )
+            return CausalValidationResult(
+                is_causally_robust=False,
+                causal_effect_size=ate,
+                p_value=p_value,
+                placebo_passed=False,
+                placebo_effect=0.0,
+                random_cause_passed=False,
+                random_cause_delta=0.0,
+                failure_type="LOW_TSTAT",
+            )
+
+        # ── Step 4a: 플라시보 검증 (treatment 셔플, 상대 임계값) ──
         placebo_effects = np.empty(self.num_simulations)
         for i in range(self.num_simulations):
             perm_treatment = np.random.permutation(treatment)
@@ -537,19 +561,22 @@ class FactorMirageFilter:
             beta_perm, _ = _fast_ols(X_perm, y)
             placebo_effects[i] = beta_perm[-1]
         placebo_effect = _sanitize(float(np.mean(placebo_effects)))
-        placebo_passed = abs(placebo_effect) < self.placebo_threshold
+        # 상대 임계값: 플라시보 ATE가 원본 ATE의 10% 미만이어야 통과
+        placebo_ratio = abs(placebo_effect / ate) if abs(ate) > 1e-12 else float("inf")
+        placebo_passed = placebo_ratio < 0.10
 
-        # ── Step 4b: 랜덤 원인 검증 (랜덤 교란변수 추가) ──
+        # ── Step 4b: 랜덤 원인 검증 (랜덤 교란변수 추가, 상대 임계값) ──
         random_effects = np.empty(self.num_simulations)
         for i in range(self.num_simulations):
             random_confounder = np.random.normal(size=len(y))
             X_random = np.column_stack([X_full, random_confounder])
             beta_random, _ = _fast_ols(X_random, y)
-            # treatment는 인덱스 5 (마지막에서 두 번째)
             random_effects[i] = beta_random[-2]
         random_effect = _sanitize(float(np.mean(random_effects)))
         random_delta = abs(random_effect - ate)
-        random_passed = random_delta < self.random_cause_threshold
+        # 상대 임계값: ATE 변화가 원본의 10% 미만이어야 통과
+        random_ratio = random_delta / abs(ate) if abs(ate) > 1e-12 else float("inf")
+        random_passed = random_ratio < 0.10
 
         # ── Step 5: 체제 변화 검증 (전반/후반 ATE 부호 일관성) ──
         regime_passed, ate_first, ate_second = self._fast_regime_split(
@@ -607,10 +634,10 @@ class FactorMirageFilter:
         mid = len(y) // 2
         if mid < _MIN_SAMPLES:
             logger.warning(
-                "Insufficient data for regime split: %d rows (need %d per half)",
+                "Insufficient data for regime split: %d rows (need %d per half) → REJECT",
                 len(y), _MIN_SAMPLES,
             )
-            return True, 0.0, 0.0
+            return False, 0.0, 0.0  # 소표본 → 자동 기각 (이전: 자동 통과)
 
         # 전반부
         X_first = np.column_stack([X_base[:mid], treatment[:mid]])

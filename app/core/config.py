@@ -80,17 +80,18 @@ class Settings(BaseSettings):
     # Phase 2: Causal Inference
     CAUSAL_PLACEBO_THRESHOLD: float = 0.05
     CAUSAL_RANDOM_CAUSE_THRESHOLD: float = 0.05
-    CAUSAL_NUM_SIMULATIONS: int = 20
+    CAUSAL_NUM_SIMULATIONS: int = 999  # Davidson & MacKinnon(2000): 최소 399, 권장 999
     CAUSAL_USE_FAST_ENGINE: bool = True  # NumPy 고속 엔진 (False → DoWhy 레거시)
 
     # Evolution Engine (진화형 팩토리)
-    ALPHA_POPULATION_SIZE: int = 100  # 5분봉 대규모 데이터 OOM 방지 (메모리 안정화 후 점진적 증가)
+    ALPHA_POPULATION_SIZE: int = 200  # 5분봉 DB 직접 로딩으로 OOM 해소 (Koza 1992: 최소 200)
     ALPHA_ELITE_PCT: float = 0.05
     ALPHA_AST_MUTATION_RATIO: float = 0.92
     ALPHA_LLM_MUTATION_RATIO: float = 0.08
-    ALPHA_FITNESS_W_IC: float = 0.30
-    ALPHA_FITNESS_W_ICIR: float = 0.20
-    ALPHA_FITNESS_W_SHARPE: float = 0.20
+    ALPHA_LLM_PROVIDER: str = "gemini"  # "gemini" (저비용) | "anthropic" (고비용)
+    ALPHA_FITNESS_W_IC: float = 0.30       # Round 3: IC 정규화로 실질 영향력 5배 증가
+    ALPHA_FITNESS_W_ICIR: float = 0.30     # Round 3: 0.20→0.30 (ICIR 중심 진화)
+    ALPHA_FITNESS_W_SHARPE: float = 0.10   # Round 3: 0.20→0.10 (Sharpe 지배 완화)
     ALPHA_FITNESS_W_MDD: float = 0.05
     ALPHA_FITNESS_W_TURNOVER: float = 0.10
     ALPHA_FITNESS_W_COMPLEXITY: float = 0.15
@@ -157,6 +158,17 @@ class Settings(BaseSettings):
     WORKFLOW_REQUIRE_CAUSAL: bool = False
     WORKFLOW_FACTOR_MAX_AGE_DAYS: int = 30
     WORKFLOW_DATA_INTERVAL: str = "5m"  # 분봉 단타 (1m/3m/5m)
+
+    # Strategy Pipeline (전략 레이어 필터)
+    STRATEGY_PIPELINE_ENABLED: bool = True
+    STRATEGY_MARKET_OPEN_HOLD_MINUTES: int = 30    # 장 초반 N분 매수 차단 (09:00~09:30)
+    STRATEGY_MARKET_CLOSE_BLOCK_MINUTES: int = 20  # 장 마감 N분 전 매수 차단 (15:10~)
+    STRATEGY_MIN_VOLUME_RATIO: float = 1.5         # 거래량비 임계값 (20일 평균 대비)
+    STRATEGY_MAX_DAILY_TRADES: int = 0              # 세션당 일일 매수 제한 (0=무제한)
+
+    # Paper 모드 지정가 시뮬레이션
+    PAPER_USE_LIMIT_ORDERS: bool = True    # Paper 지정가 매매 활성화 (False=즉시 체결 레거시)
+    PAPER_LIMIT_TTL_BARS: int = 2          # 미체결 대기 봉 수 (2봉 = 5분봉 기준 10분)
 
     # Order Management
     ORDER_BUY_TTL_SECONDS: int = 120       # 매수 미체결 TTL (2분)

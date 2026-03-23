@@ -118,6 +118,10 @@ class AlphaFactor(Base):
     birth_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"
     )
+    # AFPO: 유전 물질의 연령 (부모 age + 1, LLM/시드/아카이브 재주입 시 0)
+    genotypic_age: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
 
     # 데이터 인터벌
     interval: Mapped[str] = mapped_column(

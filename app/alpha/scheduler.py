@@ -10,7 +10,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import polars as pl
 from sqlalchemy import func, select, update
@@ -59,6 +59,7 @@ class AlphaFactoryScheduler:
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
+        self._task_ref: asyncio.Task | None = None  # GC 방지 백업 참조
         self._lock = asyncio.Lock()
         self._state = _FactoryState()
         self._vector_memory: ExperienceVectorMemory | None = None
@@ -86,6 +87,17 @@ class AlphaFactoryScheduler:
     ) -> bool:
         """스케줄러 시작. 이미 실행 중이면 False 반환."""
         async with self._lock:
+            # Redis user_stopped 플래그 체크 — 프론트/API에서 중지 시 모든 경로에서 시작 차단
+            try:
+                from app.core.redis import get_client as get_redis
+                _redis = get_redis()
+                _flag = await _redis.get("alpha:factory:user_stopped")
+                if _flag and str(_flag) == "true":
+                    logger.info("Alpha factory start 차단 — user_stopped 플래그 활성")
+                    return False
+            except Exception:
+                pass
+
             # task가 살아있으면 실행 중으로 간주 (get_status의 running과 무관)
             if self._task and not self._task.done():
                 return False
@@ -108,7 +120,7 @@ class AlphaFactoryScheduler:
                 running=True,
                 cycles_completed=prev_cycles,
                 factors_discovered_total=prev_total,
-                started_at=datetime.utcnow().isoformat(),
+                started_at=datetime.now(timezone.utc).isoformat(),
                 config={
                     "context": context,
                     "universe": universe,
@@ -144,9 +156,10 @@ class AlphaFactoryScheduler:
                 logger.warning("Vector memory cache load failed: %s", e)
 
             self._task = asyncio.create_task(self._loop())
+            self._task_ref = self._task  # GC 방지 강한 참조 유지
             logger.info(
-                "Alpha factory started: interval=%dmin, iterations=%d",
-                interval, iterations,
+                "Alpha factory started: interval=%dmin, iterations=%d, task=%s",
+                interval, iterations, self._task,
             )
             return True
 
@@ -173,6 +186,13 @@ class AlphaFactoryScheduler:
         # task가 죽었는데 running 플래그만 True면 실제로는 미실행
         is_running = self._state.running
         if is_running and self._task and self._task.done():
+            try:
+                _exc = self._task.exception() if not self._task.cancelled() else "Cancelled"
+            except Exception:
+                _exc = "unknown"
+            logger.warning(
+                "상태 불일치: state.running=True but task.done()=True (exception=%s)", _exc,
+            )
             is_running = False
         return {
             "running": is_running,
@@ -193,6 +213,8 @@ class AlphaFactoryScheduler:
 
     async def _loop(self) -> None:
         """메인 스케줄러 루프."""
+        _task_id = id(asyncio.current_task())
+        logger.info("Alpha factory _loop ENTER (task_id=%s)", _task_id)
         my_state = self._state  # 이 루프가 소유하는 state (start() 교체 시 오염 방지)
         config = my_state.config
         interval_seconds = config["interval_minutes"] * 60
@@ -234,7 +256,7 @@ class AlphaFactoryScheduler:
         except Exception as e:
             logger.exception("Alpha factory loop UNEXPECTED exit: %s", e)
         finally:
-            logger.warning("Alpha factory loop exiting — running=False 설정")
+            logger.warning("Alpha factory loop exiting — running=False 설정 (task_id=%s)", _task_id)
             # 좀비 방지: 자신의 state만 False로 설정 (새 start()의 state 오염 방지)
             my_state.running = False
             # 루프 종료 → 프론트에 알림
@@ -256,7 +278,7 @@ class AlphaFactoryScheduler:
         _last_funnel: dict = {}  # 퍼널 데이터 (텔레그램 보고용)
         _last_eval: dict = {}  # eval_complete 이벤트 (IC 샘플)
         _last_candidates: dict = {}  # candidates_ready 이벤트 (연산자 분포)
-        _cycle_start = datetime.utcnow()  # 소요시간 측정용
+        _cycle_start = datetime.now(timezone.utc)  # 소요시간 측정용
 
         await manager.broadcast("alpha:factory", {
             "type": "cycle_start",
@@ -408,7 +430,7 @@ class AlphaFactoryScheduler:
                 mining_run.progress = 100
                 mining_run.factors_found = len(discovered)
                 mining_run.iteration_logs = {"operator_stats": self._operator_registry.to_dict()}
-                mining_run.completed_at = datetime.utcnow()
+                mining_run.completed_at = datetime.now(timezone.utc)
                 await db.commit()
 
             # discovered 팩터 DB 저장 (별도 세션 — 실패해도 카운터에 영향 없음)
@@ -463,7 +485,7 @@ class AlphaFactoryScheduler:
                     self._state.factors_discovered_total += len(discovered)
             else:
                 self._state.factors_discovered_total += len(discovered)
-            self._state.last_cycle_at = datetime.utcnow().isoformat()
+            self._state.last_cycle_at = datetime.now(timezone.utc).isoformat()
             self._state.current_cycle_progress = 100
 
             await manager.broadcast("alpha:factory", {
@@ -483,7 +505,7 @@ class AlphaFactoryScheduler:
                 from app.telegram.bot import send_message as tg_send
 
                 # 시간 기반 throttle: 최소 5분 간격 (사이클이 빠르게 도는 경우 폭주 방지)
-                _now = datetime.utcnow()
+                _now = datetime.now(timezone.utc)
                 _last_report = getattr(self, "_last_tg_report_at", None)
                 _min_interval = 300  # 5분
                 _time_ok = _last_report is None or (_now - _last_report).total_seconds() >= _min_interval
@@ -495,7 +517,7 @@ class AlphaFactoryScheduler:
                 )
                 if should_report:
                     # 소요시간 계산
-                    elapsed = datetime.utcnow() - _cycle_start
+                    elapsed = datetime.now(timezone.utc) - _cycle_start
                     elapsed_min = int(elapsed.total_seconds() // 60)
                     elapsed_sec = int(elapsed.total_seconds() % 60)
                     elapsed_str = f"{elapsed_min}분 {elapsed_sec}초" if elapsed_min > 0 else f"{elapsed_sec}초"
@@ -513,7 +535,7 @@ class AlphaFactoryScheduler:
                         msg = self._build_fallback_report(report_data)
 
                     await tg_send(msg, category="mining_report", caller="alpha.scheduler")
-                    self._last_tg_report_at = datetime.utcnow()
+                    self._last_tg_report_at = datetime.now(timezone.utc)
             except Exception as e:
                 logger.warning("Telegram report failed: %s", e, exc_info=True)
 
@@ -666,6 +688,7 @@ class AlphaFactoryScheduler:
             messages=[{"role": "user", "content": user_message}],
             max_tokens=2000,
             temperature=0.3,
+            caller="alpha.scheduler",
         )
 
         msg = response.text.strip()
@@ -795,14 +818,18 @@ class AlphaFactoryScheduler:
             logger.error("Cycle %d: causal validation failed: %s", cycle_num, e)
 
 
-# ── 모듈 레벨 싱글턴 ──
+# ── 인터벌별 스케줄러 인스턴스 ──
 
-_scheduler: AlphaFactoryScheduler | None = None
+_schedulers: dict[str, AlphaFactoryScheduler] = {}
 
 
-def get_scheduler() -> AlphaFactoryScheduler:
-    """싱글턴 스케줄러 인스턴스 반환."""
-    global _scheduler
-    if _scheduler is None:
-        _scheduler = AlphaFactoryScheduler()
-    return _scheduler
+def get_scheduler(interval: str = "5m") -> AlphaFactoryScheduler:
+    """인터벌별 스케줄러 인스턴스 반환. 같은 인터벌이면 같은 인스턴스."""
+    if interval not in _schedulers:
+        _schedulers[interval] = AlphaFactoryScheduler()
+    return _schedulers[interval]
+
+
+def get_all_schedulers() -> dict[str, AlphaFactoryScheduler]:
+    """실행 중인 모든 스케줄러 반환."""
+    return _schedulers

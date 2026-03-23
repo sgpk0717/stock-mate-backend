@@ -48,18 +48,20 @@ def _resolve_date_col(df: pl.DataFrame) -> str:
     return "dt" if "dt" in df.columns else "date"
 
 
-def _filter_valid(df: pl.DataFrame, factor_col: str) -> pl.DataFrame:
-    """유효한 행만 필터 (factor + fwd_return 모두 non-null/nan)."""
+def _filter_valid(df: pl.DataFrame, factor_col: str, return_col: str = "fwd_return") -> pl.DataFrame:
+    """유효한 행만 필터 (factor + return 모두 non-null/nan)."""
     return df.filter(
         pl.col(factor_col).is_not_null()
         & pl.col(factor_col).is_not_nan()
-        & pl.col("fwd_return").is_not_null()
-        & pl.col("fwd_return").is_not_nan()
+        & pl.col(return_col).is_not_null()
+        & pl.col(return_col).is_not_nan()
     )
 
 
 def compute_ic_series(
-    df: pl.DataFrame, factor_col: str = "alpha_factor"
+    df: pl.DataFrame,
+    factor_col: str = "alpha_factor",
+    return_col: str = "fwd_return",
 ) -> list[float]:
     """일별 cross-sectional Spearman IC 시리즈 계산.
 
@@ -67,8 +69,12 @@ def compute_ic_series(
     Polars rank().over(date) + pearson_corr() group_by로 벡터화.
 
     단일 종목일 경우 시계열 IC, 다종목일 경우 날짜별 횡단면 IC.
+
+    Parameters
+    ----------
+    return_col : 수익률 컬럼명. 기본 "fwd_return". 다중 보유기간 사용 시 변경.
     """
-    valid = _filter_valid(df, factor_col)
+    valid = _filter_valid(df, factor_col, return_col=return_col)
 
     if valid.height < 10:
         return []
@@ -80,10 +86,10 @@ def compute_ic_series(
         # Polars 벡터화: rank().over(date) → group_by + pearson_corr
         ranked = valid.with_columns([
             pl.col(factor_col).rank().over(date_col).alias("_f_rank"),
-            pl.col("fwd_return").rank().over(date_col).alias("_r_rank"),
+            pl.col(return_col).rank().over(date_col).alias("_r_rank"),
             pl.col(factor_col).count().over(date_col).alias("_cnt"),
             pl.col(factor_col).std().over(date_col).alias("_f_std"),
-            pl.col("fwd_return").std().over(date_col).alias("_r_std"),
+            pl.col(return_col).std().over(date_col).alias("_r_std"),
         ]).filter(
             (pl.col("_cnt") >= 30)
             & (pl.col("_f_std") > 1e-12)
@@ -106,13 +112,13 @@ def compute_ic_series(
     window = min(20, valid.height // 3)
     if window < 5:
         factor_vals = valid[factor_col].to_numpy()
-        return_vals = valid["fwd_return"].to_numpy()
+        return_vals = valid[return_col].to_numpy()
         corr, _ = spearmanr(factor_vals, return_vals)
         return [float(corr)] if not np.isnan(corr) else []
 
     ic_list: list[float] = []
     factor_arr = valid[factor_col].to_numpy()
-    return_arr = valid["fwd_return"].to_numpy()
+    return_arr = valid[return_col].to_numpy()
 
     for i in range(window, len(factor_arr)):
         f_slice = factor_arr[i - window : i]
@@ -132,6 +138,59 @@ def compute_ic_series(
         )
 
     return ic_list
+
+
+def compute_ic_multi_horizon(
+    df: pl.DataFrame,
+    factor_col: str = "alpha_factor",
+    horizons: list[int] | None = None,
+) -> dict[int, dict]:
+    """다중 보유기간별 IC 계산 → 최적 보유기간 식별.
+
+    Parameters
+    ----------
+    horizons : 보유기간 리스트 (봉 수). 기본 [1, 6, 12, 39, 78]
+               (5분봉 기준: 5분, 30분, 1시간, 반일, 전일)
+
+    Returns
+    -------
+    {horizon: {"ic_mean", "icir", "ic_series"}}
+    """
+    if horizons is None:
+        horizons = [1, 6, 12, 39, 78]
+
+    results: dict[int, dict] = {}
+    for h in horizons:
+        ret_col = f"_fwd_ret_{h}"
+        df_h = df.with_columns(
+            (pl.col("close").shift(-h).over("symbol") / pl.col("close") - 1.0)
+            .alias(ret_col)
+        ) if "symbol" in df.columns else df.with_columns(
+            (pl.col("close").shift(-h) / pl.col("close") - 1.0)
+            .alias(ret_col)
+        )
+
+        ic_series = compute_ic_series(df_h, factor_col, return_col=ret_col)
+        if ic_series:
+            ic_mean = float(np.mean(ic_series))
+            ic_std = float(np.std(ic_series, ddof=1)) if len(ic_series) > 1 else 0.0
+            icir = ic_mean / ic_std if ic_std > 1e-12 else 0.0
+        else:
+            ic_mean = 0.0
+            icir = 0.0
+
+        results[h] = {
+            "ic_mean": round(ic_mean, 6),
+            "icir": round(icir, 4),
+            "n_obs": len(ic_series),
+        }
+
+    # 최적 보유기간 (IC 절대값 기준)
+    if results:
+        best_h = max(results, key=lambda h: abs(results[h]["ic_mean"]))
+        results["optimal_horizon"] = best_h
+
+    return results
 
 
 # ---------------------------------------------------------------------------

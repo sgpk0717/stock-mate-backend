@@ -5,9 +5,11 @@ Claude + (옵션: PySR) 기반 알파 팩터 발굴 + 궤적 변이 루프.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
@@ -675,12 +677,23 @@ class EvolutionaryAlphaMiner:
 
 위 경험을 참고하여 새로운 알파 팩터를 제안하세요. 기존 팩터와 직교성을 유지하세요."""
 
+        _t0 = time.monotonic()
         response = await self.client.messages.create(
             model=settings.AGENT_MODEL,
             max_tokens=1000,
             system=self._hypothesis_system_prompt,
             messages=[{"role": "user", "content": user_msg}],
         )
+        _dur = int((time.monotonic() - _t0) * 1000)
+        from app.core.llm._logger import log_llm_usage
+        asyncio.create_task(log_llm_usage(
+            caller="alpha.miner",
+            provider="anthropic",
+            model=response.model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            duration_ms=_dur,
+        ))
 
         text = response.content[0].text
         hypothesis = _extract_hypothesis(text)
@@ -913,12 +926,23 @@ class EvolutionaryAlphaMiner:
 이 수식을 국소적으로 수정하여 IC를 개선해주세요."""
 
         try:
+            _t0 = time.monotonic()
             response = await self.client.messages.create(
                 model=settings.AGENT_MODEL,
                 max_tokens=500,
                 system=self._mutation_system_prompt,
                 messages=[{"role": "user", "content": user_msg}],
             )
+            _dur = int((time.monotonic() - _t0) * 1000)
+            from app.core.llm._logger import log_llm_usage
+            asyncio.create_task(log_llm_usage(
+                caller="alpha.miner",
+                provider="anthropic",
+                model=response.model,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                duration_ms=_dur,
+            ))
             text = response.content[0].text
             mutated = _extract_expression(text)
             if not mutated:

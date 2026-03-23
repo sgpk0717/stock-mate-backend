@@ -1,0 +1,161 @@
+{
+  "rounds": [
+    {
+      "round": 1,
+      "title": "Niche-Based Population Diversity Cap",
+      "datetime": "2026-03-19T03:50:00+09:00",
+      "status": "partial_success",
+      "diagnosis": {
+        "summary": "모집단 83%가 volume 패밀리에 수렴 (Population Takeover). fitness 순 트리밍에서 volume 가족만 생존하여 다른 피처 조합 탐색 불가.",
+        "metrics_before": {
+          "total_factors": 3073,
+          "generations": 251,
+          "avg_ic": 0.082,
+          "max_ic": 0.262,
+          "avg_sharpe": 1.36,
+          "max_sharpe": 4.38,
+          "avg_icir": 0.53,
+          "max_icir": 0.67,
+          "volume_pct": 83.0,
+          "family_count": 2,
+          "causal_pass_pct": 28.4
+        }
+      },
+      "changes": [
+        "8개 피처 패밀리 분류 체계 도입 (classify_niche: price, volume, momentum, volatility, supply, fundamental, sentiment, market_micro)",
+        "모집단 트리밍에 니치캡 적용 — 패밀리당 최대 25% 점유율 (ALPHA_NICHE_MAX_PCT=0.25)",
+        "2-Pass 알고리즘: Pass 1에서 니치별 캡 적용, Pass 2에서 미달분 overflow 보충"
+      ],
+      "files_modified": [
+        "app/alpha/ast_converter.py — classify_niche() + FEATURE_FAMILY_MAP 추가",
+        "app/alpha/evolution_engine.py — _niche_cap_trim() 메서드 추가 + 기존 트리밍 교체",
+        "app/core/config.py — ALPHA_NICHE_MAX_PCT=0.25 추가"
+      ],
+      "verification": {
+        "cycles_elapsed": 30,
+        "generations_range": "253~284",
+        "metrics_after": {
+          "total_factors": 4294,
+          "generations": 284,
+          "avg_ic": 0.086,
+          "max_ic": 0.262,
+          "avg_sharpe": 1.35,
+          "max_sharpe": 4.38,
+          "avg_icir": 0.54,
+          "max_icir": 0.69,
+          "volume_pct": 64.5,
+          "family_count": 4,
+          "causal_pass_pct": 28.9
+        },
+        "criteria": [
+          {"label": "volume 비중 ≤30%", "target": "≤30%", "actual": "64.5%", "passed": false},
+          {"label": "패밀리 수 (5개+ 멤버) ≥4", "target": "≥4", "actual": "4", "passed": true},
+          {"label": "비volume discovered 팩터", "target": "≥1개", "actual": "다수 (fundamental Sharpe 3.07, supply Sharpe 1.88)", "passed": true},
+          {"label": "최고 IC 하락 ≤20%", "target": "≤20%", "actual": "유지 (0.217)", "passed": true},
+          {"label": "최고 ICIR 유지/개선", "target": "유지", "actual": "0.67 → 0.69 개선", "passed": true}
+        ]
+      },
+      "lesson": "니치캡이 '다양한 팩터가 살 공간'을 만드는 데 성공했지만, 비volume 팩터의 '공급' 자체가 부족하여 빈 슬롯을 volume overflow로 채우게 됨. Round 2에서 비volume 시드 주입 필요."
+    },
+    {
+      "round": 2,
+      "title": "수렴 감지 시 비volume 다양성 시드 강제 주입",
+      "datetime": "2026-03-19T09:30:00+09:00",
+      "status": "partial_failure",
+      "diagnosis": {
+        "summary": "Round 1의 니치캡이 공간을 만들었지만 비volume 팩터 공급 부족. AST 변이로 심볼 1개만 교체하면 핵심 zscore_volume이 남아 여전히 volume 니치. LLM 시드도 RAG 영향으로 volume 경향.",
+        "metrics_before": {
+          "total_factors": 4294,
+          "generations": 284,
+          "avg_ic": 0.086,
+          "max_ic": 0.262,
+          "avg_icir": 0.54,
+          "max_icir": 0.69,
+          "volume_pct": 64.5,
+          "family_count": 4,
+          "causal_pass_pct": 28.9
+        }
+      },
+      "changes": [
+        "수렴 감지 조건 확장 — 기존(피처 top10 중 8개+) + 니치 60% 이상",
+        "수렴 감지 시 비volume 하드코딩 시드 15개 offspring에 강제 주입",
+        "OHLCV + 기술적 지표 기반만 사용 (외부 데이터 피처 제외 — 미존재 위험 방지)",
+        "4개 패밀리 (price, momentum, volatility, mixed_no_volume) × 3~5개 시드 템플릿"
+      ],
+      "files_modified": [
+        "app/alpha/evolution_engine.py — 수렴 감지 확장 + _make_diversity_seeds() 추가"
+      ],
+      "verification": {
+        "cycles_elapsed": 12,
+        "generations_range": "285~296",
+        "metrics_after": {
+          "total_factors": 4750,
+          "generations": 296,
+          "avg_ic": 0.087,
+          "max_ic": 0.263,
+          "avg_sharpe": 1.38,
+          "max_sharpe": 4.38,
+          "avg_icir": 0.54,
+          "max_icir": 0.69,
+          "volume_pct": 62.5,
+          "family_count": 5,
+          "causal_pass_pct": 29.0,
+          "active_population": 48,
+          "gen285_plus_volume_pct": 94.6
+        },
+        "criteria": [
+          {"label": "volume 비중 ≤40%", "target": "≤40%", "actual": "62.5% (활성), 94.6% (gen285+ 전체)", "passed": false},
+          {"label": "비volume discovered ≥3개", "target": "≥3", "actual": "3개 (price 니치, max IC 0.051)", "passed": true},
+          {"label": "최고 IC 하락 ≤20%", "target": "≤20%", "actual": "0.115 → 0.116 (하락 없음, -0.3%)", "passed": true}
+        ]
+      },
+      "lesson": "니치캡+다양성 시드가 메커니즘으로서 정상 동작하지만, 5분봉 KOSPI200에서 volume IC(0.09)가 비volume(0.003~0.025) 대비 3~30배 높아 fitness 경쟁에서 비volume이 자연도태됨. 외부 데이터는 일별 빈도라서 5분봉 변별력 제한. 같은 방향(다양성) 추가 개선보다 환경 변경(인터벌/유니버스)이 더 효과적."
+    },
+    {
+      "round": 3,
+      "title": "Fitness 함수 ICIR 중심 재편 — IC 정규화 + 가중치 재조정",
+      "datetime": "2026-03-21T00:40:00+09:00",
+      "status": "pending",
+      "diagnosis": {
+        "summary": "Fitness-Sharpe 상관 0.70으로 Sharpe가 fitness를 지배. IC 원시값(0~0.26)이 Sharpe_norm(0~1) 대비 스케일 1/4이라 IC 가중치 30%에도 실질 기여 7%에 불과. ICIR은 전체 7,430개 팩터 중 0.7 초과 0개로 실전 유의미(1.0+) 도달 불가. 시스템이 예측 안정성이 아닌 절대 수익률을 최적화 중.",
+        "metrics_before": {
+          "total_factors": 7430,
+          "generations": 348,
+          "avg_ic": 0.091,
+          "max_ic": 0.262,
+          "avg_sharpe": 1.35,
+          "max_sharpe": 4.38,
+          "avg_icir": 0.55,
+          "max_icir": 0.6924,
+          "icir_07_plus": 0,
+          "volume_pct_gen340": 90.2,
+          "fitness_corr_ic": 0.053,
+          "fitness_corr_icir": 0.300,
+          "fitness_corr_sharpe": 0.701
+        }
+      },
+      "changes": [
+        "IC 정규화 추가: ic_norm = min(1.0, ic_mean / 0.15) — IC를 [0,1] 범위로 변환하여 Sharpe/ICIR과 동등 스케일 경쟁",
+        "ICIR 가중치 증가: 0.20 → 0.30 — ICIR이 가장 큰 예측 품질 결정 요소",
+        "Sharpe 가중치 감소: 0.20 → 0.10 — Sharpe 지배 구조 해소"
+      ],
+      "files_modified": [
+        "app/alpha/fitness.py — _IC_NORM_CEIL=0.15, ic_norm 정규화 추가",
+        "app/core/config.py — ALPHA_FITNESS_W_ICIR=0.30, ALPHA_FITNESS_W_SHARPE=0.10"
+      ],
+      "verification": {
+        "cycles_elapsed": null,
+        "generations_range": null,
+        "metrics_after": null,
+        "criteria": [
+          {"label": "fitness-ICIR 상관 ≥0.40", "target": "≥0.40", "actual": null, "passed": null},
+          {"label": "fitness-IC 상관 ≥0.15", "target": "≥0.15", "actual": null, "passed": null},
+          {"label": "max ICIR ≥0.70", "target": "≥0.70", "actual": null, "passed": null},
+          {"label": "avg IC 하락 ≤15%", "target": "≤15%", "actual": null, "passed": null},
+          {"label": "max IC 유지", "target": "유지", "actual": null, "passed": null}
+        ]
+      },
+      "lesson": null
+    }
+  ]
+}
