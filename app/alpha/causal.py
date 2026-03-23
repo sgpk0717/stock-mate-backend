@@ -1,10 +1,10 @@
 """DoWhy 4단계 인과 검증 — Factor Mirage 제거.
 
-Phase 1에서 IC를 통과한 팩터가 교란 변수(시장 수익률, 변동성, 금리, 섹터)를
-통제한 후에도 forward_return에 유의미한 인과 효과를 가지는지 검증한다.
+Phase 1에서 IC를 통과한 팩터가 교란 변수(시장 수익률, 변동성, 금리, 섹터,
+SMB, HML)를 통제한 후에도 forward_return에 유의미한 인과 효과를 가지는지 검증한다.
 
 4단계:
-1. DAG 모델링: 고정 6노드 8엣지 그래프
+1. DAG 모델링: 고정 8노드 12엣지 그래프
 2. 식별: Backdoor Criterion
 3. 추정: Linear Regression → ATE + p-value
 4. 반증: Placebo Treatment + Random Common Cause
@@ -23,7 +23,8 @@ from scipy.stats import t as t_dist
 logger = logging.getLogger(__name__)
 
 # DoWhy 고정 DAG (GML 형식)
-# 노드: market_return, market_volatility, base_rate, sector_id, alpha_factor, forward_return
+# 노드: market_return, market_volatility, base_rate, sector_id, smb, hml,
+#        alpha_factor, forward_return
 _CAUSAL_DAG_GML = """
 graph [
     directed 1
@@ -31,6 +32,8 @@ graph [
     node [ id "market_volatility" label "market_volatility" ]
     node [ id "base_rate" label "base_rate" ]
     node [ id "sector_id" label "sector_id" ]
+    node [ id "smb" label "smb" ]
+    node [ id "hml" label "hml" ]
     node [ id "alpha_factor" label "alpha_factor" ]
     node [ id "forward_return" label "forward_return" ]
 
@@ -41,6 +44,10 @@ graph [
     edge [ source "base_rate" target "forward_return" ]
     edge [ source "sector_id" target "alpha_factor" ]
     edge [ source "sector_id" target "forward_return" ]
+    edge [ source "smb" target "alpha_factor" ]
+    edge [ source "smb" target "forward_return" ]
+    edge [ source "hml" target "alpha_factor" ]
+    edge [ source "hml" target "forward_return" ]
     edge [ source "alpha_factor" target "forward_return" ]
 ]
 """
@@ -54,14 +61,21 @@ DAG_EDGES = [
     {"from": "base_rate", "to": "forward_return"},
     {"from": "sector_id", "to": "alpha_factor"},
     {"from": "sector_id", "to": "forward_return"},
+    {"from": "smb", "to": "alpha_factor"},
+    {"from": "smb", "to": "forward_return"},
+    {"from": "hml", "to": "alpha_factor"},
+    {"from": "hml", "to": "forward_return"},
     {"from": "alpha_factor", "to": "forward_return"},
 ]
 
 
-_MIN_SAMPLES = 100  # 6변수 선형회귀에 최소 100개 (≈ 변수당 15-17개)
+_MIN_SAMPLES = 100  # 8변수 선형회귀에 최소 100개 (≈ 변수당 12-13개)
 
 # 교란변수 + 처리변수 컬럼 순서 (OLS 디자인 행렬)
-_CONFOUNDER_COLS = ["market_return", "market_volatility", "base_rate", "sector_id"]
+_CONFOUNDER_COLS = [
+    "market_return", "market_volatility", "base_rate", "sector_id",
+    "smb", "hml",
+]
 
 
 def _fast_ols(X: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -329,15 +343,13 @@ class FactorMirageFilter:
         data["alpha_factor"] = factor_values[:n]
         data["forward_return"] = forward_returns[:n]
 
-        # sector_id가 없으면 0으로 채움
-        if "sector_id" not in data.columns:
-            data["sector_id"] = 0
+        # 결측 교란변수 0으로 채움
+        for _col in ("sector_id", "smb", "hml"):
+            if _col not in data.columns:
+                data[_col] = 0
 
         # NaN 행 제거
-        required_cols = [
-            "market_return", "market_volatility", "base_rate",
-            "sector_id", "alpha_factor", "forward_return",
-        ]
+        required_cols = [*_CONFOUNDER_COLS, "alpha_factor", "forward_return"]
         data = data.dropna(subset=required_cols)
 
         if len(data) < _MIN_SAMPLES:
@@ -490,8 +502,10 @@ class FactorMirageFilter:
         data["alpha_factor"] = factor_values[:n]
         data["forward_return"] = forward_returns[:n]
 
-        if "sector_id" not in data.columns:
-            data["sector_id"] = 0
+        # 결측 교란변수 0으로 채움
+        for _col in ("sector_id", "smb", "hml"):
+            if _col not in data.columns:
+                data[_col] = 0
 
         required_cols = [*_CONFOUNDER_COLS, "alpha_factor", "forward_return"]
         data = data.dropna(subset=required_cols)
@@ -521,8 +535,8 @@ class FactorMirageFilter:
 
         # 절편 + 교란변수 행렬 (모든 검증에서 재사용)
         ones = np.ones((len(y), 1))
-        X_base = np.column_stack([ones, X_conf])  # (n, 5)
-        X_full = np.column_stack([X_base, treatment])  # (n, 6)
+        X_base = np.column_stack([ones, X_conf])  # (n, 7) — 절편+6교란변수
+        X_full = np.column_stack([X_base, treatment])  # (n, 8) — +처리변수
 
         # ── Step 3: ATE 추정 (backdoor linear regression) ──
         beta, p_values = _fast_ols(X_full, y)

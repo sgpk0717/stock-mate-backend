@@ -23,6 +23,8 @@ def _make_confounder_df(n: int, seed: int = 42) -> pd.DataFrame:
         "market_volatility": rng.uniform(0.01, 0.05, n),
         "base_rate": np.full(n, 3.5),
         "sector_id": rng.integers(0, 5, n),
+        "smb": rng.normal(0.0, 0.005, n),
+        "hml": rng.normal(0.0, 0.005, n),
     })
 
 
@@ -97,8 +99,8 @@ class TestFactorMirageFilter:
         # (교란 통제 후 팩터의 직접 효과는 작아져야)
 
     def test_c07_dag_structure(self):
-        """C07: DAG 엣지 구조 검증 (8엣지)."""
-        assert len(DAG_EDGES) == 8
+        """C07: DAG 엣지 구조 검증 (12엣지)."""
+        assert len(DAG_EDGES) == 12
 
         # 필수 엣지 검증
         edges_set = {(e["from"], e["to"]) for e in DAG_EDGES}
@@ -110,6 +112,10 @@ class TestFactorMirageFilter:
         assert ("base_rate", "forward_return") in edges_set
         assert ("sector_id", "alpha_factor") in edges_set
         assert ("sector_id", "forward_return") in edges_set
+        assert ("smb", "alpha_factor") in edges_set
+        assert ("smb", "forward_return") in edges_set
+        assert ("hml", "alpha_factor") in edges_set
+        assert ("hml", "forward_return") in edges_set
 
     def test_c08_constant_factor_not_robust(self):
         """C08: 상수 팩터 → 에러 없이 robust=False."""
