@@ -315,6 +315,9 @@ def _make_sell_trade(
     )
 
 
+LogCallback = Callable[[str], Awaitable[None]] | None
+
+
 async def run_backtest(
     strategy: dict,
     symbols: list[str] | None = None,
@@ -325,6 +328,7 @@ async def run_backtest(
     position_size_pct: float = 0.1,
     cost_config: CostConfig | None = None,
     progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
 ) -> BacktestResult:
     """전 종목 백테스트 실행.
 
@@ -367,8 +371,14 @@ async def run_backtest(
     warmup_days = 30 if is_intraday else 300
     warmup_start = (start_date - timedelta(days=warmup_days)) if start_date else None
 
+    import time as _time
+    _t0 = _time.monotonic()
+
+    _period_str = f"{start_date or '?'}~{end_date or '?'}"
     if progress_cb:
-        await progress_cb(0, 100, "데이터 로딩 중...")
+        await progress_cb(0, 100, f"데이터 로딩 중... ({interval}, {_period_str})")
+    if log_cb:
+        await log_cb(f"데이터 로딩 시작 (interval={interval}, period={_period_str})")
 
     df = await load_candles(symbols, warmup_start, end_date, interval)
     if df.is_empty():
@@ -376,9 +386,12 @@ async def run_backtest(
 
     symbol_list = df["symbol"].unique().sort().to_list()
     total = len(symbol_list)
+    _elapsed = _time.monotonic() - _t0
 
     if progress_cb:
-        await progress_cb(5, 100, f"{total}개 종목 데이터 로딩 완료")
+        await progress_cb(5, 100, f"{total}개 종목, {df.height:,}행 로딩 완료 ({_elapsed:.1f}초)")
+    if log_cb:
+        await log_cb(f"{total}개 종목 × {df.height:,}행 로딩 ({_elapsed:.1f}초)")
 
     # ── 1.5. 뉴스 감성 데이터 로딩 (필요 시) ──
     sentiment_df: pl.DataFrame | None = None
@@ -391,6 +404,8 @@ async def run_backtest(
                 sentiment_df = None
             else:
                 logger.info("감성 데이터 로딩: %d행", sentiment_df.height)
+                if log_cb:
+                    await log_cb(f"뉴스 감성 데이터 로딩: {sentiment_df.height:,}행")
         except Exception as e:
             logger.warning("감성 데이터 로딩 실패: %s", e)
             sentiment_df = None
@@ -430,12 +445,17 @@ async def run_backtest(
         except Exception as e:
             logger.warning("Signal generation failed for %s: %s", sym, e)
 
-        if progress_cb and (i + 1) % 100 == 0:
+        if progress_cb and ((i + 1) % 20 == 0 or i + 1 == total):
             pct = 5 + int(55 * (i + 1) / total)
             await progress_cb(pct, 100, f"시그널 생성 {i + 1}/{total}")
+        if log_cb and (i == 0 or (i + 1) % 20 == 0 or i + 1 == total):
+            await log_cb(f"시그널 생성 {i + 1}/{total} ({sym})")
 
+    _signal_count = len(signal_dfs)
     if progress_cb:
-        await progress_cb(60, 100, "포트폴리오 시뮬레이션 시작")
+        await progress_cb(60, 100, f"포트폴리오 시뮬레이션 시작 ({_signal_count}종목)")
+    if log_cb:
+        await log_cb(f"시그널 생성 완료 — {_signal_count}/{total}종목 유효")
 
     # ── 3. 날짜별 시그널 통합 + 포트폴리오 시뮬레이션 ──
     buy_conds = strategy.get("buy_conditions", [])
@@ -780,7 +800,7 @@ async def run_backtest(
 
         equity_by_date[date_str] = cash + pos_value
 
-        if progress_cb and (date_idx + 1) % 50 == 0:
+        if progress_cb and (date_idx + 1) % 20 == 0:
             pct = 60 + int(35 * (date_idx + 1) / len(all_dates))
             await progress_cb(min(pct, 95), 100, f"시뮬레이션 {date_idx + 1}/{len(all_dates)}일")
 
@@ -804,10 +824,15 @@ async def run_backtest(
     equity_curve = [{"date": d, "equity": round(eq)} for d, eq in sorted(equity_by_date.items())]
 
     # ── 4. 성과 지표 ──
+    if log_cb:
+        await log_cb(f"성과 지표 계산 중... ({len(trades)}건 매매)")
     metrics = compute_metrics(trades, equity_curve, initial_capital)
 
+    _total_elapsed = _time.monotonic() - _t0
     if progress_cb:
         await progress_cb(100, 100, "완료")
+    if log_cb:
+        await log_cb(f"백테스트 완료 — {len(trades)}건 매매, 총 {_total_elapsed:.1f}초 소요")
 
     return BacktestResult(
         trades=trades,

@@ -7,7 +7,7 @@ import uuid
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.ai_strategy import generate_strategy_from_prompt
@@ -19,6 +19,7 @@ from app.backtest.schemas import (
     AIStrategyRequest,
     AIStrategyResponse,
     BacktestRunCreate,
+    BacktestRunPageResponse,
     BacktestRunResponse,
     BacktestRunSummary,
     StrategyInfo,
@@ -112,25 +113,71 @@ async def get_backtest_run(run_id: str, db: AsyncSession = Depends(get_db)):
     return _run_to_response(run)
 
 
-@router.get("/runs", response_model=list[BacktestRunSummary])
+_ALLOWED_SORT_COLUMNS = {
+    "created_at", "strategy_name",
+}
+_METRIC_SORT_COLUMNS = {
+    "total_return", "sharpe_ratio", "mdd", "win_rate", "total_trades",
+}
+
+
+@router.get("/runs", response_model=BacktestRunPageResponse)
 async def list_backtest_runs(
+    offset: int = 0,
     limit: int = 20,
+    sort_by: str = "created_at",
+    order: str = "desc",
+    status: str | None = None,
+    search: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """최근 백테스트 실행 목록."""
+    """백테스트 실행 목록 (페이징, 정렬, 필터, 검색)."""
     from sqlalchemy.orm import defer
-    result = await db.execute(
+
+    # WHERE 조건
+    filters = []
+    if status:
+        filters.append(BacktestRun.status == status)
+    if search:
+        filters.append(BacktestRun.strategy_name.ilike(f"%{search}%"))
+
+    # 전체 개수
+    count_q = select(func.count()).select_from(BacktestRun)
+    for f in filters:
+        count_q = count_q.where(f)
+    total = await db.scalar(count_q) or 0
+
+    # ORDER BY
+    if sort_by in _ALLOWED_SORT_COLUMNS:
+        col = getattr(BacktestRun, sort_by)
+        order_clause = col.asc().nulls_last() if order == "asc" else col.desc().nulls_last()
+    elif sort_by in _METRIC_SORT_COLUMNS:
+        # JSON 필드에서 추출 (PostgreSQL ->> 연산자)
+        json_expr = BacktestRun.metrics[sort_by].as_float()
+        order_clause = json_expr.asc().nulls_last() if order == "asc" else json_expr.desc().nulls_last()
+    else:
+        order_clause = BacktestRun.created_at.desc().nulls_last()
+
+    # 데이터 쿼리
+    data_q = (
         select(BacktestRun)
         .options(
             defer(BacktestRun.equity_curve),
             defer(BacktestRun.trades_summary),
             defer(BacktestRun.strategy_json),
         )
-        .order_by(BacktestRun.created_at.desc())
-        .limit(limit)
     )
+    for f in filters:
+        data_q = data_q.where(f)
+    data_q = data_q.order_by(order_clause).offset(offset).limit(limit)
+
+    result = await db.execute(data_q)
     runs = result.scalars().all()
-    return [_run_to_summary(r) for r in runs]
+
+    return BacktestRunPageResponse(
+        items=[_run_to_summary(r) for r in runs],
+        total=total,
+    )
 
 
 @router.delete("/run/{run_id}", status_code=204)
@@ -173,6 +220,7 @@ def _run_to_summary(run: BacktestRun) -> BacktestRunSummary:
         status=run.status,
         progress=run.progress,
         total_return=metrics.get("total_return"),
+        sharpe_ratio=metrics.get("sharpe_ratio"),
         mdd=metrics.get("mdd"),
         win_rate=metrics.get("win_rate"),
         total_trades=metrics.get("total_trades"),

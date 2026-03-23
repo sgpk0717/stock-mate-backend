@@ -7,7 +7,7 @@ import logging
 import math
 import uuid
 from dataclasses import asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -67,6 +67,13 @@ async def execute_backtest(
             "message": msg,
         })
 
+    async def log_cb(msg: str) -> None:
+        """진행률 변경 없이 로그 메시지만 전송."""
+        await manager.broadcast(channel, {
+            "type": "log",
+            "message": msg,
+        })
+
     try:
         # 상태 → RUNNING
         async with async_session() as db:
@@ -92,6 +99,7 @@ async def execute_backtest(
                     position_size_pct=position_size_pct,
                     cost_config=cost_config,
                     progress_cb=progress_cb,
+                    log_cb=log_cb,
                 ),
                 timeout=timeout,
             )
@@ -104,7 +112,7 @@ async def execute_backtest(
                     .values(
                         status="FAILED",
                         error_message=msg,
-                        completed_at=datetime.utcnow(),
+                        completed_at=datetime.now(timezone.utc),
                     )
                 )
                 await db.commit()
@@ -121,7 +129,7 @@ async def execute_backtest(
                     .values(
                         status="FAILED",
                         error_message=str(result.metrics["error"])[:500],
-                        completed_at=datetime.utcnow(),
+                        completed_at=datetime.now(timezone.utc),
                     )
                 )
                 await db.commit()
@@ -147,7 +155,7 @@ async def execute_backtest(
                     equity_curve=_sanitize_for_json(result.equity_curve),
                     trades_summary=_sanitize_for_json(trades_list),
                     symbol_count=len(set(t.symbol for t in result.trades)),
-                    completed_at=datetime.utcnow(),
+                    completed_at=datetime.now(timezone.utc),
                 )
             )
             await db.commit()
@@ -169,7 +177,7 @@ async def execute_backtest(
                 .values(
                     status="FAILED",
                     error_message=str(e)[:500],
-                    completed_at=datetime.utcnow(),
+                    completed_at=datetime.now(timezone.utc),
                 )
             )
             await db.commit()

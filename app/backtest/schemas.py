@@ -101,10 +101,16 @@ class BacktestRunSummary(BaseModel):
     status: str
     progress: int
     total_return: float | None = None
+    sharpe_ratio: float | None = None
     mdd: float | None = None
     win_rate: float | None = None
     total_trades: int | None = None
     created_at: str
+
+
+class BacktestRunPageResponse(BaseModel):
+    items: list[BacktestRunSummary]
+    total: int
 
 
 class StrategyInfo(BaseModel):

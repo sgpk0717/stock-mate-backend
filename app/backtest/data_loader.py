@@ -63,6 +63,39 @@ async def load_candles(
                   일봉: dt=Date, 분봉: dt=Datetime
     """
     if interval in _DERIVED_FROM_1M or interval == "1m":
+        # DB에 해당 인터벌 데이터가 존재하면 직접 로딩 시도
+        if interval != "1m":
+            df_direct = await _load_raw_candles(
+                symbols, start_date, end_date, db_interval=interval, as_datetime=True,
+            )
+            if not df_direct.is_empty():
+                # 오늘 데이터가 포함되어 있는지 확인
+                # 없으면 1분봉 폴백으로 보충 (장중 수집기가 1m만 저장하는 경우)
+                max_dt = df_direct["dt"].max()
+                today_start = datetime.combine(date.today(), datetime.min.time())
+                if max_dt is not None and max_dt >= today_start:
+                    return df_direct
+                # 오늘 데이터 없음 → 1분봉에서 리샘플링하여 합산
+                logger.info(
+                    "load_candles(%s): DB %s 데이터에 오늘분 없음 (max=%s), 1분봉 폴백",
+                    interval, interval, max_dt,
+                )
+                df_1m = await _load_raw_candles_chunked(
+                    symbols, start_date, end_date, db_interval="1m", as_datetime=True,
+                )
+                if not df_1m.is_empty():
+                    minutes = _interval_minutes(interval)
+                    df_resampled = _aggregate_to_minutes(df_1m, minutes)
+                    if not df_resampled.is_empty():
+                        # 직접 로딩 + 리샘플링 합산, 중복 제거
+                        # 컬럼 순서 통일 후 concat
+                        cols = df_direct.columns
+                        df_resampled = df_resampled.select(cols)
+                        combined = pl.concat([df_direct, df_resampled])
+                        combined = combined.unique(subset=["symbol", "dt"], keep="last")
+                        return combined.sort(["symbol", "dt"])
+                return df_direct
+        # 폴백: 1분봉에서 집계
         df = await _load_raw_candles_chunked(
             symbols, start_date, end_date, db_interval="1m", as_datetime=True,
         )
@@ -145,6 +178,7 @@ async def _load_raw_candles(
             # 분봉: TIMESTAMPTZ → KST datetime (시분초 유지)
             def _to_kst_datetime(dt_val: datetime) -> datetime:
                 if hasattr(dt_val, "astimezone"):
+                    # 의도적 naive KST 변환: 백테스트 엔진이 naive datetime 기대
                     return dt_val.astimezone(_KST).replace(tzinfo=None)
                 return dt_val
 

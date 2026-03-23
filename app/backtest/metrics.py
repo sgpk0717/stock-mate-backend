@@ -33,8 +33,16 @@ def compute_metrics(
     equity_curve: list[dict],
     initial_capital: float,
     annualize: float = 252.0,
+    intraday: bool = False,
 ) -> dict:
-    """trades 와 equity_curve 로부터 성과 지표를 산출한다."""
+    """trades 와 equity_curve 로부터 성과 지표를 산출한다.
+
+    Parameters
+    ----------
+    intraday : True이면 봉별 equity_curve를 일별로 집계하여
+               Sharpe/MDD/연환산을 일별 수익률 기준으로 계산한다.
+               (리서치 권장: 장중 전략은 √252 연환산이 표준)
+    """
 
     if not equity_curve:
         return _empty_metrics()
@@ -43,13 +51,22 @@ def compute_metrics(
     total_return = (final_equity - initial_capital) / initial_capital * 100
     total_return_amount = final_equity - initial_capital
 
-    # 연환산 수익률
-    days = max(len(equity_curve), 1)
-    years = days / annualize
-    annualized = ((final_equity / initial_capital) ** (1 / max(years, 0.01)) - 1) * 100 if years > 0 else 0
+    # 장중 전략: 봉별 → 일별 equity 집계 (각 날짜의 마지막 봉)
+    if intraday:
+        daily_equity = _aggregate_daily_equity(equity_curve)
+        trading_days = max(len(daily_equity), 1)
+        years = trading_days / 252.0
+        sharpe = _calc_sharpe(daily_equity, annualize=252.0)
+        mdd, mdd_amount = _calc_mdd(daily_equity)
+        sharpe_basis = "daily"
+    else:
+        trading_days = max(len(equity_curve), 1)
+        years = trading_days / annualize
+        sharpe = _calc_sharpe(equity_curve, annualize=annualize)
+        mdd, mdd_amount = _calc_mdd(equity_curve)
+        sharpe_basis = "bar"
 
-    # MDD
-    mdd, mdd_amount = _calc_mdd(equity_curve)
+    annualized = ((final_equity / initial_capital) ** (1 / max(years, 0.01)) - 1) * 100 if years > 0 else 0
 
     # 승률
     closed = [t for t in trades if t.exit_date is not None]
@@ -66,9 +83,6 @@ def compute_metrics(
     gross_profit = sum(t.pnl for t in wins)
     gross_loss = abs(sum(t.pnl for t in losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
-
-    # 샤프 비율 (봉간 수익률 기반)
-    sharpe = _calc_sharpe(equity_curve, annualize=annualize)
 
     # 평균 보유일
     avg_holding = sum(t.holding_days for t in closed) / total_trades if total_trades > 0 else 0
@@ -94,6 +108,7 @@ def compute_metrics(
         "win_rate": round(win_rate, 2),
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else 999.99,
         "sharpe_ratio": round(sharpe, 2),
+        "sharpe_basis": sharpe_basis,
         "total_trades": total_trades,
         "avg_holding_days": round(avg_holding, 1),
         "avg_win": round(avg_win, 2),
@@ -169,3 +184,16 @@ def _calc_streaks(closed: list[Trade]) -> tuple[int, int]:
         max_w = max(max_w, cur_w)
         max_l = max(max_l, cur_l)
     return max_w, max_l
+
+
+def _aggregate_daily_equity(equity_curve: list[dict]) -> list[dict]:
+    """봉별 equity_curve → 일별 마감 equity (각 날짜의 마지막 봉).
+
+    장중 전략에서 Sharpe/MDD를 일별 수익률 기반으로 계산하기 위해 사용.
+    무포지션 일자의 수익률은 0으로 자연스럽게 반영된다 (equity 변화 없음).
+    """
+    daily: dict[str, float] = {}
+    for pt in equity_curve:
+        d = pt["date"][:10]  # YYYY-MM-DD
+        daily[d] = pt["equity"]  # 마지막 봉이 덮어씀
+    return [{"date": d, "equity": eq} for d, eq in sorted(daily.items())]

@@ -98,6 +98,7 @@ async def generate_strategy_from_prompt(user_prompt: str) -> dict:
                 ),
             }
         ],
+        caller="backtest.ai_strategy",
     )
 
     text = response.content[0].text
