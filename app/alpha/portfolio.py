@@ -482,6 +482,8 @@ async def auto_optimize_composite(
         AlphaFactor.ic_mean >= min_ic,
         AlphaFactor.turnover.isnot(None),
         AlphaFactor.turnover >= min_turnover,
+        AlphaFactor.icir.isnot(None),
+        AlphaFactor.icir >= 0.3,  # ICIR<0.3 = 노이즈 (딥리서치 권고)
     ]
     if interval:
         filters.append(AlphaFactor.interval == interval)
@@ -720,15 +722,36 @@ async def auto_optimize_composite(
 
     await _log(f"Step 3/4: 일별 팩터 평균 {n_days}일 × {n_factors}팩터 구축")
 
-    # EWMA 가중 공분산
-    ewma_half_life = 60
+    # 시간축 분산=0 팩터 제거 (상수 출력 → 상관 계산 불가 → Greedy가 "무상관"으로 오인)
+    col_vars = np.var(daily_matrix, axis=0)
+    var_alive = col_vars > 1e-12
+    n_zero_var = int((~var_alive).sum())
+    if n_zero_var > 0:
+        await _log(f"  분산=0 팩터 {n_zero_var}개 제거 (상수 출력): 유효 {int(var_alive.sum())}개")
+        alive_idx = np.where(var_alive)[0]
+        daily_matrix = daily_matrix[:, var_alive]
+        valid_factors = [valid_factors[i] for i in alive_idx]
+        ic_values = [ic_values[i] for i in alive_idx]
+        polars_exprs = [polars_exprs[i] for i in alive_idx]
+        n_factors = len(valid_factors)
+        if n_factors < 3:
+            raise ValueError(f"분산>0 팩터 부족: {n_factors}개 (최소 3개)")
+
+    # 랭크 변환: 원시 팩터값 → 시간축 랭크 (Spearman 상관 효과)
+    # 원시값 Pearson은 비선형 의존성 미탐지 + 스케일 차이 → 상관=0 (딥리서치 확인)
+    from scipy.stats import rankdata as _rankdata
+    ranked_matrix = np.apply_along_axis(_rankdata, 0, daily_matrix)
+    await _log(f"Step 3/4: 랭크 변환 적용 (Spearman 상관)")
+
+    # EWMA 가중 공분산 (랭크 데이터에 적용)
+    ewma_half_life = 200  # 60→200일 (Barra USE4 기준, LW 과수축 방지)
     ewma_lambda = 0.5 ** (1.0 / ewma_half_life)
     ewma_weights = np.array([ewma_lambda ** (n_days - 1 - i) for i in range(n_days)])
     ewma_weights /= ewma_weights.sum()
 
-    # 가중 평균 + 중심화
-    weighted_mean = ewma_weights @ daily_matrix
-    centered = daily_matrix - weighted_mean
+    # 가중 평균 + 중심화 (ranked 데이터)
+    weighted_mean = ewma_weights @ ranked_matrix
+    centered = ranked_matrix - weighted_mean
     # 가중 공분산: X^T diag(w) X
     cov_matrix = (centered * ewma_weights[:, None]).T @ centered
     n_obs = n_days

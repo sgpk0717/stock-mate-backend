@@ -271,6 +271,33 @@ class AlphaFactoryScheduler:
         self._state.current_cycle_progress = 0
         cycle_num = self._state.cycles_completed + 1
 
+        # ── 텔레그램 피드백 RAG 주입 (딥리서치 권고) ──
+        try:
+            from app.core.database import async_session
+            from app.telegram.models import TelegramMessageLog
+            import re as _re
+
+            async with async_session() as _db:
+                _result = await _db.execute(
+                    select(TelegramMessageLog.text)
+                    .where(TelegramMessageLog.category == "mining_report")
+                    .order_by(TelegramMessageLog.created_at.desc())
+                    .limit(1)
+                )
+                _last_report = _result.scalar()
+                if _last_report:
+                    _match = _re.search(
+                        r"(?:전략적 제안|전략적 제언|Strategic|제언|Suggestion)(.*?)(?:\n\n|\Z)",
+                        _last_report, _re.DOTALL,
+                    )
+                    if _match:
+                        _suggestion = _match.group(1).strip()[:500]
+                        _base_ctx = config.get("context", "")
+                        config["context"] = f"{_base_ctx}\n\n[이전 사이클 관찰]\n{_suggestion}"
+                        logger.info("텔레그램 피드백 RAG 주입: %d자", len(_suggestion))
+        except Exception:
+            pass  # 실패해도 마이닝은 계속
+
         # ★ LLM 장애 리셋을 최상단에서 보장 (데이터 로드 실패 시에도 리셋)
         self._operator_registry.reset_llm_failures()
         discovered: list[DiscoveredFactor] = []

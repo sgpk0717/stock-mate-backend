@@ -333,7 +333,7 @@ def _collect_conditions_detail(
     return detail
 
 
-def _log_decision(
+async def _log_decision(
     session: LiveSession,
     symbol: str,
     action: str,
@@ -345,16 +345,33 @@ def _log_decision(
     sizing: dict | None = None,
     risk: dict | None = None,
 ) -> None:
-    """판단 기록 — decision_logger.log_decision 래퍼.
+    """판단 기록 — decision_logger.log_decision 래퍼 + Redis 동기화.
 
-    기존 호출부 14곳 변경 없이 공통 모듈을 사용한다.
+    Worker 메모리에 기록하고, Redis List에도 RPUSH하여
+    API 컨테이너에서 조회 가능하게 한다.
     """
     from app.trading.decision_logger import log_decision
-    log_decision(
+    entry = log_decision(
         session.decision_log, symbol, action, reason,
         signal=signal, conditions=conditions, snapshot=snapshot,
         sizing=sizing, risk=risk,
     )
+    # Redis 동기화 (snapshot 제외 — 사이즈 절감)
+    try:
+        import json as _json
+        from app.core.redis import rpush, get_client
+        redis_entry = {k: v for k, v in entry.items() if k != "snapshot"}
+        key = f"decisions:{session.id}"
+        await rpush(key, _json.dumps(redis_entry, ensure_ascii=False, default=str))
+        # 100건마다 LTRIM + TTL 설정
+        if len(session.decision_log) % 100 == 0:
+            r = get_client()
+            await r.ltrim(key, -5000, -1)
+            ttl = await r.ttl(key)
+            if ttl < 0:
+                await r.expire(key, 86400)
+    except Exception:
+        pass  # Redis 실패해도 기존 동작에 영향 없음
 
 
 # ── 분할매매 헬퍼 ────────────────────────────────────────────
@@ -892,14 +909,14 @@ async def _paper_loop_tick(
     for sym in scan_symbols:
         sym_df = df.filter(pl.col("symbol") == sym).sort("dt")
         if sym_df.height < 30:
-            _log_decision(session, sym, "SKIP_DATA",
+            await _log_decision(session, sym, "SKIP_DATA",
                           f"데이터 부족: {sym_df.height}봉 (최소 30봉 필요)")
             _skip_data += 1
             continue
         try:
             sym_df = generate_signals(sym_df, strategy)
         except Exception as e:
-            _log_decision(session, sym, "SKIP_ERROR",
+            await _log_decision(session, sym, "SKIP_ERROR",
                           f"시그널 생성 실패: {type(e).__name__}: {e}")
             _skip_error += 1
             continue
@@ -1014,7 +1031,7 @@ async def _paper_loop_tick(
         if signal == 1 and _strategy_pipeline is not None:
             filt = _strategy_pipeline.evaluate(signal, row, ctx)
             if filt.get("skip"):
-                _log_decision(
+                await _log_decision(
                     session, sym, "SKIP_STRATEGY_FILTER",
                     filt.get("reason", "전략 필터 거부"),
                     signal=signal,
@@ -1049,7 +1066,7 @@ async def _paper_loop_tick(
 
             if risk_decision is not None:
                 sell_price = effective_sell_price(close_price, cost)
-                _log_decision(session, sym, risk_decision.action, risk_decision.reason,
+                await _log_decision(session, sym, risk_decision.action, risk_decision.reason,
                               risk=risk_decision.risk)
 
                 if risk_decision.action == "PARTIAL_EXIT":
@@ -1079,7 +1096,7 @@ async def _paper_loop_tick(
             sell_reason = "매도 시그널: " + ", ".join(
                 f"{c['indicator']}{c['op']}{c['threshold']} (실제={c['actual']})"
                 for c in conditions.get("sell_conditions", []))
-            _log_decision(session, sym, "SELL", sell_reason,
+            await _log_decision(session, sym, "SELL", sell_reason,
                           signal=signal, conditions=conditions, snapshot=snapshot)
 
             if _cfg.PAPER_USE_LIMIT_ORDERS:
@@ -1095,7 +1112,7 @@ async def _paper_loop_tick(
                     "elapsed_bars": 0,
                     "snapshot": snapshot, "conditions": conditions,
                 })
-                _log_decision(session, sym, "LIMIT_ORDER_PLACED",
+                await _log_decision(session, sym, "LIMIT_ORDER_PLACED",
                               f"지정가 매도 등록: {pos.qty}주 @ {limit_sell_price:,.0f} "
                               f"(TTL={_cfg.PAPER_LIMIT_TTL_BARS}봉)")
             else:
@@ -1136,7 +1153,7 @@ async def _paper_loop_tick(
                     pos.scale_in_count += 1
                     result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
                                "message": f"시뮬 추가매수 체결 @ {buy_p:,.0f}"}
-                    _log_decision(session, sym, "SCALE_IN", scale_decision.reason,
+                    await _log_decision(session, sym, "SCALE_IN", scale_decision.reason,
                                   snapshot=snapshot, sizing=scale_decision.sizing)
                     _log_trade(session, sym, "BUY", "B2", remaining_qty, buy_p, result,
                                reason=scale_decision.reason,
@@ -1166,7 +1183,7 @@ async def _paper_loop_tick(
             )
 
             if buy_decision.action == "SKIP_BUY":
-                _log_decision(session, sym, "SKIP_BUY", buy_decision.reason,
+                await _log_decision(session, sym, "SKIP_BUY", buy_decision.reason,
                               signal=signal, conditions=conditions, snapshot=snapshot,
                               sizing=buy_decision.sizing)
                 continue
@@ -1182,7 +1199,7 @@ async def _paper_loop_tick(
                 if _cfg.PAPER_USE_LIMIT_ORDERS:
                     # pending 중 같은 종목 중복 방지
                     if any(o["symbol"] == sym and o["side"] == "BUY" for o in session.pending_orders):
-                        _log_decision(session, sym, "SKIP_BUY",
+                        await _log_decision(session, sym, "SKIP_BUY",
                                       f"이미 지정가 매수 대기 중",
                                       signal=signal, conditions=conditions, snapshot=snapshot)
                         continue
@@ -1199,7 +1216,7 @@ async def _paper_loop_tick(
                         "snapshot": snapshot, "conditions": conditions,
                         "sizing": buy_decision.sizing,
                     })
-                    _log_decision(session, sym, "LIMIT_ORDER_PLACED",
+                    await _log_decision(session, sym, "LIMIT_ORDER_PLACED",
                                   f"지정가 매수 등록: {qty}주 @ {buy_price:,.0f} "
                                   f"(TTL={_cfg.PAPER_LIMIT_TTL_BARS}봉) — {buy_reason}",
                                   signal=signal, conditions=conditions, snapshot=snapshot,
@@ -1219,7 +1236,7 @@ async def _paper_loop_tick(
                     )
                     result = {"success": True, "order_id": f"SIM-{uuid.uuid4().hex[:8]}",
                                "message": f"시뮬 매수 체결 @ {buy_price:,.0f}"}
-                    _log_decision(session, sym, "BUY", buy_reason,
+                    await _log_decision(session, sym, "BUY", buy_reason,
                                   signal=signal, conditions=conditions, snapshot=snapshot,
                                   sizing=buy_decision.sizing)
                     _log_trade(session, sym, "BUY", "B1", qty, buy_price, result,
@@ -1375,16 +1392,24 @@ def _process_pending_orders(
                     session._cash -= max(0, cash_diff)
                     order["price"] = market_price
                     _fill_pending_buy(session, order, candle_dt_str, cost)
-                    _log_decision(
-                        session, sym, "LIMIT_EXPIRED_MARKET",
-                        f"매수 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
-                    )
+                    import asyncio as _aio
+                    try:
+                        _loop = _aio.get_running_loop()
+                        _loop.create_task(_log_decision(
+                            session, sym, "LIMIT_EXPIRED_MARKET",
+                            f"매수 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
+                        ))
+                    except RuntimeError:
+                        pass  # 이벤트 루프 없으면 스킵
                 else:
                     session._cash += reserved
-                    _log_decision(
-                        session, sym, "LIMIT_EXPIRED_CANCEL",
-                        f"매수 TTL 만료 + 현금 부족 → 취소 (반환 {reserved:,.0f})",
-                    )
+                    try:
+                        _aio.get_running_loop().create_task(_log_decision(
+                            session, sym, "LIMIT_EXPIRED_CANCEL",
+                            f"매수 TTL 만료 + 현금 부족 → 취소 (반환 {reserved:,.0f})",
+                        ))
+                    except RuntimeError:
+                        pass
                 continue
             still_pending.append(order)
 
@@ -1396,10 +1421,13 @@ def _process_pending_orders(
                 market_price = effective_sell_price(close, cost)
                 order["price"] = market_price
                 _fill_pending_sell(session, order, candle_dt_str, cost)
-                _log_decision(
-                    session, sym, "LIMIT_EXPIRED_MARKET",
-                    f"매도 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
-                )
+                try:
+                    _aio.get_running_loop().create_task(_log_decision(
+                        session, sym, "LIMIT_EXPIRED_MARKET",
+                        f"매도 TTL 만료 → 시장가 체결 @ {market_price:,.0f} (대기 {order['elapsed_bars']}봉)",
+                    ))
+                except RuntimeError:
+                    pass
                 continue
             still_pending.append(order)
 
@@ -1831,7 +1859,7 @@ async def _real_check_signals(
         if signal == 1 and _strategy_pipeline is not None:
             filt = _strategy_pipeline.evaluate(signal, last_row, ctx)
             if filt.get("skip"):
-                _log_decision(
+                await _log_decision(
                     session, sym, "SKIP_STRATEGY_FILTER",
                     filt.get("reason", "전략 필터 거부"),
                     signal=signal, snapshot=snapshot,
@@ -1850,7 +1878,7 @@ async def _real_check_signals(
         from .order_manager import get_order_manager
         om = get_order_manager()
         if om.has_pending(sym):
-            _log_decision(session, sym, "SKIP_PENDING",
+            await _log_decision(session, sym, "SKIP_PENDING",
                           "미체결 주문 존재 — 중복 주문 방지",
                           signal=signal, conditions=conditions, snapshot=snapshot)
             continue

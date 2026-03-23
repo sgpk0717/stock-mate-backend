@@ -288,7 +288,25 @@ async def get_session_decisions(
       - action: BUY, SELL, SKIP_BUY, SKIP_DATA, SKIP_ERROR, RISK_STOP, RISK_TRAIL 등
       - symbol: 특정 종목 필터
       - limit: 최대 반환 건수 (기본 200)
+
+    Phase 2: Redis List 우선 → 메모리 폴백 (서비스 분리 대응).
     """
+    # 1. Redis에서 읽기 (Worker가 RPUSH한 데이터)
+    try:
+        import json
+        from app.core.redis import lrange
+        raw = await lrange(f"decisions:{session_id}")
+        if raw:
+            logs = [json.loads(r) for r in raw]
+            if action:
+                logs = [d for d in logs if d.get("action") == action]
+            if symbol:
+                logs = [d for d in logs if d.get("symbol") == symbol]
+            return logs[-limit:]
+    except Exception:
+        pass
+
+    # 2. 폴백: 메모리 (Worker 내부 또는 inline 모드)
     session = get_session(session_id)
     if not session:
         raise HTTPException(404, "Session not found")

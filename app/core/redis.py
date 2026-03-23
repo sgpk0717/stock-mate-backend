@@ -84,6 +84,29 @@ async def delete(key: str) -> None:
         logger.debug("Redis delete 실패 (%s): %s", key, e)
 
 
+# ── 판단 로그 (List) ──
+
+
+async def rpush(key: str, *values: str) -> int | None:
+    """Redis List에 엔트리 추가 (RPUSH)."""
+    r = get_client()
+    try:
+        return await r.rpush(key, *values)
+    except Exception as e:
+        logger.debug("Redis rpush 실패 (%s): %s", key, e)
+        return None
+
+
+async def lrange(key: str, start: int = 0, end: int = -1) -> list[str]:
+    """Redis List 범위 조회 (LRANGE)."""
+    r = get_client()
+    try:
+        return await r.lrange(key, start, end)
+    except Exception as e:
+        logger.debug("Redis lrange 실패 (%s): %s", key, e)
+        return []
+
+
 # ── 명령 큐 (Stream) ──
 
 
