@@ -36,9 +36,9 @@ class CPCVResult:
 def cpcv_validate(
     df: pl.DataFrame,
     factor_expr: sympy.Basic | str,
-    n_groups: int = 5,
-    n_test: int = 2,
-    embargo_days: int = 5,
+    n_groups: int = 10,   # 5→10 (일봉 40년, 그룹당 ~4년, 딥리서치 권고)
+    n_test: int = 3,      # 2→3 (C(10,3)=120 경로)
+    embargo_days: int = 10,  # 5→10 (일봉 보유기간 고려)
     ic_threshold: float = 0.03,
 ) -> CPCVResult:
     """조합적 정제 교차 검증.
@@ -173,8 +173,8 @@ def cpcv_validate(
     negative_paths = sum(1 for ic in paths_ic if ic <= 0)
     pbo = negative_paths / len(paths_ic)
 
-    # 통과 조건: mean_ic >= threshold AND PBO < 0.5
-    passed = mean_ic >= ic_threshold and pbo < 0.5
+    # 통과 조건: mean_ic >= threshold AND PBO < 0.3 (딥리서치 권고: 더 엄격한 과적합 필터)
+    passed = mean_ic >= ic_threshold and pbo < 0.3
 
     return CPCVResult(
         passed=passed,

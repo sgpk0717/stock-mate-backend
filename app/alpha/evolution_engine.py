@@ -16,7 +16,7 @@ from dataclasses import asdict
 
 import polars as pl
 import sympy
-from sqlalchemy import func, or_ as db_or, select, update
+from sqlalchemy import and_ as db_and, func, or_ as db_or, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alpha.ast_converter import (
@@ -55,6 +55,12 @@ from app.alpha.operators import OperatorRegistry
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# 인터벌별 팩터 이름 prefix (일봉/분봉 구분)
+_INTERVAL_PREFIX = {
+    "1m": "m1", "3m": "m3", "5m": "m5",
+    "15m": "m15", "30m": "m30", "1h": "h1", "1d": "d",
+}
 
 
 class EvolutionEngine:
@@ -839,7 +845,7 @@ class EvolutionEngine:
                         ic_series=[],
                     )
                     df = DiscoveredFactor(
-                        name=f"evo_g{self._generation}_{len(new_discovered)}",
+                        name=f"{_INTERVAL_PREFIX.get(self._interval, 'x')}_evo_g{self._generation}_{len(new_discovered)}",
                         expression_str=child.expression_str,
                         expression_sympy=str(child.expression),
                         polars_code=self._safe_code_string(child.expression),
@@ -1945,7 +1951,7 @@ class EvolutionEngine:
                 # 신규 팩터 삽입
                 new_factor = AlphaFactor(
                     mining_run_id=uuid.UUID(self._current_run_id) if self._current_run_id else None,
-                    name=f"evo_g{self._generation}",
+                    name=f"{_INTERVAL_PREFIX.get(self._interval, 'x')}_evo_g{self._generation}",
                     expression_str=factor.expression_str,
                     expression_sympy=str(factor.expression),
                     polars_code=self._safe_code_string(factor.expression),
@@ -1983,11 +1989,9 @@ class EvolutionEngine:
                 sa_delete(AlphaFactor).where(
                     AlphaFactor.population_active == False,  # noqa: E712
                     AlphaFactor.status == "population",
-                    db_or(
-                        AlphaFactor.ic_mean < 0.03,
-                        AlphaFactor.ic_mean.is_(None),
-                        AlphaFactor.sharpe < 0.3,
-                        AlphaFactor.sharpe.is_(None),
+                    db_and(  # OR→AND: 둘 다 나쁜 경우에만 삭제 (딥리서치 권고)
+                        db_or(AlphaFactor.ic_mean < 0.03, AlphaFactor.ic_mean.is_(None)),
+                        db_or(AlphaFactor.sharpe < 0.3, AlphaFactor.sharpe.is_(None)),
                     ),
                 )
             )

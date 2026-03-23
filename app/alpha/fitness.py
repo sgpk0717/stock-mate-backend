@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 
 # Turnover 하한: 이보다 낮으면 Buy-and-Hold (스캘핑 무용) → 즉시 탈락
-_TURNOVER_FLOOR = 0.02
+_TURNOVER_FLOOR = 0.005  # 0.5% (일봉 가치팩터 턴오버 1~2% 허용, 딥리서치 권고)
 
 # IC 정규화 기준: 이 값 이상이면 ic_norm=1.0 (포화)
 # 5분봉 KOSPI200 현실적 상한 ~0.15 (0.12 이상이면 매우 우수)

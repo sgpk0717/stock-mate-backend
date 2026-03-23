@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     CAUSAL_USE_FAST_ENGINE: bool = True  # NumPy 고속 엔진 (False → DoWhy 레거시)
 
     # Evolution Engine (진화형 팩토리)
-    ALPHA_POPULATION_SIZE: int = 200  # 5분봉 DB 직접 로딩으로 OOM 해소 (Koza 1992: 최소 200)
+    ALPHA_POPULATION_SIZE: int = 750  # 일봉 전환 (Koza 1992: 최소 500, 딥리서치 권고 500~1000)
     ALPHA_ELITE_PCT: float = 0.05
     ALPHA_AST_MUTATION_RATIO: float = 0.92
     ALPHA_LLM_MUTATION_RATIO: float = 0.08
@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     # Phase 3: Alpha Factory
     ALPHA_FACTORY_AUTO_START: bool = False
     ALPHA_FACTORY_INTERVAL_MINUTES: int = 360  # 6시간
-    ALPHA_FACTORY_MAX_ITERATIONS: int = 5
+    ALPHA_FACTORY_MAX_ITERATIONS: int = 100  # 일봉: 데이터 로딩 10초, 100세대 ~30분
     ALPHA_FACTORY_CROSSOVER_ENABLED: bool = True
     ALPHA_FACTORY_TOURNAMENT_K: int = 3
     ALPHA_FACTORY_ORTHOGONALITY_THRESHOLD: float = 0.7
