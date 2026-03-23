@@ -6,7 +6,9 @@ google-genai SDK 사용 (레거시 google-generativeai 아님).
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 from google import genai
 from google.genai import types as genai_types
@@ -41,6 +43,7 @@ async def chat_gemini(
     temperature: float | None = None,
     json_mode: bool = False,
     json_schema: dict | None = None,
+    caller: str | None = None,
 ) -> LLMResponse:
     """Gemini chat completion — LLMResponse 반환.
 
@@ -78,16 +81,30 @@ async def chat_gemini(
 
     config = genai_types.GenerateContentConfig(**config_kwargs)
 
+    start = time.monotonic()
     response = await client.aio.models.generate_content(
         model=settings.GEMINI_MODEL,
         contents=contents,
         config=config,
     )
+    duration_ms = int((time.monotonic() - start) * 1000)
 
     # 토큰 사용량 추출
     usage = response.usage_metadata
     input_tokens = getattr(usage, "prompt_token_count", 0) if usage else 0
     output_tokens = getattr(usage, "candidates_token_count", 0) if usage else 0
+
+    if caller:
+        from app.core.llm._logger import log_llm_usage
+
+        asyncio.create_task(log_llm_usage(
+            caller=caller,
+            provider="gemini",
+            model=settings.GEMINI_MODEL,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_ms=duration_ms,
+        ))
 
     return LLMResponse(
         text=response.text or "",

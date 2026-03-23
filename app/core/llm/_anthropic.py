@@ -6,6 +6,9 @@ chat() 반환 타입은 anthropic.types.Message 유지 (Tool Use 호환).
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 import anthropic
 import httpx
 
@@ -38,12 +41,15 @@ async def chat(
     system: str | None = None,
     max_tokens: int = 4000,
     tools: list | None = None,
+    caller: str | None = None,
 ) -> anthropic.types.Message:
     """Claude messages.create 래퍼.
 
     모델은 settings.AGENT_MODEL을 자동 사용한다.
     Tool Use 호출자(manager.py, factor_chat.py)를 위해
     반환 타입을 anthropic.types.Message로 유지.
+
+    caller: 호출자 식별 문자열 (설정 시 llm_usage_logs에 자동 기록)
     """
     client = get_client()
     kwargs: dict = {
@@ -55,7 +61,23 @@ async def chat(
         kwargs["system"] = system
     if tools is not None:
         kwargs["tools"] = tools
-    return await client.messages.create(**kwargs)
+
+    start = time.monotonic()
+    result = await client.messages.create(**kwargs)
+    duration_ms = int((time.monotonic() - start) * 1000)
+
+    if caller:
+        from app.core.llm._logger import log_llm_usage
+
+        asyncio.create_task(log_llm_usage(
+            caller=caller,
+            provider="anthropic",
+            model=result.model,
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+            duration_ms=duration_ms,
+        ))
+    return result
 
 
 async def chat_simple(
@@ -63,15 +85,18 @@ async def chat_simple(
     messages: list[dict],
     system: str | None = None,
     max_tokens: int = 4000,
+    caller: str | None = None,
 ) -> LLMResponse:
     """chat() 래퍼 — 프로바이더 독립적 LLMResponse 반환.
 
     텍스트만 필요한 호출자용 (Tool Use 불필요).
+    caller: 호출자 식별 문자열 (설정 시 llm_usage_logs에 자동 기록)
     """
     response = await chat(
         messages=messages,
         system=system,
         max_tokens=max_tokens,
+        caller=caller,
     )
     return LLMResponse(
         text=response.content[0].text,

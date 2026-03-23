@@ -10,6 +10,8 @@
 
 from app.core.llm._anthropic import chat, chat_simple, get_client
 from app.core.llm._gemini import chat_gemini, get_gemini_client
+from app.core.llm._logger import log_llm_usage
+from app.core.llm._models import LLMUsageLog
 from app.core.llm._types import LLMProvider, LLMResponse
 
 __all__ = [
@@ -20,6 +22,9 @@ __all__ = [
     # Gemini
     "chat_gemini",
     "get_gemini_client",
+    # 로깅
+    "log_llm_usage",
+    "LLMUsageLog",
     # 타입
     "LLMProvider",
     "LLMResponse",
