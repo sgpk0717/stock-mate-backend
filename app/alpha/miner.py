@@ -177,6 +177,13 @@ _OPTIONAL_FEATURE_BLOCKS: dict[str, tuple[str, list[str]]] = {
         "  operating_margin: 영업이익률 (%)",
         ["eps", "bps", "debt_to_equity", "operating_margin"],
     ),
+    "vkospi": (
+        "- 시장 변동성 (KOSPI200 실현변동성 대용, 전 종목 공통 값):\n"
+        "  vkospi: 20일 연환산 실현변동성 (%, 약 10~50 범위)\n"
+        "  vkospi_percentile: 60일 내 변동성 백분위 (0~100, 50=중간)\n"
+        "  활용: 변동성 레짐 감지 (vkospi > 30 = 고변동성, step(30 - vkospi) = 저변동성 체제)",
+        ["close"],  # DB에서 자동 join — OHLCV 존재 시 항상 표시 (미존재 시 NaN graceful)
+    ),
     # ── 이벤트 감지 피처 (OHLCV에서 자동 계산, 항상 표시) ──
     "volume_events": (
         "- 거래량 이벤트 (OHLCV에서 자동 계산):\n"
@@ -263,6 +270,14 @@ _CATEGORY_EXAMPLES: dict[str, list[dict]] = {
         {
             "hypothesis": "ATR 감소 후 갭상승 + 레인지 돌파 = 확장적 돌파 매매 기회",
             "formula": "gap_up_pct * step(atr_7 - atr_21) * range_breakout",
+        },
+        {
+            "hypothesis": "저변동성 체제에서 모멘텀 전략이 잘 작동 (변동성 레짐 필터)",
+            "formula": "step(30 - vkospi) * return_5d * volume_ratio",
+        },
+        {
+            "hypothesis": "변동성 백분위 극단(고변동)에서 RSI 과매도 반등이 더 강력",
+            "formula": "rsi_oversold_bounce * (vkospi_percentile / 100) * vol_spike_5d",
         },
     ],
     "mean_reversion": [

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial")
+JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial", "vkospi")
 
 
 async def _send_collection_telegram(msg: str) -> None:
@@ -310,6 +310,7 @@ class DailyScheduler:
         _JOB_DISPLAY = {
             "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
             "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
+            "vkospi": "VKOSPI",
         }
         _JOB_DETAIL = {
             "daily_candle": "일봉 캔들 (pykrx)",
@@ -318,6 +319,7 @@ class DailyScheduler:
             "margin_short": "신용잔고/공매도 (KIS API)",
             "investor": "투자자별 매매동향 (KIS API)",
             "dart_financial": "DART 재무 데이터",
+            "vkospi": "VKOSPI 대용 (KOSPI200 실현변동성, Yahoo Finance)",
         }
         _formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else date
         items = "\n".join(
@@ -451,6 +453,7 @@ class DailyScheduler:
             _display = {
                 "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
                 "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
+                "vkospi": "VKOSPI",
             }
             _name = _display.get(job_name, job_name)
             _dur = f"{int(job.duration_seconds)}초" if job.duration_seconds else ""
@@ -523,6 +526,15 @@ class DailyScheduler:
 
             return await collect_dart_financials(
                 date, progress_cb=_progress_cb, cb=self._breakers["dart"],
+            )
+
+        if job_name == "vkospi":
+            from app.scheduler.collectors.vkospi_collector import (
+                collect_vkospi,
+            )
+
+            return await collect_vkospi(
+                date, progress_cb=_progress_cb,
             )
 
         return CollectionResult(job=job_name)

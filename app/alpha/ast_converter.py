@@ -7,6 +7,7 @@ Polars DataFrame에 적용 가능한 Expression으로 변환한다.
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import sympy
 import polars as pl
@@ -76,15 +77,25 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
     # 멀티 윈도우 이동평균
     "sma_5": "sma_5",
     "sma_10": "sma_10",
+    "sma_50": "sma_50",
     "sma_60": "sma_60",
+    "sma_100": "sma_100",
+    "sma_200": "sma_200",
+    "sma_252": "sma_252",
     "ema_5": "ema_5",
     "ema_10": "ema_10",
+    "ema_50": "ema_50",
     "ema_60": "ema_60",
+    "ema_100": "ema_100",
+    "ema_200": "ema_200",
+    "ema_252": "ema_252",
     # 멀티 윈도우 RSI/ATR
     "rsi_7": "rsi_7",
     "rsi_21": "rsi_21",
+    "rsi_42": "rsi_42",
     "atr_7": "atr_7",
     "atr_21": "atr_21",
+    "atr_42": "atr_42",
     # 시차 피처
     "close_lag_1": "close_lag_1",
     "close_lag_5": "close_lag_5",
@@ -150,6 +161,12 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
     # 프로그램 매매 피처 (enriched candles에서 제공)
     "pgm_net_norm": "pgm_net_norm",
     "pgm_buy_ratio": "pgm_buy_ratio",
+    # VKOSPI 대용 (KOSPI200 실현변동성, stock_candles VKOSPI_PROXY에서 join)
+    "vkospi": "vkospi",
+    "realized_vol": "vkospi",
+    "market_vol": "vkospi",
+    "vkospi_percentile": "vkospi_percentile",
+    "vol_regime": "vkospi_percentile",
     # ── 이벤트 감지 피처 (OHLCV에서 자동 계산) ──
     # 거래량 이벤트
     "vol_spike_5d": "vol_spike_5d",
@@ -183,8 +200,8 @@ _FAMILY_DEFINITIONS: dict[str, list[str]] = {
         "close", "open", "high", "low",
         "close_lag_1", "close_lag_5", "close_lag_20",
         "bb_upper", "bb_lower", "bb_middle", "bb_position", "bb_width",
-        "sma_5", "sma_10", "sma_20", "sma_60",
-        "ema_5", "ema_10", "ema_20", "ema_60",
+        "sma_5", "sma_10", "sma_20", "sma_50", "sma_60", "sma_100", "sma_200", "sma_252",
+        "ema_5", "ema_10", "ema_20", "ema_50", "ema_60", "ema_100", "ema_200", "ema_252",
         "price_change_pct",
         "gap_up_pct", "gap_down_pct",
         "range_breakout", "range_breakdown",
@@ -206,6 +223,7 @@ _FAMILY_DEFINITIONS: dict[str, list[str]] = {
     "volatility": [
         "atr_7", "atr_14", "atr_21",
         "bb_squeeze", "bb_breakout_upper",
+        "vkospi", "vkospi_percentile",
     ],
     "supply": [
         "foreign_net_norm", "inst_net_norm", "retail_net_norm",
@@ -444,10 +462,10 @@ _ALPHA_FEATURE_COLUMNS = {
     "bb_upper", "bb_lower", "bb_middle",
     "price_change_pct", "ema_20",
     # 멀티 윈도우
-    "sma_5", "sma_10", "sma_60",
-    "ema_5", "ema_10", "ema_60",
-    "rsi_7", "rsi_21",
-    "atr_7", "atr_21",
+    "sma_5", "sma_10", "sma_50", "sma_60", "sma_100", "sma_200", "sma_252",
+    "ema_5", "ema_10", "ema_50", "ema_60", "ema_100", "ema_200", "ema_252",
+    "rsi_7", "rsi_21", "rsi_42",
+    "atr_7", "atr_21", "atr_42",
     # 시차
     "close_lag_1", "close_lag_5", "close_lag_20",
     "volume_lag_1", "volume_lag_5",
@@ -471,6 +489,8 @@ _ALPHA_FEATURE_COLUMNS = {
     "margin_rate", "short_balance_rate", "short_volume_ratio",
     # 프로그램 매매 (enriched candles에서 제공)
     "pgm_net_norm", "pgm_buy_ratio",
+    # VKOSPI 대용 (KOSPI200 실현변동성, VKOSPI_PROXY 심볼에서 join)
+    "vkospi", "vkospi_percentile",
     # 이벤트 감지 피처
     "vol_spike_5d", "vol_spike_20d", "consec_low_vol_5", "vol_dry_then_spike",
     "consec_up", "consec_down", "gap_up_pct", "gap_down_pct",
@@ -478,6 +498,145 @@ _ALPHA_FEATURE_COLUMNS = {
     "rsi_oversold_bounce", "macd_cross_up", "bb_squeeze", "bb_breakout_upper",
     "foreign_accumulate_5d", "inst_accumulate_5d",
 }
+
+
+_vkospi_cache: pl.DataFrame | None = None
+_vkospi_cache_ts: float = 0.0
+
+
+def _load_vkospi_proxy() -> pl.DataFrame:
+    """VKOSPI_PROXY 데이터를 stock_candles에서 로드 (메모리 캐시 1시간)."""
+    import time
+
+    global _vkospi_cache, _vkospi_cache_ts
+
+    now = time.monotonic()
+    if _vkospi_cache is not None and (now - _vkospi_cache_ts) < 3600:
+        return _vkospi_cache
+
+    try:
+        from sqlalchemy import create_engine, text
+        from app.core.config import settings
+
+        # 동기 엔진은 호출 시 매번 생성 (1시간 캐시이므로 부담 없음)
+        engine = create_engine(
+            settings.sync_database_url,
+            pool_size=1,
+            max_overflow=0,
+            pool_pre_ping=True,
+        )
+        try:
+            with engine.connect() as conn:
+                result = conn.execute(
+                    text(
+                        "SELECT dt, close AS vkospi, high AS vkospi_percentile "
+                        "FROM stock_candles "
+                        "WHERE symbol = 'VKOSPI_PROXY' AND interval = '1d' "
+                        "ORDER BY dt"
+                    )
+                )
+                rows = result.fetchall()
+        finally:
+            engine.dispose()
+
+        if not rows:
+            logging.getLogger(__name__).debug("VKOSPI_PROXY data not found in DB")
+            _vkospi_cache = pl.DataFrame(schema={
+                "vkospi_dt": pl.Date,
+                "vkospi": pl.Float64,
+                "vkospi_percentile": pl.Float64,
+            })
+            _vkospi_cache_ts = now
+            return _vkospi_cache
+
+        # Polars DataFrame 변환
+        data = {
+            "vkospi_dt": [r[0].date() if hasattr(r[0], 'date') else r[0] for r in rows],
+            "vkospi": [float(r[1]) if r[1] is not None else None for r in rows],
+            "vkospi_percentile": [float(r[2]) if r[2] is not None else None for r in rows],
+        }
+        cache = pl.DataFrame(data).with_columns(
+            pl.col("vkospi_dt").cast(pl.Date)
+        )
+
+        _vkospi_cache = cache
+        _vkospi_cache_ts = now
+        logging.getLogger(__name__).info(
+            "VKOSPI_PROXY loaded: %d rows, %s ~ %s",
+            cache.height,
+            cache["vkospi_dt"].min(),
+            cache["vkospi_dt"].max(),
+        )
+        return cache
+
+    except Exception as e:
+        logging.getLogger(__name__).warning("VKOSPI_PROXY load failed (graceful NaN): %s", e)
+        _vkospi_cache = pl.DataFrame(schema={
+            "vkospi_dt": pl.Date,
+            "vkospi": pl.Float64,
+            "vkospi_percentile": pl.Float64,
+        })
+        _vkospi_cache_ts = now
+        return _vkospi_cache
+
+
+def _join_vkospi_proxy(df: pl.DataFrame) -> pl.DataFrame:
+    """VKOSPI_PROXY 데이터를 dt 기준으로 main DataFrame에 join.
+
+    분봉 데이터는 dt의 date 파트로 join한다.
+    VKOSPI_PROXY 데이터가 없으면 NaN 컬럼으로 graceful degradation.
+    """
+    if "vkospi" in df.columns:
+        return df  # 이미 존재
+
+    vkospi = _load_vkospi_proxy()
+
+    if vkospi.height == 0:
+        # 데이터 없음 -> NaN 컬럼 추가
+        return df.with_columns([
+            pl.lit(None).cast(pl.Float64).alias("vkospi"),
+            pl.lit(None).cast(pl.Float64).alias("vkospi_percentile"),
+        ])
+
+    # dt 컬럼의 타입에 따라 join 키 생성
+    dt_dtype = df.schema["dt"]
+
+    if dt_dtype == pl.Date:
+        # 일봉: 직접 join
+        df = df.join(
+            vkospi.rename({"vkospi_dt": "dt"}),
+            on="dt",
+            how="left",
+        )
+    elif dt_dtype == pl.Datetime or str(dt_dtype).startswith("Datetime"):
+        # 분봉: dt에서 date 추출 후 join
+        df = df.with_columns(
+            pl.col("dt").dt.date().alias("_vkospi_join_date")
+        )
+        df = df.join(
+            vkospi.rename({"vkospi_dt": "_vkospi_join_date"}),
+            on="_vkospi_join_date",
+            how="left",
+        ).drop("_vkospi_join_date")
+    else:
+        # 타입 불명 -> date로 캐스트 시도
+        try:
+            df = df.with_columns(
+                pl.col("dt").cast(pl.Date).alias("_vkospi_join_date")
+            )
+            df = df.join(
+                vkospi.rename({"vkospi_dt": "_vkospi_join_date"}),
+                on="_vkospi_join_date",
+                how="left",
+            ).drop("_vkospi_join_date")
+        except Exception:
+            # 최후 수단: NaN 컬럼
+            df = df.with_columns([
+                pl.lit(None).cast(pl.Float64).alias("vkospi"),
+                pl.lit(None).cast(pl.Float64).alias("vkospi_percentile"),
+            ])
+
+    return df
 
 
 def ensure_alpha_features(
@@ -551,14 +710,14 @@ def ensure_alpha_features(
         )
 
     # ── 멀티 윈도우 이동평균 ──
-    for period in [5, 10, 60]:
+    for period in [5, 10, 50, 60, 100, 200, 252]:
         if _need(f"sma_{period}"):
             df = add_sma(df, period=period)
         if _need(f"ema_{period}"):
             df = add_ema(df, period=period)
 
     # ── 멀티 윈도우 RSI (inline — add_rsi는 항상 "rsi" alias) ──
-    for period in [7, 21]:
+    for period in [7, 21, 42]:
         col_name = f"rsi_{period}"
         if _need(col_name):
             delta = pl.col("close").diff()
@@ -575,7 +734,7 @@ def ensure_alpha_features(
             df = df.with_columns(rsi_expr.alias(col_name))
 
     # ── 멀티 윈도우 ATR ──
-    for period in [7, 21]:
+    for period in [7, 21, 42]:
         col_name = f"atr_{period}"
         if _need(col_name):
             prev_close = pl.col("close").shift(1)
@@ -809,6 +968,13 @@ def ensure_alpha_features(
                     / (pl.col("pgm_buy_qty") + pl.col("pgm_sell_qty")).cast(pl.Float64).clip(lower_bound=1.0)
                 ).alias("pgm_buy_ratio")
             )
+
+    # ── VKOSPI 대용 (KOSPI200 실현변동성) ──
+    # stock_candles의 VKOSPI_PROXY 심볼에서 dt 기준 join
+    # close = realized_vol_20d, high = vol_percentile_60d
+    _vkospi_needed = _need("vkospi") or _need("vkospi_percentile")
+    if _vkospi_needed:
+        df = _join_vkospi_proxy(df)
 
     # ══════════════════════════════════════════════════════
     # ── 이벤트 감지 피처 (OHLCV 기반, 자동 계산) ──
