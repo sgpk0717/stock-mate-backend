@@ -356,13 +356,13 @@ async def prune_factors(
         )
         all_factors = factors_result.fetchall()
 
-        # 3. causal_robust=true 무조건 보존
-        causal_keep = [f for f in all_factors if f.causal_robust is True]
-        candidates = [f for f in all_factors if f.causal_robust is not True]
+        # 3. 3단계 분류: 보존 / 우선삭제 / 경쟁
+        causal_keep = [f for f in all_factors if f.causal_robust is True]    # 무조건 보존
+        mirages = [f for f in all_factors if f.causal_robust is False]       # 우선 삭제 (가짜)
+        unvalidated = [f for f in all_factors if f.causal_robust is None]    # fitness 경쟁
 
         remaining_slots = max_per_interval - len(causal_keep)
         if remaining_slots <= 0:
-            # causal 통과 팩터만으로도 limit 초과 -> 삭제 안 함
             results[interval_key] = {
                 "before": count,
                 "after": count,
@@ -371,7 +371,7 @@ async def prune_factors(
             }
             continue
 
-        # 4. 니치별 최소 비율 보장
+        # 4. 미검증 팩터를 니치+fitness로 경쟁 (미라지 제외)
         def _sort_key(f):
             """fitness_composite 우선, 없으면 ic_mean 폴백."""
             fc = f.fitness_composite
@@ -380,7 +380,7 @@ async def prune_factors(
             return f.ic_mean if f.ic_mean is not None else -999.0
 
         niche_map: dict[str, list] = {}
-        for f in candidates:
+        for f in unvalidated:  # ← 미라지 제외, 미검증만 경쟁
             try:
                 expr = parse_expression(f.expression_str or "")
                 niche = classify_niche(expr)
@@ -406,14 +406,21 @@ async def prune_factors(
         else:
             keep_rest = []
 
-        # 6. 보존 목록 = causal + niche_guaranteed + keep_rest
+        # 6. 보존 목록 = causal + 미검증(niche+fitness) + 미라지(남은 슬롯만)
         keep_ids = set()
         keep_ids.update(f.id for f in causal_keep)
         keep_ids.update(f.id for f in niche_guaranteed)
         keep_ids.update(f.id for f in keep_rest)
 
+        # 미라지는 슬롯이 남을 때만 (fitness 순) — 사실상 거의 삭제됨
+        mirage_slots = max_per_interval - len(keep_ids)
+        if mirage_slots > 0 and mirages:
+            sorted_mirages = sorted(mirages, key=_sort_key, reverse=True)
+            keep_ids.update(f.id for f in sorted_mirages[:mirage_slots])
+
         # 7. 삭제 대상
         prune_ids = [f.id for f in all_factors if f.id not in keep_ids]
+        mirages_pruned = sum(1 for f in mirages if f.id not in keep_ids)
 
         if not dry_run and prune_ids:
             # alpha_experiences FK가 SET NULL이므로 명시적 정리
@@ -432,6 +439,7 @@ async def prune_factors(
             "before": count,
             "after": count - pruned,
             "pruned": pruned,
+            "mirages_pruned": mirages_pruned,
             "causal_kept": len(causal_keep),
             "niche_distribution": {n: len(fs) for n, fs in niche_map.items()},
         }
