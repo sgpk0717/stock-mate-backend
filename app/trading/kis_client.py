@@ -265,28 +265,28 @@ class KISClient:
         last = candles[-1]
         return candles, last.get("stck_bsop_date", ""), last.get("stck_cntg_hour", "")
 
-    async def inquire_program_trading(self, symbol: str) -> dict[str, Any]:
-        """종목별 프로그램매매추이 체결 조회 (FHPPG04600101).
+    async def inquire_program_trading(self, symbol: str, date: str = "") -> dict[str, Any]:
+        """종목별 프로그램매매추이(일별) 조회 (FHPPG04650201).
 
         실전 전용 (모의투자 미지원).
-        장시간(09:00~15:30) 최근 30분 데이터 조회.
+        종목코드별 프로그램 매매 일별 데이터를 조회한다.
+
+        Args:
+            symbol: 종목코드 (예: "005930")
+            date: 조회 시작일 YYYYMMDD (빈 문자열이면 당일부터)
 
         Returns:
-            프로그램 매수/매도 수량 및 금액 (output 배열의 첫 번째 행)
+            프로그램 매수/매도 거래량 및 금액 (output 배열의 첫 번째 행 = 최신일)
         """
         data = await self._get(
-            "/uapi/domestic-stock/v1/quotations/comp-program-trade-today",
-            tr_id="FHPPG04600101",
+            "/uapi/domestic-stock/v1/quotations/program-trade-by-stock-daily",
+            tr_id="FHPPG04650201",
             params={
                 "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_MRKT_CLS_CODE": "K",
                 "FID_INPUT_ISCD": symbol,
-                "FID_SCTN_CLS_CODE": "",
-                "FID_COND_MRKT_DIV_CODE1": "",
-                "FID_INPUT_HOUR_1": "",
+                "FID_INPUT_DATE_1": date,
             },
         )
-        # output이 배열(여러 시간대) — 최신(첫 번째) 행 사용
         output_list = data.get("output", [])
         if isinstance(output_list, list) and output_list:
             output = output_list[0]
@@ -296,7 +296,7 @@ class KISClient:
             output = {}
 
         if output:
-            logger.debug("inquire_program_trading raw keys: %s", list(output.keys()))
+            logger.debug("program_trade_by_stock_daily raw keys: %s", list(output.keys()))
 
         def _safe_int(val: Any) -> int:
             try:
@@ -304,18 +304,23 @@ class KISClient:
             except (ValueError, TypeError):
                 return 0
 
-        # KIS 공식 필드명 (TR FHPPG04600101, 프로그램매매 종합현황)
-        sell_qty = _safe_int(output.get("whol_smtn_seln_vol", 0))
-        buy_qty = _safe_int(output.get("whol_smtn_shnu_vol", 0))
-        sell_amt = _safe_int(output.get("whol_smtn_seln_tr_pbmn", 0))
-        buy_amt = _safe_int(output.get("whol_smtn_shnu_tr_pbmn", 0))
+        # FHPPG04650201 응답 필드 (종목별 프로그램매매추이 일별)
+        # whol = 전체(차익+비차익), seln = 매도, shnu = 매수, ntby = 순매수
+        total_sell = _safe_int(output.get("whol_smtn_seln_tr_pbmn", 0))
+        total_buy = _safe_int(output.get("whol_smtn_shnu_tr_pbmn", 0))
+        total_net = _safe_int(output.get("whol_smtn_ntby_tr_pbmn", 0))
+        sell_vol = _safe_int(output.get("whol_smtn_seln_vol", 0))
+        buy_vol = _safe_int(output.get("whol_smtn_shnu_vol", 0))
         return {
-            "pgm_buy_qty": buy_qty,
-            "pgm_sell_qty": sell_qty,
-            "pgm_net_qty": buy_qty - sell_qty,
-            "pgm_buy_amount": buy_amt,
-            "pgm_sell_amount": sell_amt,
-            "pgm_net_amount": buy_amt - sell_amt,
+            "pgm_buy_amount": total_buy,
+            "pgm_sell_amount": total_sell,
+            "pgm_net_amount": total_net,
+            "arbt_buy_amount": 0,  # 일별 API는 차익/비차익 미분리
+            "arbt_sell_amount": 0,
+            "nabt_buy_amount": 0,
+            "nabt_sell_amount": 0,
+            "pgm_buy_vol": buy_vol,
+            "pgm_sell_vol": sell_vol,
         }
 
     async def inquire_daily_short_sale(
