@@ -74,6 +74,20 @@ async def main() -> None:
     except Exception as e:
         logger.warning("좀비 정리 실패: %s", e)
 
+    # WorkerState singleton row 보장 (id=1) — UPDATE가 no-op이 되는 것 방지
+    try:
+        from app.models.base import WorkerState
+        from sqlalchemy import select as sa_select
+
+        async with async_session() as db:
+            existing = await db.execute(sa_select(WorkerState).where(WorkerState.id == 1))
+            if existing.scalar_one_or_none() is None:
+                db.add(WorkerState(id=1))
+                await db.commit()
+                logger.info("WorkerState id=1 생성 완료")
+    except Exception as e:
+        logger.warning("WorkerState 초기화 실패: %s", e)
+
     tasks: list[asyncio.Task] = []
 
     # TradingContext + 세션 복구
@@ -112,27 +126,156 @@ async def main() -> None:
 
     # 팩토리 상태 DB 동기화 (ExternalFactoryClient용)
     async def _sync_factory_status() -> None:
-        """알파 팩토리 상태를 worker_state 테이블에 5초마다 기록."""
-        from app.alpha.scheduler import get_scheduler
+        """알파 팩토리 상태를 worker_state 테이블에 5초마다 기록.
+
+        모든 인터벌 스케줄러 중 running인 것을 우선 반환.
+        """
+        from app.alpha.scheduler import get_all_schedulers, get_scheduler
         from app.models.base import WorkerState
-        from sqlalchemy import update as sa_update
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
 
         while True:
             try:
-                status = get_scheduler().get_status()
+                # 모든 활성 스케줄러 중 running인 것 찾기
+                all_scheds = get_all_schedulers()
+                status = None
+                for _iv, _sched in all_scheds.items():
+                    _s = _sched.get_status()
+                    if _s.get("running"):
+                        status = _s
+                        break
+                if status is None:
+                    # running인 스케줄러 없음 → 아무거나 (기본 5m)
+                    status = get_scheduler().get_status()
+
+                # Redis user_stopped 플래그를 status에 반영
+                # (Worker 재시작 시 인메모리는 리셋되지만 Redis 플래그는 유지됨)
+                try:
+                    from app.core.redis import get_client as _get_redis_flag
+                    _rf = _get_redis_flag()
+                    _flag = await _rf.get("alpha:factory:user_stopped")
+                    if _flag and str(_flag).lower() == "true":
+                        status["user_stopped"] = True
+                except Exception:
+                    pass
+
                 async with async_session() as db:
-                    await db.execute(
-                        sa_update(WorkerState)
-                        .where(WorkerState.id == 1)
-                        .values(factory_status=status)
+                    stmt = pg_insert(WorkerState).values(
+                        id=1, factory_status=status,
+                    ).on_conflict_do_update(
+                        index_elements=["id"],
+                        set_={"factory_status": status},
                     )
+                    await db.execute(stmt)
                     await db.commit()
+
+                # workflow:status Redis Hash도 동기화
+                try:
+                    from app.core.redis import get_client as _get_redis
+                    _wr = _get_redis()
+                    await _wr.hset("workflow:status", mapping={
+                        "mining_running": str(status.get("running", False)),
+                        "mining_cycles": str(status.get("cycles_completed", 0)),
+                        "mining_factors": str(status.get("factors_discovered_total", 0)),
+                    })
+                except Exception:
+                    pass
             except Exception as e:
                 logger.debug("Factory status sync failed: %s", e)
             await asyncio.sleep(5)
 
     tasks.append(asyncio.create_task(_sync_factory_status()))
     logger.info("팩토리 상태 DB 동기화 시작 (5초)")
+
+    # ── 팩토리 명령 소비자 (Redis Stream) ──
+    async def _consume_factory_commands() -> None:
+        """API에서 보낸 factory start/stop 명령을 소비."""
+        import json as _json
+        from app.alpha.scheduler import get_scheduler
+        from app.core.redis import get_client
+        from app.models.base import WorkerState
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        r = get_client()
+        last_id = "$"  # 재시작 시 새 명령만 처리 (이전 명령 리플레이 방지)
+        logger.info("팩토리 명령 소비자 시작 (commands:factory)")
+
+        while True:
+            try:
+                results = await r.xread(
+                    {"commands:factory": last_id},
+                    count=5, block=3000,
+                )
+                if not results:
+                    continue
+                for _, messages in results:
+                    for msg_id, fields in messages:
+                        last_id = msg_id
+                        action = fields.get("action", "")
+                        payload_str = fields.get("payload", "{}")
+                        try:
+                            payload = _json.loads(payload_str) if payload_str else {}
+                        except Exception:
+                            payload = {}
+
+                        try:
+                            interval = payload.get("data_interval", "5m")
+                            scheduler = get_scheduler(interval)
+
+                            if action == "factory_start":
+                                ok = await scheduler.start(**payload)
+                                logger.info("팩토리 명령: start(%s) → %s", interval, ok)
+                            elif action == "factory_stop":
+                                # 모든 interval 스케줄러 일괄 중지 + user_stopped 마킹
+                                from app.alpha.scheduler import get_all_schedulers
+                                stopped_any = False
+                                for iv, sched in get_all_schedulers().items():
+                                    if sched.get_status().get("running"):
+                                        ok = await sched.stop()
+                                        logger.info("팩토리 명령: stop(%s) → %s", iv, ok)
+                                        if ok:
+                                            stopped_any = True
+                                            scheduler = sched  # DB 동기화용
+                                    else:
+                                        # 비활성 스케줄러도 user_stopped 마킹 (watchdog 재시작 방지)
+                                        sched._state.user_stopped = True
+                                if not stopped_any:
+                                    logger.info("팩토리 명령: stop — 실행 중인 스케줄러 없음")
+
+                            # 결과를 즉시 DB 동기화 (UPSERT)
+                            status = scheduler.get_status()
+                            async with async_session() as db:
+                                stmt = pg_insert(WorkerState).values(
+                                    id=1, factory_status=status,
+                                ).on_conflict_do_update(
+                                    index_elements=["id"],
+                                    set_={"factory_status": status},
+                                )
+                                await db.execute(stmt)
+                                await db.commit()
+
+                            # workflow:status Redis Hash도 동기화
+                            # (워크플로우 페이지의 "마이닝 진행 중" 표시와 일치시킴)
+                            try:
+                                from app.core.redis import get_client as _get_redis
+                                _wr = _get_redis()
+                                await _wr.hset("workflow:status", mapping={
+                                    "mining_running": str(status.get("running", False)),
+                                    "mining_cycles": str(status.get("cycles_completed", 0)),
+                                    "mining_factors": str(status.get("factors_discovered_total", 0)),
+                                })
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.error("팩토리 명령 실패 (%s): %s", action, e)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("팩토리 명령 소비 에러: %s", e)
+                await asyncio.sleep(3)
+
+    tasks.append(asyncio.create_task(_consume_factory_commands()))
 
     # 프로그램 매매 수집기
     if settings.PGM_TRADING_ENABLED:

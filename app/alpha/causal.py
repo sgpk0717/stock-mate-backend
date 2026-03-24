@@ -531,7 +531,17 @@ class FactorMirageFilter:
         # NumPy 배열 추출
         y = data["forward_return"].values.astype(np.float64)
         X_conf = data[_CONFOUNDER_COLS].values.astype(np.float64)
-        treatment = data["alpha_factor"].values.astype(np.float64)
+        treatment_raw = data["alpha_factor"].values.astype(np.float64)
+
+        # ── Treatment Z-score 표준화 ──
+        # 알파 팩터 값은 수식에 따라 스케일이 천차만별 (0.01 ~ 100,000+).
+        # OLS beta(ATE)는 스케일에 직접 비례하므로, 표준화 없이는
+        # t-stat이 항상 0에 수렴하여 모든 팩터가 reject됨.
+        t_std = float(np.nanstd(treatment_raw))
+        if t_std > 1e-12:
+            treatment = (treatment_raw - np.nanmean(treatment_raw)) / t_std
+        else:
+            treatment = treatment_raw  # 상수 팩터 → 그대로 (어차피 reject)
 
         # 절편 + 교란변수 행렬 (모든 검증에서 재사용)
         ones = np.ones((len(y), 1))

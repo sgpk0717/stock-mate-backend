@@ -558,14 +558,32 @@ async def start_factory(data: AlphaFactoryStartRequest):
         max_cycles=data.max_cycles,
     )
 
-    if not result["started"]:
-        raise HTTPException(409, f"팩토리({data.data_interval})가 이미 실행 중입니다")
+    if not result.get("started"):
+        raise HTTPException(409, f"팩토리({data.data_interval}) 시작 명령 전송 실패")
 
-    return AlphaFactoryStatusResponse(**result["status"])
+    # fire-and-forget: 명령 전송 성공이면 즉시 반환
+    # Worker가 처리하면 GET /factory/status 폴링으로 상태 변경 감지
+    status = result.get("status", {})
+    return AlphaFactoryStatusResponse(
+        running=status.get("running", False),
+        cycles_completed=status.get("cycles_completed", 0),
+        factors_discovered_total=status.get("factors_discovered_total", 0),
+        current_cycle_progress=status.get("current_cycle_progress", 0),
+        current_cycle_message=status.get("current_cycle_message", ""),
+        last_cycle_at=status.get("last_cycle_at"),
+        started_at=status.get("started_at"),
+        config=status.get("config") or data.model_dump(),
+        population_size=status.get("population_size", 0),
+        elite_count=status.get("elite_count", 0),
+        generation=status.get("generation", 0),
+        operator_stats=status.get("operator_stats"),
+        last_funnel=status.get("last_funnel"),
+        user_stopped=status.get("user_stopped", False),
+    )
 
 
 @router.post("/factory/stop", response_model=AlphaFactoryStatusResponse)
-async def stop_factory(interval: str = "5m"):
+async def stop_factory(interval: str = "1d"):
     """알파 팩토리 중지. interval별. Redis 플래그로 와치독 재시작도 방지."""
     from app.alpha.factory_client import get_factory_client
     from app.core.redis import get_client as get_redis
@@ -578,7 +596,10 @@ async def stop_factory(interval: str = "5m"):
         pass
 
     client = get_factory_client(interval=interval)
-    result = await client.stop()
+    try:
+        result = await client.stop(interval=interval)
+    except TypeError:
+        result = await client.stop()
 
     # ExternalFactoryClient는 DB에 명령만 넣으므로, DB 상태도 직접 업데이트
     try:
@@ -599,8 +620,30 @@ async def stop_factory(interval: str = "5m"):
     return AlphaFactoryStatusResponse(**{**result["status"], "running": False, "user_stopped": True})
 
 
+@router.put("/factory/auto-restart")
+async def set_auto_restart(enabled: bool = True):
+    """팩토리 자동 재시작(워크플로우 연동) 활성/비활성.
+
+    enabled=False: Redis 플래그 설정 → 워크플로우가 팩토리를 자동 시작하지 않음.
+    enabled=True: Redis 플래그 삭제 → 워크플로우가 MINING 페이즈에서 팩토리를 관리.
+    워크플로우 자체는 영향받지 않음 (emergency_stop 호출 안 함).
+    """
+    from app.core.redis import get_client as get_redis
+
+    try:
+        redis = get_redis()
+        if enabled:
+            await redis.delete("alpha:factory:user_stopped")
+        else:
+            await redis.set("alpha:factory:user_stopped", "true")
+    except Exception as e:
+        raise HTTPException(500, f"Redis error: {e}")
+
+    return {"auto_restart": enabled}
+
+
 @router.get("/factory/status", response_model=AlphaFactoryStatusResponse)
-async def get_factory_status(interval: str = "5m"):
+async def get_factory_status(interval: str = "1d"):
     """알파 팩토리 상태 조회. interval별."""
     from app.alpha.factory_client import get_factory_client
 

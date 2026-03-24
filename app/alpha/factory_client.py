@@ -86,43 +86,66 @@ class InlineFactoryClient(FactoryClient):
 
 
 class ExternalFactoryClient(FactoryClient):
-    """워커 분리 모드: DB 명령큐를 통해 워커에 위임."""
+    """워커 분리 모드: Redis Stream을 통해 워커에 위임."""
 
     async def start(self, **kwargs) -> dict:
-        from app.core.database import async_session
-        from app.models.base import WorkerCommand, WorkerState
-        from sqlalchemy import select
+        import json as _json
+        from app.core.redis import get_client as get_redis
 
-        # 현재 상태 먼저 확인
-        status = await self.get_status()
-        if status.get("running"):
+        # user_stopped 플래그 삭제 (start는 항상 플래그 초기화)
+        try:
+            r = get_redis()
+            await r.delete("alpha:factory:user_stopped")
+        except Exception:
+            pass
+
+        # Redis Stream으로 명령 전송 (Worker가 소비)
+        try:
+            r = get_redis()
+            await r.xadd("commands:factory", {
+                "action": "factory_start",
+                "payload": _json.dumps(kwargs, ensure_ascii=False, default=str),
+            })
+        except Exception as e:
+            logger.error("팩토리 시작 명령 전송 실패: %s", e)
+            status = await self.get_status()
             return {"started": False, "status": status}
 
-        async with async_session() as session:
-            cmd = WorkerCommand(
-                command="factory_start",
-                payload=kwargs,
-            )
-            session.add(cmd)
-            await session.commit()
+        # 명령 전송 성공 → 즉시 반환 (fire-and-forget)
+        # Worker가 명령을 처리하면 5초 sync가 DB를 업데이트.
+        # 장중 Worker 부하로 5초 이내 응답을 보장할 수 없으므로,
+        # 프론트는 useFactoryStatus 폴링(3초)으로 상태 변경을 감지.
+        return {"started": True, "status": {"running": True, **kwargs}}
 
-        return {"started": True, "status": status}
-
-    async def stop(self) -> dict:
-        from app.core.database import async_session
-        from app.models.base import WorkerCommand
+    async def stop(self, interval: str = "5m") -> dict:
+        import json as _json
+        from app.core.redis import get_client as get_redis
 
         status = await self.get_status()
-        if not status.get("running"):
+
+        # user_stopped 플래그 설정 (watchdog/orchestrator 재시작 방지)
+        try:
+            r = get_redis()
+            await r.set("alpha:factory:user_stopped", "true")
+        except Exception:
+            pass
+
+        try:
+            r = get_redis()
+            await r.xadd("commands:factory", {
+                "action": "factory_stop",
+                "payload": _json.dumps({"data_interval": interval}),
+            })
+        except Exception as e:
+            logger.error("팩토리 중지 명령 전송 실패: %s", e)
             return {"stopped": False, "status": status}
 
-        async with async_session() as session:
-            cmd = WorkerCommand(
-                command="factory_stop",
-                payload={},
-            )
-            session.add(cmd)
-            await session.commit()
+        # Worker가 stop을 처리할 때까지 대기 (task cleanup 포함)
+        for _ in range(15):  # 최대 15초 대기
+            await asyncio.sleep(1.0)
+            status = await self.get_status()
+            if not status.get("running"):
+                return {"stopped": True, "status": status}
 
         return {"stopped": True, "status": status}
 

@@ -1170,16 +1170,23 @@ class DailyWorkflowOrchestrator:
                     pass
 
                 from app.alpha.factory_client import get_factory_client
-                factory = get_factory_client()
+                _data_interval = settings.WORKFLOW_DATA_INTERVAL
+                factory = get_factory_client(interval=_data_interval)
                 if not (await factory.get_status())["running"]:
-                    # 상시 마이닝: 장중(08:30~16:30)에만 일시 중지
+                    # 인터벌별 디폴트 날짜 (메모리 효율 + 통계적 유의성)
+                    _today = date.today().isoformat()
+                    _start_date = "2014-01-01" if _data_interval == "1d" else ""
+                    _end_date = _today if _data_interval == "1d" else ""
+
                     await factory.start(
                         context=mining_context,
+                        start_date=_start_date,
+                        end_date=_end_date,
                         interval_minutes=0,
                         max_iterations=settings.ALPHA_FACTORY_MAX_ITERATIONS,
                         enable_crossover=settings.ALPHA_FACTORY_CROSSOVER_ENABLED,
                         max_cycles=0,  # 무제한 (PRE_MARKET에 의해 중지)
-                        data_interval=settings.WORKFLOW_DATA_INTERVAL,
+                        data_interval=_data_interval,
                     )
                     await self._log_event(
                         session, run, "mining_start",
@@ -1530,6 +1537,27 @@ class DailyWorkflowOrchestrator:
                 if needs_restart:
                     await self._restart_trading_session(sid, issues)
 
+            # 장중 분봉 수집기 생존 체크 (Worker 재시작 시 Task 유실 대응)
+            try:
+                from app.trading.live_runner import _intraday_collector_task, start_intraday_candle_collector
+                if _intraday_collector_task is None or _intraday_collector_task.done():
+                    # 수집 대상 종목 결정
+                    scan_symbols: list[str] = []
+                    for s in sessions:
+                        scan_symbols.extend(getattr(s, "scan_symbols", []))
+                    if not scan_symbols:
+                        from sqlalchemy import text as _t
+                        async with async_session() as _db:
+                            _r = await _db.execute(
+                                _t("SELECT symbol FROM stock_masters WHERE market = 'KOSPI' ORDER BY symbol LIMIT 200")
+                            )
+                            scan_symbols = [r[0] for r in _r.fetchall()]
+                    if scan_symbols:
+                        asyncio.create_task(start_intraday_candle_collector(scan_symbols))
+                        logger.warning("장중 분봉 수집기 재시작 (%d종목) — Task 유실 감지", len(scan_symbols))
+            except Exception as _e:
+                logger.debug("분봉 수집기 체크 실패: %s", _e)
+
         except Exception as e:
             logger.error("Session Health Check 오류: %s", e)
 
@@ -1646,7 +1674,7 @@ class DailyWorkflowOrchestrator:
     async def _ensure_mining_running(self) -> None:
         """팩토리가 안 돌고 있으면 재시작 (마이닝 상시가동 보장)."""
         try:
-            from app.alpha.scheduler import get_scheduler
+            from app.alpha.scheduler import get_all_schedulers, get_scheduler
 
             # Redis 플래그 체크: 프론트/API에서 user_stopped 설정 시 와치독 비활성화
             try:
@@ -1658,12 +1686,13 @@ class DailyWorkflowOrchestrator:
             except Exception:
                 pass
 
-            scheduler = get_scheduler()
+            # ★ 모든 interval 스케줄러 중 하나라도 실행 중이면 재시작 불필요
+            for _iv, _sched in get_all_schedulers().items():
+                if _sched._task and not _sched._task.done():
+                    return
 
-            # ★ task가 살아있으면 (실행 중이면) 재시작 안 함
-            # get_status()는 state.running과 task.done() 불일치 시 오보 가능
-            if scheduler._task and not scheduler._task.done():
-                return
+            # 설정된 interval의 스케줄러 가져오기 (5m 고정 아님)
+            scheduler = get_scheduler(settings.WORKFLOW_DATA_INTERVAL)
 
             status = scheduler.get_status()
             if not status["running"]:
