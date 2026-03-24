@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.alpha.models import AlphaFactor, AlphaMiningRun
+from app.alpha.models import AlphaExperience, AlphaFactor, AlphaMiningRun
 from app.alpha.runner import execute_alpha_mining
 from app.alpha.schemas import (
     AlphaFactorBacktestRequest,
@@ -301,6 +301,150 @@ async def delete_factors_batch(
         delete(AlphaFactor).where(AlphaFactor.id.in_(uuids))
     )
     await db.commit()
+
+
+@router.post("/factors/prune")
+async def prune_factors(
+    max_per_interval: int = 3000,
+    dry_run: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """인터벌별 팩터 속아내기(Pruning).
+
+    성능 하위 팩터를 삭제하여 인터벌별 max_per_interval 이하로 유지.
+
+    보존 우선순위:
+    1. causal_robust=true -> 무조건 보존
+    2. 니치별 최소 비율 보장 (다양성 유지)
+    3. fitness_composite 상위 -> 보존 (없으면 ic_mean 폴백)
+
+    dry_run=true면 삭제하지 않고 삭제될 팩터 수만 반환.
+    """
+    from app.alpha.ast_converter import classify_niche, parse_expression
+
+    if max_per_interval < 1:
+        raise HTTPException(400, "max_per_interval은 1 이상이어야 합니다.")
+
+    # 1. 인터벌별 팩터 수 조회
+    counts_result = await db.execute(
+        select(AlphaFactor.interval, func.count(AlphaFactor.id))
+        .group_by(AlphaFactor.interval)
+    )
+    interval_counts = {row[0]: row[1] for row in counts_result.fetchall()}
+
+    results: dict[str, dict] = {}
+    total_pruned = 0
+
+    for interval_key, count in interval_counts.items():
+        if count <= max_per_interval:
+            results[interval_key] = {
+                "before": count,
+                "after": count,
+                "pruned": 0,
+            }
+            continue
+
+        # 2. 해당 인터벌의 모든 팩터 로드
+        factors_result = await db.execute(
+            select(
+                AlphaFactor.id,
+                AlphaFactor.ic_mean,
+                AlphaFactor.fitness_composite,
+                AlphaFactor.causal_robust,
+                AlphaFactor.expression_str,
+            ).where(AlphaFactor.interval == interval_key)
+        )
+        all_factors = factors_result.fetchall()
+
+        # 3. causal_robust=true 무조건 보존
+        causal_keep = [f for f in all_factors if f.causal_robust is True]
+        candidates = [f for f in all_factors if f.causal_robust is not True]
+
+        remaining_slots = max_per_interval - len(causal_keep)
+        if remaining_slots <= 0:
+            # causal 통과 팩터만으로도 limit 초과 -> 삭제 안 함
+            results[interval_key] = {
+                "before": count,
+                "after": count,
+                "pruned": 0,
+                "note": "causal_robust 팩터만으로 limit 초과",
+            }
+            continue
+
+        # 4. 니치별 최소 비율 보장
+        def _sort_key(f):
+            """fitness_composite 우선, 없으면 ic_mean 폴백."""
+            fc = f.fitness_composite
+            if fc is not None:
+                return fc
+            return f.ic_mean if f.ic_mean is not None else -999.0
+
+        niche_map: dict[str, list] = {}
+        for f in candidates:
+            try:
+                expr = parse_expression(f.expression_str or "")
+                niche = classify_niche(expr)
+            except Exception:
+                niche = "unknown"
+            niche_map.setdefault(niche, []).append(f)
+
+        num_niches = max(len(niche_map), 1)
+        min_per_niche = max(10, remaining_slots // (num_niches * 2))
+
+        niche_guaranteed: list = []
+        niche_rest: list = []
+        for _niche, factors_in_niche in niche_map.items():
+            sorted_niche = sorted(factors_in_niche, key=_sort_key, reverse=True)
+            niche_guaranteed.extend(sorted_niche[:min_per_niche])
+            niche_rest.extend(sorted_niche[min_per_niche:])
+
+        # 5. 나머지 슬롯을 fitness 순으로 채움
+        slots_after_niche = remaining_slots - len(niche_guaranteed)
+        if slots_after_niche > 0:
+            sorted_rest = sorted(niche_rest, key=_sort_key, reverse=True)
+            keep_rest = sorted_rest[:slots_after_niche]
+        else:
+            keep_rest = []
+
+        # 6. 보존 목록 = causal + niche_guaranteed + keep_rest
+        keep_ids = set()
+        keep_ids.update(f.id for f in causal_keep)
+        keep_ids.update(f.id for f in niche_guaranteed)
+        keep_ids.update(f.id for f in keep_rest)
+
+        # 7. 삭제 대상
+        prune_ids = [f.id for f in all_factors if f.id not in keep_ids]
+
+        if not dry_run and prune_ids:
+            # alpha_experiences FK가 SET NULL이므로 명시적 정리
+            await db.execute(
+                delete(AlphaExperience).where(
+                    AlphaExperience.factor_id.in_(prune_ids)
+                )
+            )
+            await db.execute(
+                delete(AlphaFactor).where(AlphaFactor.id.in_(prune_ids))
+            )
+
+        pruned = len(prune_ids)
+        total_pruned += pruned
+        results[interval_key] = {
+            "before": count,
+            "after": count - pruned,
+            "pruned": pruned,
+            "causal_kept": len(causal_keep),
+            "niche_distribution": {n: len(fs) for n, fs in niche_map.items()},
+        }
+
+    if not dry_run:
+        await db.commit()
+
+    return {
+        "dry_run": dry_run,
+        "max_per_interval": max_per_interval,
+        "total_pruned": total_pruned,
+        "intervals": results,
+    }
 
 
 @router.post("/factor/{factor_id}/backtest", status_code=202)
