@@ -191,12 +191,98 @@ class EvolutionEngine:
 
         return population
 
+    async def _inject_seed_factors(
+        self,
+        seed_factor_ids: list[str],
+        population: list[ScoredFactor],
+    ) -> int:
+        """seed_factor_ids에 해당하는 팩터를 DB에서 로드하여 모집단에 주입.
+
+        이미 모집단에 존재하는 팩터는 스킵한다.
+        Returns: 실제 주입된 팩터 수.
+        """
+        import uuid as _uuid
+
+        existing_ids = {f.factor_id for f in population if f.factor_id}
+
+        try:
+            uuids = [_uuid.UUID(fid) for fid in seed_factor_ids]
+        except (ValueError, AttributeError) as e:
+            logger.warning("seed_factor_ids UUID 파싱 실패: %s", e)
+            return 0
+
+        result = await self._db.execute(
+            select(AlphaFactor).where(AlphaFactor.id.in_(uuids))
+        )
+        factors = list(result.scalars().all())
+
+        if not factors:
+            logger.warning("seed_factor_ids: DB에서 팩터를 찾을 수 없음 (ids=%s)", seed_factor_ids)
+            return 0
+
+        injected = 0
+        for f in factors:
+            fid = str(f.id)
+            if fid in existing_ids:
+                logger.debug("seed factor %s already in population, skipping", fid)
+                continue
+
+            try:
+                expr = parse_expression(f.expression_str)
+                fitness = f.fitness_composite or compute_composite_fitness(
+                    ic_mean=f.ic_mean or 0.0,
+                    icir=f.icir or 0.0,
+                    turnover=f.turnover or 0.0,
+                    tree_depth=f.tree_depth or calc_tree_depth(expr),
+                    tree_size=f.tree_size or calc_tree_size(expr),
+                    sharpe=f.sharpe or 0.0,
+                    max_drawdown=f.max_drawdown or 0.0,
+                    w_ic=settings.ALPHA_FITNESS_W_IC,
+                    w_icir=settings.ALPHA_FITNESS_W_ICIR,
+                    w_sharpe=settings.ALPHA_FITNESS_W_SHARPE,
+                    w_mdd=settings.ALPHA_FITNESS_W_MDD,
+                    w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
+                    w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
+                )
+
+                population.append(ScoredFactor(
+                    expression=expr,
+                    expression_str=f.expression_str,
+                    hypothesis=f.hypothesis or "",
+                    ic_mean=f.ic_mean or 0.0,
+                    ic_std=f.ic_std or 0.0,
+                    icir=f.icir or 0.0,
+                    turnover=f.turnover or 0.0,
+                    sharpe=f.sharpe or 0.0,
+                    max_drawdown=f.max_drawdown or 0.0,
+                    generation=f.birth_generation or self._generation,
+                    factor_id=fid,
+                    fitness_composite=fitness,
+                    tree_depth=f.tree_depth or calc_tree_depth(expr),
+                    tree_size=f.tree_size or calc_tree_size(expr),
+                    expression_hash=f.expression_hash or expression_hash(expr),
+                    operator_origin="seed_injected",
+                    genotypic_age=0,  # 시드 주입 = 새 유전자 취급
+                ))
+                existing_ids.add(fid)
+                injected += 1
+            except (ASTConversionError, Exception) as e:
+                logger.warning("seed factor %s 파싱 실패: %s", fid, e)
+
+        return injected
+
     async def run_generation(
         self,
         progress_cb=None,
         iteration_cb=None,
+        seed_factor_ids: list[str] | None = None,
     ) -> list[DiscoveredFactor]:
         """한 세대 실행.
+
+        Parameters
+        ----------
+        seed_factor_ids : list[str] | None
+            DB에서 로드하여 초기 모집단에 주입할 팩터 ID 목록. None이면 무시.
 
         Returns
         -------
@@ -208,6 +294,15 @@ class EvolutionEngine:
 
         # 1. 모집단 로드
         population = await self.load_population()
+
+        # 1.1. seed_factor_ids가 있으면 해당 팩터를 DB에서 로드하여 모집단에 주입
+        if seed_factor_ids:
+            injected = await self._inject_seed_factors(seed_factor_ids, population)
+            if injected > 0:
+                logger.info(
+                    "세대 %d: seed_factor_ids에서 %d개 팩터 주입 (요청=%d)",
+                    self._generation, injected, len(seed_factor_ids),
+                )
 
         if not population:
             # 초기 시드 필요

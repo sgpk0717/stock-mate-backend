@@ -146,6 +146,7 @@ class AlphaFactoryStartRequest(BaseModel):
     orthogonality_threshold: float = Field(0.7, ge=0.0, le=1.0)
     enable_crossover: bool = True
     max_cycles: int | None = Field(None, ge=1, le=1000)
+    seed_factor_ids: list[str] | None = None  # 시드 팩터 ID 목록 (선택)
 
 
 class AlphaFactoryStatusResponse(BaseModel):

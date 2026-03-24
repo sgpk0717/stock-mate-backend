@@ -527,6 +527,66 @@ async def get_validation_status(job_id: str):
     return progress
 
 
+# ── 데이터 가용성 ──
+
+
+@router.get("/data-availability")
+async def get_data_availability(interval: str = "1d"):
+    """마이닝에 사용되는 데이터 소스별 가용성 확인."""
+    from sqlalchemy import text
+
+    from app.core.database import async_session
+
+    async with async_session() as db:
+        results = {}
+
+        # OHLCV (stock_candles)
+        r = await db.execute(
+            text("SELECT COUNT(*) FROM stock_candles WHERE interval = :iv"),
+            {"iv": interval},
+        )
+        ohlcv_count = r.scalar() or 0
+        results["ohlcv"] = {"available": ohlcv_count > 0, "rows": ohlcv_count}
+
+        # technical, cross_section은 OHLCV에서 자동 계산
+        results["technical"] = {"available": ohlcv_count > 0, "rows": ohlcv_count}
+        results["cross_section"] = {"available": ohlcv_count > 0, "rows": ohlcv_count}
+
+        # investor_trading
+        r = await db.execute(text("SELECT COUNT(*) FROM investor_trading"))
+        cnt = r.scalar() or 0
+        results["investor"] = {"available": cnt > 0, "rows": cnt}
+
+        # news_sentiment_daily
+        r = await db.execute(text("SELECT COUNT(*) FROM news_sentiment_daily"))
+        cnt = r.scalar() or 0
+        results["sentiment"] = {"available": cnt > 0, "rows": cnt}
+
+        # dart_financials
+        r = await db.execute(text("SELECT COUNT(*) FROM dart_financials"))
+        cnt = r.scalar() or 0
+        results["dart"] = {"available": cnt > 0, "rows": cnt}
+
+        # margin_short_daily
+        r = await db.execute(text("SELECT COUNT(*) FROM margin_short_daily"))
+        cnt = r.scalar() or 0
+        results["margin_short"] = {"available": cnt > 0, "rows": cnt}
+
+        # program_trading
+        r = await db.execute(text("SELECT COUNT(*) FROM program_trading"))
+        cnt = r.scalar() or 0
+        results["program"] = {"available": cnt > 0, "rows": cnt}
+
+        # sector (stock_masters with embedding)
+        r = await db.execute(
+            text("SELECT COUNT(*) FROM stock_masters WHERE embedding IS NOT NULL")
+        )
+        cnt = r.scalar() or 0
+        results["sector"] = {"available": cnt > 0, "rows": cnt}
+
+    return results
+
+
 # ── Phase 3: 알파 팩토리 ──
 
 
@@ -556,6 +616,7 @@ async def start_factory(data: AlphaFactoryStartRequest):
         orthogonality_threshold=data.orthogonality_threshold,
         enable_crossover=data.enable_crossover,
         max_cycles=data.max_cycles,
+        seed_factor_ids=data.seed_factor_ids,
     )
 
     if not result.get("started"):

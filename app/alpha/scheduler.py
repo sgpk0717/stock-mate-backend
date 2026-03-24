@@ -84,6 +84,7 @@ class AlphaFactoryScheduler:
         orthogonality_threshold: float = 0.7,
         enable_crossover: bool | None = None,
         max_cycles: int | None = None,
+        seed_factor_ids: list[str] | None = None,
     ) -> bool:
         """스케줄러 시작. 이미 실행 중이면 False 반환."""
         async with self._lock:
@@ -133,6 +134,7 @@ class AlphaFactoryScheduler:
                     "orthogonality_threshold": orthogonality_threshold,
                     "enable_crossover": crossover,
                     "max_cycles": max_cycles,
+                    "seed_factor_ids": seed_factor_ids,
                 },
             )
 
@@ -161,6 +163,18 @@ class AlphaFactoryScheduler:
                 "Alpha factory started: interval=%dmin, iterations=%d, task=%s",
                 interval, iterations, self._task,
             )
+
+            # WebSocket 즉시 알림 — 프론트 폴링 대기 없이 UI 갱신
+            try:
+                from app.services.ws_manager import manager
+                await manager.broadcast("alpha:factory", {
+                    "type": "factory_started",
+                    "interval": data_interval,
+                    "config": self._state.config,
+                })
+            except Exception:
+                pass
+
             return True
 
     async def stop(self) -> bool:
@@ -179,6 +193,17 @@ class AlphaFactoryScheduler:
                     pass
             self._task = None
             logger.info("Alpha factory stopped")
+
+            # WebSocket 즉시 알림
+            try:
+                from app.services.ws_manager import manager
+                await manager.broadcast("alpha:factory", {
+                    "type": "factory_stopped",
+                    "reason": "user",
+                })
+            except Exception:
+                pass
+
             return True
 
     def get_status(self) -> dict:
@@ -338,6 +363,13 @@ class AlphaFactoryScheduler:
             if self._cached_data is not None and self._data_cache_key == cache_key:
                 data = self._cached_data
                 logger.info("Cycle %d: using cached candles %d rows x %d cols", cycle_num, data.height, data.width)
+                await manager.broadcast("alpha:factory", {
+                    "type": "progress",
+                    "cycle": cycle_num,
+                    "phase": "data_cached",
+                    "message": f"캐시 데이터 사용 ({data.height:,}행 × {data.width}피처)",
+                    "current": 0, "total": 100,
+                })
             else:
                 data = await load_enriched_candles(
                     symbols=symbols,
@@ -347,7 +379,16 @@ class AlphaFactoryScheduler:
                 )
                 self._cached_data = data
                 self._data_cache_key = cache_key
-                logger.info("Cycle %d: loaded enriched candles %d rows x %d cols", cycle_num, data.height, data.width)
+                _size_mb = data.estimated_size() / 1024 / 1024
+                logger.info("Cycle %d: loaded enriched candles %d rows x %d cols (%.0fMB)", cycle_num, data.height, data.width, _size_mb)
+                # 팩트 기반 로그: 실제 로드 결과
+                await manager.broadcast("alpha:factory", {
+                    "type": "progress",
+                    "cycle": cycle_num,
+                    "phase": "data_loaded",
+                    "message": f"{data.height:,}행 × {data.width}피처 로드 ({_size_mb:.0f}MB)",
+                    "current": 0, "total": 100,
+                })
 
             if data.height == 0:
                 logger.warning("Alpha factory cycle %d: no candle data", cycle_num)
@@ -442,10 +483,14 @@ class AlphaFactoryScheduler:
 
                 self._evolution_engine._current_run_id = str(run_id)
 
-                logger.info("Cycle %d: starting run_generation (gen=%d)", cycle_num, self._evolution_engine.generation)
+                # seed_factor_ids: 첫 사이클에서만 주입, 이후 사이클에서는 무시
+                _seed_ids = config.get("seed_factor_ids") if cycle_num == 1 else None
+
+                logger.info("Cycle %d: starting run_generation (gen=%d, seed_factor_ids=%s)", cycle_num, self._evolution_engine.generation, _seed_ids)
                 discovered = await self._evolution_engine.run_generation(
                     progress_cb=progress_cb,
                     iteration_cb=iteration_cb,
+                    seed_factor_ids=_seed_ids,
                 )
                 logger.info("Cycle %d: run_generation done, discovered=%d", cycle_num, len(discovered))
 
