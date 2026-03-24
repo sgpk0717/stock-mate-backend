@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 KST = timezone(timedelta(hours=9))
 
-JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial", "vkospi")
+JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial", "vkospi", "program_trading")
 
 
 async def _send_collection_telegram(msg: str) -> None:
@@ -311,6 +311,7 @@ class DailyScheduler:
             "daily_candle": "일봉", "minute_candle": "분봉", "news": "뉴스",
             "margin_short": "신용/공매도", "investor": "투자자수급", "dart_financial": "DART재무",
             "vkospi": "VKOSPI",
+            "program_trading": "프로그램매매",
         }
         _JOB_DETAIL = {
             "daily_candle": "일봉 캔들 (pykrx)",
@@ -320,6 +321,7 @@ class DailyScheduler:
             "investor": "투자자별 매매동향 (KIS API)",
             "dart_financial": "DART 재무 데이터",
             "vkospi": "VKOSPI 대용 (KOSPI200 실현변동성, Yahoo Finance)",
+            "program_trading": "프로그램 매매 일별 보충 (KIS API)",
         }
         _formatted_date = f"{date[:4]}-{date[4:6]}-{date[6:]}" if len(date) == 8 else date
         items = "\n".join(
@@ -535,6 +537,15 @@ class DailyScheduler:
 
             return await collect_vkospi(
                 date, progress_cb=_progress_cb,
+            )
+
+        if job_name == "program_trading":
+            from app.scheduler.collectors.program_trading_daily import (
+                collect_program_trading_daily,
+            )
+
+            return await collect_program_trading_daily(
+                target_date=date, progress_cb=_progress_cb,
             )
 
         return CollectionResult(job=job_name)
