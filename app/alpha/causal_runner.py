@@ -45,6 +45,8 @@ def start_validation_job(job_id: str, total: int) -> None:
         "avg_ms_per_factor": None,
         "estimated_remaining_ms": None,
         "current_factor_idx": 0,
+        "logs": [],
+        "cancelled": False,
     }
 
 
@@ -75,6 +77,27 @@ def finish_validation_job(job_id: str) -> None:
     if job:
         job["status"] = "completed"
         job["estimated_remaining_ms"] = 0
+
+
+def _add_log(
+    job_id: str,
+    factor_idx: int,
+    total: int,
+    factor_name: str,
+    step: str,
+    message: str,
+) -> None:
+    """검증 잡에 실시간 로그 항목 추가."""
+    job = _validation_jobs.get(job_id)
+    if job:
+        job["logs"].append({
+            "ts": time.time(),
+            "idx": factor_idx,
+            "total": total,
+            "factor_name": factor_name,
+            "step": step,
+            "message": message,
+        })
 
 
 def get_validation_progress(job_id: str) -> dict | None:
@@ -147,6 +170,9 @@ async def validate_single_factor(
     db: AsyncSession,
     confounders_cache: dict | None = None,
     candles_cache: dict | None = None,
+    job_id: str | None = None,
+    factor_idx: int = 0,
+    factor_total: int = 0,
 ) -> CausalValidationResult:
     """개별 팩터에 대해 인과 검증을 수행하고 DB를 업데이트한다.
 
@@ -156,11 +182,18 @@ async def validate_single_factor(
     db : DB 세션
     confounders_cache : 교란 변수 캐시 (배치 호출 시 재사용)
     candles_cache : 캔들 데이터 캐시 (배치 호출 시 재사용)
+    job_id : 배치 잡 ID (로그 기록용, None이면 로그 미기록)
+    factor_idx : 현재 팩터 인덱스 (1-based, 로그 기록용)
+    factor_total : 전체 팩터 수 (로그 기록용)
 
     Returns
     -------
     CausalValidationResult
     """
+    def _log(step: str, message: str, name: str = "") -> None:
+        if job_id:
+            _add_log(job_id, factor_idx, factor_total, name, step, message)
+
     # 1. 팩터 조회
     result = await db.execute(
         select(AlphaFactor).where(AlphaFactor.id == factor_id)
@@ -168,6 +201,10 @@ async def validate_single_factor(
     factor = result.scalar_one_or_none()
     if not factor:
         raise ValueError(f"Factor not found: {factor_id}")
+
+    fname = factor.name or str(factor_id)[:8]
+    ic_val = factor.ic_mean if factor.ic_mean is not None else 0.0
+    _log("start", f"[{factor_idx}/{factor_total}] {fname} 검증 시작 (IC={ic_val:.4f})", fname)
 
     # 1b. IC 조기 필터: IC가 threshold 미만이면 DoWhy 스킵
     if factor.ic_mean is not None and factor.ic_mean < settings.ALPHA_IC_THRESHOLD_PASS:
@@ -177,6 +214,11 @@ async def validate_single_factor(
             .values(causal_robust=False, status="mirage", causal_failure_type="LOW_IC")
         )
         await db.commit()
+        _log(
+            "result",
+            f"[{factor_idx}/{factor_total}] {fname} → MIRAGE (LOW_IC: {factor.ic_mean:.4f} < {settings.ALPHA_IC_THRESHOLD_PASS})",
+            fname,
+        )
         logger.info(
             "Factor %s skipped (IC %.4f < %.4f)",
             str(factor_id)[:8], factor.ic_mean, settings.ALPHA_IC_THRESHOLD_PASS,
@@ -231,6 +273,8 @@ async def validate_single_factor(
     _symbols_for_cache = resolved_symbols or []
     cache_key = f"{start_date}_{end_date}_{interval}_{','.join(sorted(_symbols_for_cache))}"
 
+    _log("data_prep", f"[{factor_idx}/{factor_total}] {fname} 데이터 로딩 중...", fname)
+
     if candles_cache is not None and candles_cache.get("key") == cache_key:
         base_df = candles_cache["base_df"]
     else:
@@ -277,12 +321,39 @@ async def validate_single_factor(
             confounders_cache["_dt_normalized"] = True
 
     # 5. CPU-heavy 팩터 계산 + DoWhy를 스레드에서 실행
+    _log("causal_running", f"[{factor_idx}/{factor_total}] {fname} 인과 검증 실행 중 (ATE/플라시보/랜덤/체제)...", fname)
+
     causal_result = await asyncio.to_thread(
         _prepare_factor_and_validate_sync,
         base_df,
         factor.expression_str,
         confounders_df,
         sector_map,
+    )
+
+    # 5b. 인과 검증 세부 결과 로그
+    _log(
+        "ate_computed",
+        f"[{factor_idx}/{factor_total}] {fname} ATE={causal_result.causal_effect_size:.6f}, p={causal_result.p_value:.4f}",
+        fname,
+    )
+    _log(
+        "placebo",
+        f"[{factor_idx}/{factor_total}] {fname} 플라시보: {'PASS' if causal_result.placebo_passed else 'FAIL'} (effect={causal_result.placebo_effect:.6f})",
+        fname,
+    )
+    _log(
+        "random_cause",
+        f"[{factor_idx}/{factor_total}] {fname} 랜덤 원인: {'PASS' if causal_result.random_cause_passed else 'FAIL'} (delta={causal_result.random_cause_delta:.6f})",
+        fname,
+    )
+    regime_passed = getattr(causal_result, "regime_shift_passed", False)
+    ate_first = getattr(causal_result, "regime_ate_first_half", 0.0)
+    ate_second = getattr(causal_result, "regime_ate_second_half", 0.0)
+    _log(
+        "regime",
+        f"[{factor_idx}/{factor_total}] {fname} 체제 분할: {'PASS' if regime_passed else 'FAIL'} (1st={ate_first:.6f}, 2nd={ate_second:.6f})",
+        fname,
     )
 
     # 6. DB 업데이트
@@ -299,6 +370,15 @@ async def validate_single_factor(
         )
     )
     await db.commit()
+
+    # 최종 결과 로그
+    result_label = "VALIDATED" if causal_result.is_causally_robust else "MIRAGE"
+    failure_info = f" ({causal_result.failure_type})" if causal_result.failure_type else ""
+    _log(
+        "result",
+        f"[{factor_idx}/{factor_total}] {fname} → {result_label}{failure_info}",
+        fname,
+    )
 
     logger.info(
         "Factor %s causal validation: %s (ATE=%.6f, p=%.4f)",
@@ -422,18 +502,33 @@ async def validate_factors_by_ids(
     failed = 0
     robust = 0
     mirage = 0
+    total = len(factor_ids)
+
+    _add_log(job_id, 0, total, "", "batch_start", f"배치 검증 시작: {total}개 팩터")
 
     sem = asyncio.Semaphore(max_concurrent)
 
-    async def _validate_one(fid: uuid.UUID) -> bool | None:
+    async def _validate_one(idx: int, fid: uuid.UUID) -> bool | None:
         nonlocal validated, failed, robust, mirage
+
+        # 중단 체크
+        if _validation_jobs.get(job_id, {}).get("cancelled"):
+            return None
+
         async with sem:
+            # Semaphore 획득 후에도 중단 체크
+            if _validation_jobs.get(job_id, {}).get("cancelled"):
+                return None
+
             try:
                 async with async_session() as db:
                     result = await validate_single_factor(
                         fid, db,
                         confounders_cache=confounders_cache,
                         candles_cache=candles_cache,
+                        job_id=job_id,
+                        factor_idx=idx + 1,
+                        factor_total=total,
                     )
                 validated += 1
                 if result.is_causally_robust:
@@ -451,6 +546,11 @@ async def validate_factors_by_ids(
                     job_id, completed=validated, failed=failed,
                     robust=robust, mirage=mirage,
                 )
+                _add_log(
+                    job_id, idx + 1, total, str(fid)[:8],
+                    "result",
+                    f"[{idx + 1}/{total}] {str(fid)[:8]} → ERROR: {str(e)[:100]}",
+                )
                 logger.error("Validation %s failed: %s", str(fid)[:8], str(e)[:200])
                 try:
                     async with async_session() as err_db:
@@ -464,7 +564,21 @@ async def validate_factors_by_ids(
                     pass
                 return False
 
-    await asyncio.gather(*[_validate_one(fid) for fid in factor_ids])
+    # 순차적으로 실행하되 Semaphore로 동시성 제어
+    # (asyncio.gather는 모든 태스크를 동시에 스폰하므로, 중단 시 이미 스폰된 태스크는 취소 불가)
+    # → gather 유지하되, 각 태스크 내부에서 cancelled 체크
+    results = await asyncio.gather(
+        *[_validate_one(i, fid) for i, fid in enumerate(factor_ids)]
+    )
+
+    # 중단된 경우 로그 추가
+    if _validation_jobs.get(job_id, {}).get("cancelled"):
+        _add_log(
+            job_id, 0, total, "",
+            "cancelled",
+            f"사용자 중단: {validated}개 완료, {failed}개 실패",
+        )
+
     finish_validation_job(job_id)
 
     return {"validated": validated, "failed": failed, "robust": robust, "mirage": mirage}

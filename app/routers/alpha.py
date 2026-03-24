@@ -667,8 +667,8 @@ async def validate_factors_batch_endpoint(
 
 
 @router.get("/validate/{job_id}/status")
-async def get_validation_status(job_id: str):
-    """인과 검증 잡 진행 상황 조회."""
+async def get_validation_status(job_id: str, since_idx: int = 0):
+    """인과 검증 잡 진행 상황 조회. since_idx로 새 로그만 반환."""
     from app.alpha.factory_client import get_factory_client
 
     client = get_factory_client()
@@ -676,7 +676,24 @@ async def get_validation_status(job_id: str):
     if progress is None:
         raise HTTPException(404, "Validation job not found")
 
-    return progress
+    # 딕셔너리 복사 후 로그 슬라이싱 (원본 변경 방지)
+    result = {**progress}
+    if "logs" in result:
+        result["logs"] = result["logs"][since_idx:]
+
+    return result
+
+
+@router.post("/validate/{job_id}/cancel")
+async def cancel_validation(job_id: str):
+    """인과 검증 잡 중단 요청."""
+    from app.alpha.causal_runner import _validation_jobs
+
+    job = _validation_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Validation job not found")
+    job["cancelled"] = True
+    return {"cancelled": True}
 
 
 # ── 데이터 가용성 ──

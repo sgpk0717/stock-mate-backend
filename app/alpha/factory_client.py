@@ -178,52 +178,21 @@ class ExternalFactoryClient(FactoryClient):
         return state.factory_status
 
     async def start_validation_batch(self, factor_ids: list, job_id: str, total: int) -> None:
-        from app.core.database import async_session
-        from app.models.base import WorkerCommand
+        # 인과검증은 API 프로세스에서 직접 실행 (Worker 위임 불필요 — CPU-heavy는 to_thread)
+        from app.alpha.causal_runner import start_validation_job, validate_factors_by_ids
 
-        async with async_session() as session:
-            cmd = WorkerCommand(
-                command="validate_batch",
-                payload={
-                    "factor_ids": [str(fid) for fid in factor_ids],
-                    "job_id": job_id,
-                    "total": total,
-                },
-            )
-            session.add(cmd)
-            await session.commit()
+        start_validation_job(job_id, total)
+        asyncio.create_task(validate_factors_by_ids(factor_ids, job_id))
 
     async def get_validation_progress(self, job_id: str) -> dict | None:
-        from app.core.database import async_session
-        from app.models.base import WorkerState
-        from sqlalchemy import select
+        from app.alpha.causal_runner import get_validation_progress
 
-        async with async_session() as session:
-            result = await session.execute(select(WorkerState).where(WorkerState.id == 1))
-            state = result.scalar_one_or_none()
-
-        if not state or not state.causal_jobs:
-            return None
-
-        return state.causal_jobs.get(job_id)
+        return get_validation_progress(job_id)
 
     async def get_latest_validation_job(self) -> dict | None:
-        from app.core.database import async_session
-        from app.models.base import WorkerState
-        from sqlalchemy import select
+        from app.alpha.causal_runner import get_latest_validation_job
 
-        async with async_session() as session:
-            result = await session.execute(select(WorkerState).where(WorkerState.id == 1))
-            state = result.scalar_one_or_none()
-
-        if not state or not state.causal_jobs:
-            return None
-
-        jobs = state.causal_jobs
-        if not jobs:
-            return None
-
-        latest_id = max(jobs, key=lambda k: jobs[k].get("started_at", 0))
+        return get_latest_validation_job()
         return {"job_id": latest_id, **jobs[latest_id]}
 
 
