@@ -51,6 +51,13 @@ async def load_confounders(
     merged = pd.merge(merged, smb_df, on="dt", how="left")
     merged = pd.merge(merged, hml_df, on="dt", how="left")
 
+    # [2026-04-06] S&P500 수익률 + USD/KRW 환율 변동 — 오버나잇 갭 교란변수
+    us_df = _load_us_market_data(start_date, end_date)
+    if not us_df.empty:
+        merged = pd.merge(merged, us_df, on="dt", how="left")
+        merged["us_market_return"] = merged["us_market_return"].ffill().fillna(0.0)
+        merged["usd_krw_change"] = merged["usd_krw_change"].ffill().fillna(0.0)
+
     # forward-fill로 빈 날짜 채우기
     merged["base_rate"] = merged["base_rate"].ffill().bfill()
     # SMB/HML: 결측은 0.0으로 채움 (데이터 부재일에 neutral 가정)
@@ -100,6 +107,49 @@ async def _load_market_data(
     result = df.select(["dt", "market_return", "market_volatility", "market_momentum_12m"]).to_pandas()
     result["dt"] = pd.to_datetime(result["dt"]).dt.date
     return result
+
+
+def _load_us_market_data(start_date: date, end_date: date) -> pd.DataFrame:
+    """S&P500 수익률 + USD/KRW 환율 변동 로드 (yfinance).
+
+    T+1 shift: 미국 전일 종가 → 한국 당일 교란변수.
+    미국 장(23:30~06:00 KST) 종료 후 한국 장(09:00 KST) 개시.
+    """
+    try:
+        import yfinance as yf
+
+        extended_start = start_date - timedelta(days=10)
+        sp500 = yf.download("^GSPC", start=str(extended_start), end=str(end_date + timedelta(days=1)), progress=False)
+        usdkrw = yf.download("KRW=X", start=str(extended_start), end=str(end_date + timedelta(days=1)), progress=False)
+
+        result = pd.DataFrame()
+
+        if not sp500.empty:
+            sp = sp500["Close"].pct_change().reset_index()
+            sp.columns = ["dt", "us_market_return"]
+            sp["dt"] = pd.to_datetime(sp["dt"]).dt.date
+            # T+1 shift: 미국 월요일 수익률 → 한국 화요일에 반영
+            sp["dt"] = sp["dt"] + timedelta(days=1)
+            result = sp
+
+        if not usdkrw.empty:
+            fx = usdkrw["Close"].pct_change().reset_index()
+            fx.columns = ["dt", "usd_krw_change"]
+            fx["dt"] = pd.to_datetime(fx["dt"]).dt.date
+            fx["dt"] = fx["dt"] + timedelta(days=1)
+            if result.empty:
+                result = fx
+            else:
+                result = pd.merge(result, fx, on="dt", how="outer")
+
+        if not result.empty:
+            result = result[(result["dt"] >= start_date) & (result["dt"] <= end_date)]
+
+        return result
+
+    except Exception as e:
+        logger.warning("US market data load failed: %s", e)
+        return pd.DataFrame(columns=["dt", "us_market_return", "usd_krw_change"])
 
 
 def _load_base_rate(start_date: date, end_date: date) -> pd.DataFrame:
