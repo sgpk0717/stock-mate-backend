@@ -14,7 +14,9 @@ import sympy
 
 from app.alpha.ast_converter import (
     ASTConversionError,
+    FEATURE_FAMILY_MAP,
     NAMED_VARIABLE_MAP,
+    _FAMILY_DEFINITIONS,
     parse_expression,
     sympy_to_code_string,
     sympy_to_polars,
@@ -24,7 +26,14 @@ logger = logging.getLogger(__name__)
 
 # 피처 치환용 변수 목록
 _FEATURES = list(NAMED_VARIABLE_MAP.keys())
+_FEATURES_SET = set(_FEATURES)
 _MAX_DEPTH = 6
+
+# 패밀리별 피처 인덱스 (stratified sampling용, 모듈 로드 시 1회 구축)
+_FAMILY_FEATURE_INDEX: dict[str, list[str]] = {}
+for _fam, _members in _FAMILY_DEFINITIONS.items():
+    _FAMILY_FEATURE_INDEX[_fam] = [f for f in _members if f in _FEATURES_SET]
+_FAMILIES = [f for f in _FAMILY_FEATURE_INDEX if _FAMILY_FEATURE_INDEX[f]]
 
 
 def _get_subtrees(expr: sympy.Basic) -> list[sympy.Basic]:
@@ -149,8 +158,23 @@ def _mutate_constant(expr: sympy.Basic) -> sympy.Basic | None:
     return expr.subs(target, new_val)
 
 
+def _stratified_feature_select(exclude: str) -> str:
+    """2단계 계층적 피처 선택: 패밀리 균등 → 패밀리 내 균등.
+
+    균등 샘플링(1/150)에서 price(35개)가 23%를 차지하던 문제 해소.
+    8개 패밀리가 각각 12.5%의 선택 확률을 보장받는다.
+    """
+    chosen_family = random.choice(_FAMILIES)
+    candidates = [f for f in _FAMILY_FEATURE_INDEX[chosen_family] if f != exclude]
+    if not candidates:
+        # fallback: 전체 피처에서 선택
+        all_candidates = [f for f in _FEATURES if f != exclude]
+        return random.choice(all_candidates) if all_candidates else exclude
+    return random.choice(candidates)
+
+
 def _mutate_feature(expr: sympy.Basic) -> sympy.Basic | None:
-    """피처 심볼을 다른 피처로 교체."""
+    """피처 심볼을 다른 피처로 교체 (카테고리 균형 샘플링)."""
     subtrees = _get_subtrees(expr)
     symbols = [s for s in subtrees if isinstance(s, sympy.Symbol)]
     if not symbols:
@@ -158,11 +182,9 @@ def _mutate_feature(expr: sympy.Basic) -> sympy.Basic | None:
 
     target = random.choice(symbols)
     current_name = str(target)
-    candidates = [f for f in _FEATURES if f != current_name]
-    if not candidates:
-        return None
 
-    new_feature = sympy.Symbol(random.choice(candidates))
+    new_name = _stratified_feature_select(exclude=current_name)
+    new_feature = sympy.Symbol(new_name)
     return expr.subs(target, new_feature)
 
 
@@ -207,7 +229,8 @@ class ScoredFactor:
     turnover: float = 0.0          # 포지션 턴오버 (일별 포트폴리오 변경 비율)
     sharpe: float = 0.0            # Long-only Sharpe (상위 분위 포트폴리오)
     max_drawdown: float = 0.0
-    genotypic_age: int = 0         # AFPO: 유전 물질의 연령 (세대 수 기반)
+    genotypic_age: int = 0         # AFPO: 유전 물질의 연령
+    coverage_pct: float = 1.0      # IC 유효 비율 (0~1) (세대 수 기반)
 
 
 def hoist_mutation(expr: sympy.Basic) -> sympy.Basic | None:

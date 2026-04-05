@@ -58,8 +58,8 @@ logger = logging.getLogger(__name__)
 
 # 인터벌별 팩터 이름 prefix (일봉/분봉 구분)
 _INTERVAL_PREFIX = {
-    "1m": "m1", "3m": "m3", "5m": "m5",
-    "15m": "m15", "30m": "m30", "1h": "h1", "1d": "d",
+    "1m": "1m", "3m": "3m", "5m": "5m",
+    "15m": "15m", "30m": "30m", "1h": "1h", "1d": "d",
 }
 
 
@@ -88,6 +88,9 @@ class EvolutionEngine:
         generation: int = 0,
         train_ratio: float = 0.7,
         interval: str = "1d",
+        cpcv_n_groups: int = 10,
+        cpcv_n_test: int = 3,
+        cpcv_embargo_days: int = 10,
     ) -> None:
         self._data = data
         self._db = db
@@ -101,6 +104,9 @@ class EvolutionEngine:
         self._generation = generation
         self._train_ratio = train_ratio
         self._interval = interval
+        self._cpcv_n_groups = cpcv_n_groups
+        self._cpcv_n_test = cpcv_n_test
+        self._cpcv_embargo_days = cpcv_embargo_days
         self._current_run_id: str | None = None  # scheduler에서 설정
 
         # 데이터 전처리
@@ -115,6 +121,7 @@ class EvolutionEngine:
         result = await self._db.execute(
             select(AlphaFactor).where(
                 AlphaFactor.population_active == True,  # noqa: E712
+                AlphaFactor.interval == self._interval,
             ).order_by(AlphaFactor.fitness_composite.desc().nullslast())
         )
         factors = list(result.scalars().all())
@@ -212,7 +219,11 @@ class EvolutionEngine:
             return 0
 
         result = await self._db.execute(
-            select(AlphaFactor).where(AlphaFactor.id.in_(uuids))
+            select(AlphaFactor).where(
+                AlphaFactor.id.in_(uuids),
+                AlphaFactor.interval == self._interval,
+                AlphaFactor.factor_type == "single",
+            )
         )
         factors = list(result.scalars().all())
 
@@ -275,6 +286,7 @@ class EvolutionEngine:
         self,
         progress_cb=None,
         iteration_cb=None,
+        log_cb=None,
         seed_factor_ids: list[str] | None = None,
     ) -> list[DiscoveredFactor]:
         """한 세대 실행.
@@ -293,7 +305,11 @@ class EvolutionEngine:
         self._eval_fail_logged = 0  # 세대별 리셋
 
         # 1. 모집단 로드
+        if log_cb:
+            log_cb(f"세대 {self._generation}: DB에서 모집단 로드 중...")
         population = await self.load_population()
+        if log_cb:
+            log_cb(f"세대 {self._generation}: 모집단 {len(population)}개 로드 완료")
 
         # 1.1. seed_factor_ids가 있으면 해당 팩터를 DB에서 로드하여 모집단에 주입
         if seed_factor_ids:
@@ -303,13 +319,23 @@ class EvolutionEngine:
                     "세대 %d: seed_factor_ids에서 %d개 팩터 주입 (요청=%d)",
                     self._generation, injected, len(seed_factor_ids),
                 )
+                if log_cb:
+                    log_cb(f"세대 {self._generation}: 시드 팩터 {injected}개 주입")
 
-        if not population:
-            # 초기 시드 필요
-            logger.info("No active population found, seeding initial population")
-            population = await self._seed_population(
-                min(self._population_size, 20)
+        _min_pop = max(10, int(self._population_size * 0.1))
+        if len(population) < _min_pop:
+            # 모집단 부족 → LLM 시딩으로 부트스트랩
+            _need = _min_pop - len(population)
+            logger.info(
+                "모집단 부족: %d개 (최소 %d) → %d개 시드 생성",
+                len(population), _min_pop, _need,
             )
+            if log_cb:
+                log_cb(f"세대 {self._generation}: 모집단 {len(population)}개 부족 (최소 {_min_pop}) → {_need}개 시드 생성 중...")
+            seeds = await self._seed_population(_need)
+            population.extend(seeds)
+            if log_cb:
+                log_cb(f"세대 {self._generation}: 시드 {len(seeds)}개 추가 → 모집단 {len(population)}개")
 
         if progress_cb:
             await progress_cb(10, 100, f"세대 {self._generation}: 모집단 {len(population)}개 로드")
@@ -325,6 +351,8 @@ class EvolutionEngine:
         # 2. 엘리트 보존
         elites = self._select_elites(population)
         logger.info("세대 %d: 엘리트 %d개 선택, Train/Val 분할 시작", self._generation, len(elites))
+        if log_cb:
+            log_cb(f"세대 {self._generation}: 엘리트 {len(elites)}개 보존")
 
         # 2b. 수렴 감지 → LLM 재시드 주입
         self._diversity_injection_needed = False  # Phase 3 후 시드 주입 플래그
@@ -357,6 +385,8 @@ class EvolutionEngine:
                     "세대 %d: 수렴 감지 — %s. LLM 시드 + 다양성 시드 주입.",
                     self._generation, " / ".join(_reason),
                 )
+                if log_cb:
+                    log_cb(f"세대 {self._generation}: 수렴 감지 — {' / '.join(_reason)}")
                 self._diversity_injection_needed = True
 
                 # 기존 LLM 시드 주입 (5개)
@@ -370,10 +400,22 @@ class EvolutionEngine:
                         pass
                 if _injected > 0:
                     logger.info("세대 %d: LLM 시드 %d개 주입 완료", self._generation, _injected)
+                    if log_cb:
+                        log_cb(f"세대 {self._generation}: LLM 다양성 시드 {_injected}개 주입")
+
+        # 이벤트 루프 양보 (Redis/텔레그램 등 async 작업 실행 기회)
+        await asyncio.sleep(0)
 
         # 3. Train/Val 분할
-        train_data, val_data = self._split_train_val()
-        logger.info("세대 %d: Train/Val 분할 완료 (train=%d×%d, val=%s)", self._generation, train_data.height, train_data.width, val_data.height if val_data is not None else "None")
+        train_data, tier2_data, val_data = self._split_train_val()
+        logger.info(
+            "세대 %d: 분할 완료 (train=%d×%d, tier2=%s, val=%s)",
+            self._generation, train_data.height, train_data.width,
+            tier2_data.height if tier2_data is not None else "None",
+            val_data.height if val_data is not None else "None",
+        )
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Train/Val 분할 (train={train_data.height:,}행, val={val_data.height:,}행)" if val_data is not None else f"세대 {self._generation}: Train 전용 ({train_data.height:,}행)")
 
         # CPCV 검증에 전체 데이터가 필요하므로 참조 보존
         full_data = self._data
@@ -383,9 +425,13 @@ class EvolutionEngine:
         gc.collect()
 
         # 3.5. fwd_return 사전 계산 (팩터와 무관, 1회만 계산)
-        train_data = compute_forward_returns(train_data, periods=1)
+        # [2026-03-31] 딥리서치 R3+R4 — forward return periods 설정 연동
+        # 기본 1일. ALPHA_FORWARD_RETURN_PERIODS=5 → 5일 수익률 (재무/밸류 팩터 발굴용)
+        from app.core.config import settings as _cfg
+        _fwd_periods = _cfg.ALPHA_FORWARD_RETURN_PERIODS
+        train_data = compute_forward_returns(train_data, periods=_fwd_periods)
         if val_data is not None:
-            val_data = compute_forward_returns(val_data, periods=1)
+            val_data = compute_forward_returns(val_data, periods=_fwd_periods)
 
         # 4. 진화 3-Phase 파이프라인
         import time as _time
@@ -403,49 +449,60 @@ class EvolutionEngine:
 
         _t_phase0 = _time.perf_counter()
         logger.info("세대 %d: Phase 1 시작 (offspring_target=%d)", self._generation, offspring_target)
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Phase 1 — 자식 {offspring_target}개 생성 시작")
 
-        # ── Phase 1: 식 생성 (AST 즉시, LLM 지연) ──
-        _GeneratedChild = tuple  # (expr, op_name, parent, parent_ids)
-        ast_children: list[tuple] = []
-        llm_coros: list[tuple] = []  # (op_name, parent, parent_ids, coro)
-
-        for i in range(offspring_target):
-            op_name = self._operator_registry.select()
-            parents = tournament_select(
-                population,
-                k=min(settings.ALPHA_TOURNAMENT_K, len(population)),
-                n_select=2,
-                parsimony=True,
-            )
-            if not parents:
-                funnel["operator_null"] += 1
-                continue
-            parent = parents[0]
-            parent_ids = [parent.factor_id] if parent.factor_id else []
-
-            if op_name.startswith("llm_"):
-                if op_name == "llm_seed":
-                    coro = self._llm_seed()
-                elif op_name == "llm_crossover":
-                    # 시맨틱 교차: 서로 다른 패밀리의 부모 2개 사용
-                    if len(parents) >= 2:
-                        parent_ids = parent_ids + ([parents[1].factor_id] if parents[1].factor_id else [])
-                    coro = self._llm_semantic_crossover(parent, parents[1] if len(parents) >= 2 else parent)
+        # ── Phase 1: 식 생성 (AST는 to_thread, LLM은 코루틴 수집) ──
+        # AST 연산(tournament_select + _apply_ast_op)은 CPU 바운드 → 스레드 오프로드
+        def _phase1_ast_sync():
+            _ast = []
+            _llm_specs = []  # (op_name, parent, parent_ids, parents)
+            _nulls = 0
+            for _ in range(offspring_target):
+                op_name = self._operator_registry.select()
+                parents = tournament_select(
+                    population,
+                    k=min(settings.ALPHA_TOURNAMENT_K, len(population)),
+                    n_select=2, parsimony=True,
+                )
+                if not parents:
+                    _nulls += 1
+                    continue
+                parent = parents[0]
+                parent_ids = [parent.factor_id] if parent.factor_id else []
+                if op_name.startswith("llm_"):
+                    _llm_specs.append((op_name, parent, parent_ids, parents))
                 else:
-                    coro = self._llm_mutate(parent)
-                llm_coros.append((op_name, parent, parent_ids, coro))
+                    child_expr = self._apply_ast_op(parents, op_name)
+                    if child_expr is not None:
+                        if op_name == "ast_crossover" and len(parents) >= 2 and parents[1].factor_id:
+                            parent_ids = parent_ids + [parents[1].factor_id]
+                        _ast.append((child_expr, op_name, parent, parent_ids))
+                    else:
+                        self._operator_registry.update(op_name, delta_fitness=0.0)
+                        _nulls += 1
+            return _ast, _llm_specs, _nulls
+
+        ast_children, _llm_specs, _p1_nulls = await asyncio.to_thread(_phase1_ast_sync)
+        funnel["operator_null"] += _p1_nulls
+
+        # LLM 코루틴은 async 컨텍스트에서 생성 (to_thread 안에서는 불가)
+        llm_coros: list[tuple] = []
+        for op_name, parent, parent_ids, parents in _llm_specs:
+            if op_name == "llm_seed":
+                coro = self._llm_seed()
+            elif op_name == "llm_crossover":
+                if len(parents) >= 2:
+                    parent_ids = parent_ids + ([parents[1].factor_id] if parents[1].factor_id else [])
+                coro = self._llm_semantic_crossover(parent, parents[1] if len(parents) >= 2 else parent)
             else:
-                child_expr = self._apply_ast_op(parents, op_name)
-                if child_expr is not None:
-                    if op_name == "ast_crossover" and len(parents) >= 2 and parents[1].factor_id:
-                        parent_ids = parent_ids + [parents[1].factor_id]
-                    ast_children.append((child_expr, op_name, parent, parent_ids))
-                else:
-                    self._operator_registry.update(op_name, delta_fitness=0.0)
-                    funnel["operator_null"] += 1
+                coro = self._llm_mutate(parent)
+            llm_coros.append((op_name, parent, parent_ids, coro))
 
         _t_phase1 = _time.perf_counter()
         logger.info("세대 %d: Phase 1 완료 (%.1fs) — AST %d개, LLM %d개", self._generation, _t_phase1 - _t_phase0, len(ast_children), len(llm_coros))
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Phase 1 완료 — AST {len(ast_children)}개 + LLM {len(llm_coros)}개 ({_t_phase1 - _t_phase0:.1f}s)")
 
         if progress_cb:
             await progress_cb(
@@ -454,6 +511,8 @@ class EvolutionEngine:
             )
 
         # ── Phase 2: LLM 호출 동시 실행 (retry + 폴백) ──
+        if log_cb and llm_coros:
+            log_cb(f"세대 {self._generation}: Phase 2 — LLM {len(llm_coros)}개 동시 호출 시작")
         llm_success_count = 0
         if llm_coros:
             sem = asyncio.Semaphore(settings.ALPHA_LLM_MAX_CONCURRENT)
@@ -549,6 +608,8 @@ class EvolutionEngine:
         _t_phase2 = _time.perf_counter()
         all_children = ast_children
         logger.info("세대 %d: Phase 2 완료 (%.1fs) — 총 %d개 자식, to_thread 시작", self._generation, _t_phase2 - _t_phase1, len(all_children))
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Phase 2 완료 — LLM {llm_success_count}/{len(llm_coros)} 성공, 총 {len(all_children)}개 ({_t_phase2 - _t_phase1:.1f}s)")
 
         # ★ 자식 0개 시 Phase 3 스킵 (0초 빈 실행 방지)
         if not all_children:
@@ -596,15 +657,27 @@ class EvolutionEngine:
             })
 
         # ── Phase 3: CPU-bound 평가를 별도 스레드에서 실행 (이벤트 루프 해방) ──
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Phase 3 — {len(all_children)}개 배치 IC 평가 시작 (to_thread)")
+        # log_cb를 직접 전달 — 스레드 내부에서 실시간으로 scheduler state에 기록
+        # (list.append + str 대입은 GIL 하에 thread-safe)
+        # is_cancelled: 스레드 내부에서 주기적으로 체크, True면 즉시 종료
+        _cancel_check = getattr(self, "_is_cancelled", None)
         offspring, new_discovered, funnel = await asyncio.to_thread(
             self._evaluate_batch_sync,
             all_children, train_data, val_data,
             offspring_target, funnel,
             _t_phase0, _t_phase1, _t_phase2,
             full_data,
+            log_cb,
+            _cancel_check,
+            tier2_data,
         )
 
         logger.info("세대 %d: Phase 3 to_thread 완료 — offspring %d개", self._generation, len(offspring))
+
+        if log_cb:
+            log_cb(f"세대 {self._generation}: Phase 3 완료 — 평가 {len(offspring)}개, 발견 {len(new_discovered)}개")
 
         if progress_cb:
             await progress_cb(90, 100, f"세대 {self._generation}: 평가 완료")
@@ -699,7 +772,10 @@ class EvolutionEngine:
                     logger.debug("Failed to save experience: %s", e)
 
         # 7. DB 업데이트
+        if log_cb:
+            log_cb(f"세대 {self._generation}: 모집단 DB 영속화 ({len(final_population)}개)")
         await self._persist_population(final_population)
+        self._last_population = final_population  # scheduler report_metrics에서 참조
 
         if progress_cb:
             await progress_cb(100, 100, f"세대 {self._generation} 완료: {len(new_discovered)}개 발견")
@@ -735,6 +811,9 @@ class EvolutionEngine:
         t_phase1: float,
         t_phase2: float,
         full_data: pl.DataFrame | None = None,
+        log_cb=None,  # callable(str) — 실시간 로그 (scheduler._append_log)
+        is_cancelled=None,  # callable() -> bool — 취소 체크
+        tier2_data: pl.DataFrame | None = None,  # Tier 2 평가용 데이터 구간
     ) -> tuple[list, list, dict]:
         """Phase 3: 배치 평가 + Walk-Forward + CPCV (CPU-bound, 별도 스레드에서 실행).
 
@@ -751,8 +830,15 @@ class EvolutionEngine:
         _BATCH_SIZE = getattr(self, "_dynamic_batch_size", settings.ALPHA_EVAL_BATCH_SIZE)
         _is_intraday = is_intraday(self._interval)
         _rtc = default_round_trip_cost(self._interval)
+        _total_batches = (len(all_children) + _BATCH_SIZE - 1) // _BATCH_SIZE
+        _batch_idx = 0
 
         for batch_start in range(0, len(all_children), _BATCH_SIZE):
+            if is_cancelled and is_cancelled():
+                if log_cb:
+                    log_cb(f"Phase 3 중단: 배치 {_batch_idx}/{_total_batches}에서 취소됨")
+                break
+            _batch_idx += 1
             # 동적 배치 사이즈: OOM 발생 시에만 축소, 여유 시 복구
             try:
                 import psutil
@@ -783,12 +869,18 @@ class EvolutionEngine:
             if not valid_batch:
                 continue
 
+            if log_cb is not None:
+                log_cb(f"IC 배치 {_batch_idx}/{_total_batches}: {len(valid_batch)}개 평가 중...")
+
             # Step 2+3: 분봉/일봉 분기
             if _is_intraday:
                 # 분봉: per-factor 개별 평가 (배치 with_columns 불필요 — 메모리 절약)
                 # 필요 컬럼만 선택해서 메모리 압축 (32컬럼 → 최소 컬럼)
                 _eval_cols = {"symbol", "dt", "open", "high", "low", "close", "volume", "fwd_return"}
+                _vb_total = len(valid_batch)
                 for idx, (i, child_tuple) in enumerate(valid_batch):
+                    if is_cancelled and is_cancelled():
+                        break
                     child_expr, op_name, parent, parent_ids = child_tuple
                     # 수식에 필요한 피처 컬럼 추출 (SymPy 변수명 → Polars 컬럼명 변환)
                     try:
@@ -811,6 +903,10 @@ class EvolutionEngine:
                     )
                     if scored is not None:
                         offspring.append(scored)
+                    # 10개마다 진행 로그
+                    if log_cb is not None and ((idx + 1) % 10 == 0 or idx + 1 == _vb_total):
+                        _ic_val = f"IC={scored.ic_mean:.4f}" if scored else "eval_fail"
+                        log_cb(f"분봉 IC 평가 [{idx+1}/{_vb_total}] {op_name} → {_ic_val}")
                     # 메모리 회수: GC + OS에 회수 시간 부여
                     gc.collect()
                     if idx % 3 == 2:
@@ -848,7 +944,9 @@ class EvolutionEngine:
                     except Exception:
                         ic_dict[col] = []
 
-            for i, child_tuple in valid_batch:
+            _vb_total_d = len(valid_batch)
+            _batch_total_dates = df_batch.select("dt").unique().height
+            for _vi, (i, child_tuple) in enumerate(valid_batch):
                 child_expr, op_name, parent, parent_ids = child_tuple
                 col = f"_bf_{i}"
                 ic_series = ic_dict.get(col, [])
@@ -862,6 +960,7 @@ class EvolutionEngine:
                     turnover_series=to_series,
                     annualize=252.0,
                     round_trip_cost=_rtc,
+                    total_dates=_batch_total_dates,
                 )
                 scored = self._build_scored_factor(
                     child_expr, op_name, parent, parent_ids, metrics, funnel,
@@ -869,13 +968,22 @@ class EvolutionEngine:
                 if scored is not None:
                     offspring.append(scored)
 
+            # 배치 완료 로그
+            if log_cb is not None:
+                _ok = funnel["eval_success"]
+                log_cb(f"IC 배치 {_batch_idx}/{_total_batches} 완료: {_vb_total_d}개 평가, 누적 생존 {len(offspring)}개")
+
             # 배치 완료 후 임시 DataFrame 해제 + GC
             del df_batch
             gc.collect()
 
         _t_phase3 = _time.perf_counter()
+        if log_cb is not None:
+            log_cb(f"IC 평가 완료: {len(offspring)}개 생존 (eval_ok={funnel['eval_success']}, {_t_phase3 - t_phase2:.1f}s)")
 
         # Phase 3b: IC 통과 → Walk-Forward + CPCV 후보 수집
+        if log_cb is not None:
+            log_cb(f"Walk-Forward 검증 시작 (IC≥{self._ic_threshold:.3f})")
         for scored in offspring:
             if scored.ic_mean >= self._ic_threshold:
                 funnel["ic_pass"] += 1
@@ -899,20 +1007,101 @@ class EvolutionEngine:
 
                 cpcv_candidates.append(scored)
 
+        # ── Tier 2: 대리 강건성 게이트 (CPCV 전) ──
+        if settings.ALPHA_TIER2_ENABLED and tier2_data is not None and cpcv_candidates:
+            from app.alpha.surrogate_eval import compute_robustness_gate
+
+            tier2_top_k = min(settings.ALPHA_TIER2_TOP_K, len(cpcv_candidates))
+            cpcv_candidates.sort(key=lambda c: c.fitness_composite, reverse=True)
+            tier2_targets = cpcv_candidates[:tier2_top_k]
+
+            sl_grid = tuple(float(x) for x in settings.ALPHA_TIER2_SL_GRID.split(",") if x.strip())
+            ts_grid = tuple(float(x) for x in settings.ALPHA_TIER2_TS_GRID.split(",") if x.strip())
+
+            if log_cb is not None:
+                log_cb(f"Tier 2 강건성 평가 시작: 상위 {tier2_top_k}개, 그리드 {len(sl_grid)}×{len(ts_grid)}={len(sl_grid)*len(ts_grid)}조합")
+
+            tier2_passed_hashes: set[str] = set()
+            tier2_target_hashes: set[str] = {expression_hash(c.expression) for c in tier2_targets}
+            funnel["tier2_evaluated"] = 0
+            funnel["tier2_passed"] = 0
+            funnel["tier2_failed"] = 0
+
+            for i, candidate in enumerate(tier2_targets):
+                if is_cancelled and is_cancelled():
+                    break
+                try:
+                    passed, details = compute_robustness_gate(
+                        factor_expr=candidate.expression,
+                        tier2_data=tier2_data,
+                        stop_loss_grid=sl_grid,
+                        trailing_stop_grid=ts_grid,
+                    )
+                    funnel["tier2_evaluated"] += 1
+                    c_hash = expression_hash(candidate.expression)
+                    if passed:
+                        tier2_passed_hashes.add(c_hash)
+                        funnel["tier2_passed"] += 1
+                    else:
+                        funnel["tier2_failed"] += 1
+                    if log_cb is not None and (i + 1) % 10 == 0:
+                        log_cb(f"Tier 2 진행: {i+1}/{tier2_top_k} (통과 {funnel['tier2_passed']}, 탈락 {funnel['tier2_failed']})")
+                except Exception as e:
+                    logger.warning("Tier 2 평가 실패 (%s): %s", candidate.expression_str[:40], e)
+                    funnel["tier2_failed"] += 1
+
+            # 미통과 팩터를 CPCV 후보에서 제거
+            # Tier 2 평가 대상이 아닌 팩터는 통과시키지 않음 (미평가 = 탈락)
+            before_count = len(cpcv_candidates)
+            cpcv_candidates = [
+                c for c in cpcv_candidates
+                if expression_hash(c.expression) in tier2_passed_hashes
+                or expression_hash(c.expression) not in tier2_target_hashes
+            ]
+            if log_cb is not None:
+                log_cb(
+                    f"Tier 2 완료: {funnel['tier2_evaluated']}개 평가, "
+                    f"{funnel['tier2_passed']}개 통과, {funnel['tier2_failed']}개 탈락 → "
+                    f"CPCV 후보 {before_count}→{len(cpcv_candidates)}개"
+                )
+
         # CPCV 2단계 검증: top-K 후보만
+        if log_cb is not None:
+            log_cb(f"Walk-Forward 완료: IC 통과 {funnel['ic_pass']}개, WF 과적합 {funnel['wf_overfit']}개, Sharpe 탈락 {funnel['sharpe_fail']}개 → CPCV 후보 {len(cpcv_candidates)}개")
         if cpcv_candidates:
             from app.alpha.cpcv import cpcv_validate
+            from app.alpha.interval import is_intraday as _is_intraday
 
             cpcv_candidates.sort(key=lambda c: c.fitness_composite, reverse=True)
             cpcv_top_k = min(50, len(cpcv_candidates))
+            if log_cb is not None:
+                log_cb(f"CPCV 검증 시작: top-{cpcv_top_k}개 후보")
 
             # ★ 해시 기반 클론 중복 제거
             _discovered_hashes: set[str] = set()
+            _cpcv_idx = 0
 
             for child in cpcv_candidates[:cpcv_top_k]:
+                if is_cancelled and is_cancelled():
+                    if log_cb:
+                        log_cb(f"CPCV 중단: {_cpcv_idx}/{cpcv_top_k}에서 취소됨")
+                    break
+                _cpcv_idx += 1
+                # [2026-04-05] 분봉 intraday: 데이터 기간이 짧으므로 CPCV 그룹 축소
+                _cpcv_groups = self._cpcv_n_groups
+                _cpcv_test = self._cpcv_n_test
+                _cpcv_embargo = self._cpcv_embargo_days
+                if _is_intraday(self._interval):
+                    _cpcv_groups = min(self._cpcv_n_groups, 5)  # 10→5
+                    _cpcv_test = min(self._cpcv_n_test, 2)      # 3→2
+                    _cpcv_embargo = min(self._cpcv_embargo_days, 5)  # 10→5
                 cpcv_result = cpcv_validate(
                     full_data, child.expression,
+                    n_groups=_cpcv_groups,
+                    n_test=_cpcv_test,
+                    embargo_days=_cpcv_embargo,
                     ic_threshold=self._ic_threshold,
+                    interval=self._interval,
                 )
                 if cpcv_result.passed:
                     # ★ 구조적 해시로 클론 제거 (상수만 다른 동일 수식 방지)
@@ -923,10 +1112,14 @@ class EvolutionEngine:
                     _discovered_hashes.add(_hash)
 
                     # CPCV 통과 후 최종 Sharpe 검증
-                    if child.sharpe < settings.ALPHA_SHARPE_THRESHOLD:
+                    # [2026-04-05] 분봉 intraday 수익률은 변동성이 작아 Sharpe가 구조적으로 낮음
+                    _sharpe_th = settings.ALPHA_SHARPE_THRESHOLD
+                    if _is_intraday(self._interval) and settings.ALPHA_FWD_RETURN_MODE == "intraday":
+                        _sharpe_th = _sharpe_th * 0.5  # 0.3 → 0.15
+                    if child.sharpe < _sharpe_th:
                         logger.info(
-                            "CPCV 통과했지만 Sharpe %.2f < %.1f → 탈락: %s",
-                            child.sharpe, settings.ALPHA_SHARPE_THRESHOLD,
+                            "CPCV 통과했지만 Sharpe %.2f < %.2f → 탈락: %s",
+                            child.sharpe, _sharpe_th,
                             child.expression_str[:50],
                         )
                         continue
@@ -954,12 +1147,16 @@ class EvolutionEngine:
                         "CPCV passed: %s (mean_ic=%.4f, pbo=%.2f)",
                         child.expression_str[:50], cpcv_result.mean_ic, cpcv_result.pbo,
                     )
+                    if log_cb is not None:
+                        log_cb(f"CPCV {_cpcv_idx}/{cpcv_top_k} 통과: IC={cpcv_result.mean_ic:.4f}, PBO={cpcv_result.pbo:.2f}, Sharpe={child.sharpe:.2f}")
                 else:
                     logger.debug(
                         "CPCV rejected: %s (reason=%s, mean_ic=%.4f, pbo=%.2f)",
                         child.expression_str[:50], cpcv_result.reason,
                         cpcv_result.mean_ic, cpcv_result.pbo,
                     )
+                    if log_cb is not None:
+                        log_cb(f"CPCV {_cpcv_idx}/{cpcv_top_k} 탈락: {cpcv_result.reason} (IC={cpcv_result.mean_ic:.4f})")
 
         # cpcv_candidates 수를 funnel에 기록 (run_generation의 iteration_cb에서 참조)
         funnel["cpcv_candidates"] = len(cpcv_candidates)
@@ -982,6 +1179,13 @@ class EvolutionEngine:
             t_phase1 - t_phase0, t_phase2 - t_phase1,
             _t_phase3 - t_phase2, _t_phase3 - t_phase0,
         )
+        if log_cb is not None:
+            log_cb(
+                f"퍼널: {offspring_target}→eval {funnel['eval_success']}→IC {funnel['ic_pass']}"
+                f"→WF탈락 {funnel['wf_overfit']}→Sharpe탈락 {funnel['sharpe_fail']}"
+                f"→CPCV {len(cpcv_candidates)}→발견 {len(new_discovered)}"
+            )
+            log_cb(f"타이밍: 생성={t_phase1 - t_phase0:.1f}s, LLM={t_phase2 - t_phase1:.1f}s, 평가={_t_phase3 - t_phase2:.1f}s, 총={_t_phase3 - t_phase0:.1f}s")
 
         del full_data
         return offspring, new_discovered, funnel
@@ -1015,7 +1219,18 @@ class EvolutionEngine:
         if len(population) <= target_size:
             return population
 
-        max_pct = settings.ALPHA_NICHE_MAX_PCT
+        # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 동적 니치캡
+        # 프로세스: /deep-research → 2건 보고서 교차 분석
+        # 변경/추가: 수렴 감지 시 25%→15%로 축소하여 다양성 강제 확보
+        effective_niche_pct = settings.ALPHA_NICHE_MAX_PCT
+        if getattr(self, '_diversity_injection_needed', False):
+            effective_niche_pct = min(effective_niche_pct, 0.15)
+            logger.info(
+                "Dynamic niche cap: %.0f%% → %.0f%% (convergence detected)",
+                settings.ALPHA_NICHE_MAX_PCT * 100, effective_niche_pct * 100,
+            )
+
+        max_pct = effective_niche_pct
         if max_pct >= 1.0:
             population.sort(key=lambda f: f.fitness_composite, reverse=True)
             return population[:target_size]
@@ -1194,6 +1409,7 @@ class EvolutionEngine:
             select(AlphaFactor).where(
                 AlphaFactor.status == "validated",
                 AlphaFactor.population_active == False,  # noqa: E712
+                AlphaFactor.interval == self._interval,
             )
         )
         all_archived = list(archive_result.scalars().all())
@@ -1357,21 +1573,59 @@ class EvolutionEngine:
 
         return seeds
 
-    def _split_train_val(self) -> tuple[pl.DataFrame, pl.DataFrame | None]:
-        """데이터를 Train(70%) / Validation(30%) 분할."""
+    def _split_train_val(self) -> tuple[pl.DataFrame, pl.DataFrame | None, pl.DataFrame | None]:
+        """데이터를 Train / Tier2-Eval / Validation 분할.
+
+        ALPHA_TIER2_ENABLED=True: Train(50%) / Tier2(20%) / Val(30%)
+        ALPHA_TIER2_ENABLED=False: Train(70%) / Val(30%) (기존 동작)
+        """
         dates = self._data.select("dt").unique().sort("dt")
         date_list = dates["dt"].to_list()
 
         if len(date_list) < 20:
-            return self._data, None
+            return self._data, None, None
 
-        split_idx = int(len(date_list) * self._train_ratio)
-        split_date = date_list[split_idx]
+        if settings.ALPHA_TIER2_ENABLED:
+            train_ratio = settings.ALPHA_TIER2_TRAIN_RATIO      # 0.50
+            tier2_ratio = settings.ALPHA_TIER2_EVAL_RATIO        # 0.20
+            embargo_days = self._cpcv_embargo_days                # Train↔Tier2, Tier2↔Val embargo
+            train_idx = int(len(date_list) * train_ratio)
+            tier2_idx = int(len(date_list) * (train_ratio + tier2_ratio))
 
-        train = self._data.filter(pl.col("dt") <= split_date).rechunk().shrink_to_fit()
-        val = self._data.filter(pl.col("dt") > split_date).rechunk().shrink_to_fit()
+            train_end = date_list[train_idx]
+            tier2_end = date_list[tier2_idx]
 
-        return train, val if val.height > 0 else None
+            # Train: ~train_end
+            train = self._data.filter(pl.col("dt") <= train_end).rechunk().shrink_to_fit()
+
+            # Tier2: train_end + embargo ~ tier2_end (Train과의 겹침 방지)
+            tier2_start_idx = min(train_idx + embargo_days, tier2_idx)
+            tier2_start = date_list[tier2_start_idx] if tier2_start_idx < len(date_list) else tier2_end
+            tier2 = self._data.filter(
+                (pl.col("dt") >= tier2_start) & (pl.col("dt") <= tier2_end)
+            ).rechunk().shrink_to_fit()
+
+            # Val: tier2_end + embargo ~ (Tier2와의 겹침 방지)
+            val_start_idx = min(tier2_idx + embargo_days, len(date_list) - 1)
+            val_start = date_list[val_start_idx]
+            val = self._data.filter(pl.col("dt") >= val_start).rechunk().shrink_to_fit()
+
+            logger.info(
+                "3-segment split: Train ~%s (%d rows), Tier2 %s~%s (%d rows, embargo=%d), Val %s~ (%d rows, embargo=%d)",
+                train_end, train.height,
+                tier2_start, tier2_end, tier2.height, embargo_days,
+                val_start, val.height, embargo_days,
+            )
+
+            return train, tier2 if tier2.height > 0 else None, val if val.height > 0 else None
+        else:
+            split_idx = int(len(date_list) * self._train_ratio)
+            split_date = date_list[split_idx]
+
+            train = self._data.filter(pl.col("dt") <= split_date).rechunk().shrink_to_fit()
+            val = self._data.filter(pl.col("dt") > split_date).rechunk().shrink_to_fit()
+
+            return train, None, val if val.height > 0 else None
 
     def _is_overfit(self, train_ic: float, val_ic: float) -> bool:
         """과적합 판단: Val IC 기준 미달 또는 Train→Val 하락 50% 초과."""
@@ -1432,7 +1686,7 @@ class EvolutionEngine:
             "abs(return_5d) / atr_7 * rsi_7 / 100",
         ]
 
-        train_data, _ = self._split_train_val()
+        train_data, _, _ = self._split_train_val()
 
         for i, tmpl in enumerate(templates[:count]):
             try:
@@ -1675,6 +1929,11 @@ class EvolutionEngine:
             self._operator_registry.update(op_name, delta_fitness=0.0)
             return None
 
+        # 커버리지 hard filter: IC 유효 일수가 최소 기준 미달이면 탈락
+        if len(metrics.ic_series) < settings.ALPHA_MIN_COVERAGE_DAYS:
+            self._operator_registry.update(op_name, delta_fitness=0.0)
+            return None
+
         depth = calc_tree_depth(child_expr)
         size = calc_tree_size(child_expr)
         fitness = compute_composite_fitness(
@@ -1691,6 +1950,8 @@ class EvolutionEngine:
             w_mdd=settings.ALPHA_FITNESS_W_MDD,
             w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
             w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
+            coverage_pct=metrics.coverage_pct,
+            coverage_exp=settings.ALPHA_COVERAGE_PENALTY_EXP,
         )
 
         delta = fitness - parent.fitness_composite
@@ -1718,6 +1979,7 @@ class EvolutionEngine:
             expression_hash=expression_hash(child_expr),
             operator_origin=op_name,
             genotypic_age=child_age,
+            coverage_pct=metrics.coverage_pct,
         )
 
     # eval 실패 샘플 로깅 카운터 (세대당 리셋)
@@ -1780,7 +2042,7 @@ class EvolutionEngine:
         try:
             import random as _random
 
-            from app.alpha.miner import _CATEGORY_EXAMPLES, _CATEGORIES
+            from app.alpha.miner import _CATEGORY_EXAMPLES, _CATEGORIES, _FSA_AVOID_PATTERNS
 
             feature_list = self._get_feature_list()
 
@@ -1791,11 +2053,11 @@ class EvolutionEngine:
                 family_features = {
                     "price": "close, open, high, low, sma_20, ema_20, bb_upper, bb_lower",
                     "momentum": "rsi, macd_hist, price_change_pct, return_5d, return_20d",
-                    "volatility": "atr_14, atr_7, bb_width, true_range",
-                    "supply": "foreign_net_norm, inst_net_norm, retail_net_norm",
-                    "fundamental": "eps, bps, earnings_yield, book_yield, operating_margin",
-                    "sentiment": "sentiment_score, event_score, article_count",
-                    "market_micro": "margin_rate, short_balance_rate, pgm_net_norm",
+                    "volatility": "atr_14, atr_7, bb_width, vkospi, vkospi_percentile",
+                    "supply": "foreign_net_norm, inst_net_norm, foreign_net_ema5, foreign_net_ema20, foreign_flow_accel, smart_dumb_gap, foreign_accum_10d",
+                    "fundamental": "eps, bps, earnings_yield, book_yield, eps_fresh, days_since_disclosure",
+                    "sentiment": "sentiment_score, event_score, sentiment_ema3, event_score_ema5",
+                    "market_micro": "margin_rate, short_balance_rate, pgm_net_norm, short_asi_60, margin_rate_roc10",
                 }
                 target_features = family_features.get(category, "")
                 example_strs = ""
@@ -1824,6 +2086,11 @@ class EvolutionEngine:
                     f"Return ONLY the formula, nothing else."
                 )
 
+            # [2026-03-31] 딥리서치 R2 고유 권장 — FSA 회피 패턴을 LLM 시드에도 주입
+            # 프로세스: /deep-research → 2건 보고서 교차 분석
+            # 변경/추가: 반복 발견 단순 패턴을 LLM에 회피 지시 (miner.py와 동일)
+            prompt += f"\n{_FSA_AVOID_PATTERNS}"
+
             # RAG 경험 추가
             if self._vector_memory:
                 rag = self._vector_memory.format_rag_context(
@@ -1845,6 +2112,8 @@ class EvolutionEngine:
     async def _llm_mutate(self, parent: ScoredFactor) -> sympy.Basic | None:
         """LLM으로 기존 수식 변이 (다차원 메트릭 피드백)."""
         try:
+            from app.alpha.miner import _FSA_AVOID_PATTERNS
+
             feature_list = self._get_feature_list()
             prompt = (
                 f"Mutate this alpha factor formula to improve it:\n"
@@ -1859,6 +2128,11 @@ class EvolutionEngine:
                 "sign(), step(), Max(), Min(), clip(x, lo, hi).\n"
                 "Return ONLY the new formula, nothing else."
             )
+
+            # [2026-03-31] 딥리서치 R2 고유 권장 — FSA 회피 패턴을 LLM 변이에도 주입
+            # 프로세스: /deep-research → 2건 보고서 교차 분석
+            # 변경/추가: 반복 발견 단순 패턴 회피 (miner.py 및 _llm_seed와 동일)
+            prompt += f"\n{_FSA_AVOID_PATTERNS}"
 
             # RAG: 유사한 과거 시도
             if self._vector_memory:
@@ -1955,9 +2229,13 @@ class EvolutionEngine:
             if is_intraday(self._interval):
                 from app.alpha.evaluator import _collapse_to_daily
                 # with_columns + select 체이닝: 큰 중간 DataFrame 방지
+                # open 포함: intraday 모드에서 장중 수익률(open→close) 계산에 필요
+                _select_cols = ["symbol", "dt", "close", "alpha_factor"]
+                if "open" in data.columns:
+                    _select_cols.insert(3, "open")
                 df = (
                     data.with_columns(polars_expr.alias("alpha_factor"))
-                    .select(["symbol", "dt", "close", "alpha_factor"])
+                    .select(_select_cols)
                 )
                 del data  # 호출자의 slim_data 참조 해제 촉진
                 df = _collapse_to_daily(df, factor_col="alpha_factor")
@@ -1976,6 +2254,8 @@ class EvolutionEngine:
             if df.height < 10:
                 return None
 
+            total_dates = df.select("dt").unique().height
+
             ic_series = compute_ic_series(df, factor_col="alpha_factor")
             ls_returns = compute_quantile_returns(df, factor_col="alpha_factor")
             lo_returns = compute_long_only_returns(df, factor_col="alpha_factor")
@@ -1987,6 +2267,7 @@ class EvolutionEngine:
                 turnover_series=turnover_series,
                 annualize=252.0,
                 round_trip_cost=default_round_trip_cost(self._interval),
+                total_dates=total_dates,
             )
         except Exception as e:
             if self._eval_fail_logged < 5:
@@ -2008,10 +2289,11 @@ class EvolutionEngine:
 
     async def _persist_population(self, population: list[ScoredFactor]) -> None:
         """모집단을 DB에 영속화."""
-        # 기존 활성 모집단 비활성화
+        # 기존 활성 모집단 비활성화 (같은 interval만)
         await self._db.execute(
             update(AlphaFactor)
             .where(AlphaFactor.population_active == True)  # noqa: E712
+            .where(AlphaFactor.interval == self._interval)
             .values(population_active=False, is_elite=False)
         )
 
