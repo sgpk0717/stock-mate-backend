@@ -40,6 +40,7 @@ def cpcv_validate(
     n_test: int = 3,      # 2→3 (C(10,3)=120 경로)
     embargo_days: int = 10,  # 5→10 (일봉 보유기간 고려)
     ic_threshold: float = 0.03,
+    interval: str = "1d",  # [2026-04-03] 분봉 정합성: intraday 모드 시 장중 수익률 적용
 ) -> CPCVResult:
     """조합적 정제 교차 검증.
 
@@ -60,7 +61,32 @@ def cpcv_validate(
     if isinstance(factor_expr, str):
         factor_expr = parse_expression(factor_expr)
 
-    # 고유 날짜 목록
+    # 안전장치: 단일 종목 시 스킵 (cross-sectional IC 불가)
+    n_symbols = df.select("symbol").n_unique() if "symbol" in df.columns else 1
+    if n_symbols < 3:
+        return CPCVResult(
+            passed=True,
+            reason="single_stock",
+        )
+
+    # 팩터 컬럼 추가 + fwd_return 계산
+    try:
+        polars_expr = sympy_to_polars(factor_expr)
+        df = df.with_columns(polars_expr.alias("alpha_factor"))
+
+        # [2026-04-03] 분봉 정합성: evaluator와 동일한 수익률 정의 사용
+        from app.alpha.interval import is_intraday
+        from app.core.config import settings
+        if is_intraday(interval) and settings.ALPHA_FWD_RETURN_MODE == "intraday":
+            from app.alpha.evaluator import _collapse_to_daily
+            df = _collapse_to_daily(df, factor_col="alpha_factor")
+        else:
+            df = compute_forward_returns(df, periods=1)
+    except Exception as e:
+        logger.debug("CPCV factor computation failed: %s", e)
+        return CPCVResult(passed=False, reason=f"eval_error: {e}")
+
+    # [2026-04-05] 고유 날짜 목록 — collapse 후 추출해야 dt 타입 일치
     unique_dates = df.select("dt").unique().sort("dt")["dt"].to_list()
     total_days = len(unique_dates)
 
@@ -72,25 +98,8 @@ def cpcv_validate(
             reason="insufficient_data",
         )
 
-    # 안전장치: 단일 종목 시 스킵 (cross-sectional IC 불가)
-    n_symbols = df.select("symbol").n_unique() if "symbol" in df.columns else 1
-    if n_symbols < 3:
-        return CPCVResult(
-            passed=True,
-            reason="single_stock",
-        )
-
     # embargo 자동 조정
     actual_embargo = min(embargo_days, total_days // n_groups - 1)
-
-    # 팩터 컬럼 추가
-    try:
-        polars_expr = sympy_to_polars(factor_expr)
-        df = df.with_columns(polars_expr.alias("alpha_factor"))
-        df = compute_forward_returns(df, periods=1)
-    except Exception as e:
-        logger.debug("CPCV factor computation failed: %s", e)
-        return CPCVResult(passed=False, reason=f"eval_error: {e}")
 
     # NaN/Inf 필터링
     df = df.filter(

@@ -31,12 +31,26 @@ class FactorMetrics:
     max_drawdown: float        # Long-only 포트폴리오 MDD (비율, 예: -0.15 = -15%)
     ic_series: list[float]
     long_only_returns: list[float] = field(default_factory=list)
+    coverage_pct: float = 1.0      # IC 유효 일수 / 전체 일수 (0~1)
+    # [2026-04-06] 멀티호라이즌 IC (분봉 팩터 알파 반감기 측정)
+    multi_horizon: dict | None = None   # {horizon_days: {ic_mean, icir, n_obs}, optimal_horizon: int}
+    optimal_horizon: int | None = None  # 최적 보유기간 (일수)
+    half_life_days: float | None = None # 알파 반감기 (일수)
 
 
 def compute_forward_returns(
     df: pl.DataFrame, periods: int = 1
 ) -> pl.DataFrame:
-    """T+periods 수익률 컬럼 추가."""
+    """T+periods 수익률 컬럼 추가.
+
+    [QA fix C3] 다종목 데이터에서 symbol별 shift — 심볼 경계 오염 방지.
+    이전: bare shift(-periods)로 심볼 A 마지막 행이 심볼 B 첫 행의 close를 참조.
+    """
+    if "symbol" in df.columns:
+        return df.with_columns(
+            (pl.col("close").shift(-periods).over("symbol") / pl.col("close") - 1.0)
+            .alias("fwd_return")
+        )
     return df.with_columns(
         (pl.col("close").shift(-periods) / pl.col("close") - 1.0)
         .alias("fwd_return")
@@ -191,6 +205,129 @@ def compute_ic_multi_horizon(
         results["optimal_horizon"] = best_h
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# IC Decay Profile (팩터 정보 반감기 측정)
+# [2026-03-31] 딥리서치 R3+R4 공통 권장 — IC 감쇠 프로파일
+# 실측: Factor 1(ICIR=0.79) 감쇠 1%, Factor 2(ICIR=0.69) 감쇠 53% @20일
+# ---------------------------------------------------------------------------
+
+
+def compute_ic_decay_profile(
+    df: pl.DataFrame,
+    factor_col: str = "alpha_factor",
+    horizons: list[int] | None = None,
+) -> dict:
+    """IC 감쇠 프로파일 — 팩터의 정보 반감기 측정.
+
+    Parameters
+    ----------
+    df : 팩터 값 + close + symbol 포함 DataFrame
+    horizons : 보유기간 리스트 (일봉 기준: [1, 3, 5, 10, 20])
+
+    Returns
+    -------
+    {
+        "profile": {horizon: {"ic_mean", "icir"}},
+        "half_life_days": int | None,  # IC가 1일 IC의 50%로 떨어지는 일수
+        "decay_rate": float,  # 20일 IC / 1일 IC (1.0 = 감쇠 없음, 0.0 = 완전 소멸)
+        "classification": "durable" | "moderate" | "fast_decay"
+    }
+    """
+    if horizons is None:
+        horizons = [1, 3, 5, 10, 20]
+
+    # [QA fix I5] 빈 horizon 또는 단일 포인트 방어
+    if not horizons or len(horizons) < 2:
+        return {
+            "profile": {},
+            "half_life_days": None,
+            "decay_rate": 0.0,
+            "classification": "unknown",
+        }
+
+    profile = compute_ic_multi_horizon(df, factor_col, horizons=horizons)
+
+    ic_1d = profile.get(horizons[0], {}).get("ic_mean", 0.0)
+    ic_max_h = profile.get(horizons[-1], {}).get("ic_mean", 0.0)
+
+    # 감쇠율: 마지막 horizon IC / 첫 horizon IC
+    if abs(ic_1d) > 1e-8:
+        decay_rate = ic_max_h / ic_1d
+    else:
+        decay_rate = 0.0
+
+    # 반감기 계산: IC가 ic_1d의 50%로 떨어지는 일수 (선형 보간)
+    half_life = None
+    # [QA fix I5] IC 부호 반전 시 half_life 계산 스킵
+    if abs(ic_1d) > 1e-8 and ic_1d * ic_max_h > 0:  # 같은 부호일 때만
+        target = abs(ic_1d) * 0.5
+        for i in range(len(horizons) - 1):
+            h1, h2 = horizons[i], horizons[i + 1]
+            ic1 = abs(profile.get(h1, {}).get("ic_mean", 0.0))
+            ic2 = abs(profile.get(h2, {}).get("ic_mean", 0.0))
+            if ic1 >= target >= ic2 and ic1 > ic2:
+                half_life = h1 + (target - ic1) / (ic2 - ic1) * (h2 - h1)
+                half_life = round(half_life, 1)
+                break
+        if half_life is None and abs(ic_max_h) >= target:
+            half_life = float(horizons[-1])
+
+    # [QA fix I5] IC 증가/부호 반전 분류 추가
+    if ic_1d * ic_max_h < 0:
+        classification = "sign_reversal"  # IC 부호가 뒤집힘: 위험 팩터
+    elif decay_rate > 1.2:
+        classification = "strengthening"  # IC가 시간이 지나면 강해짐 (value 팩터 등)
+    elif decay_rate >= 0.8:
+        classification = "durable"        # 감쇠 20% 미만: 장기 유효 팩터
+    elif decay_rate >= 0.4:
+        classification = "moderate"       # 감쇠 20~60%: 중기 팩터
+    else:
+        classification = "fast_decay"     # 감쇠 60% 이상: 단기 전용 팩터
+
+    return {
+        "profile": {h: profile[h] for h in horizons if h in profile},
+        "half_life_days": half_life,
+        "decay_rate": round(decay_rate, 4),
+        "classification": classification,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 섹터 중립화 (팩터값에서 섹터 효과 제거)
+# [2026-03-31] 딥리서치 R3+R4 — 산업 중립화
+# 추정 효과: +10~30% IC (Cs_Rank 이미 사용하는 팩터에는 제한적)
+# ---------------------------------------------------------------------------
+
+
+def neutralize_sector(
+    df: pl.DataFrame,
+    factor_col: str = "alpha_factor",
+    date_col: str = "dt",
+    sector_col: str = "sector_id",
+) -> pl.DataFrame:
+    """섹터 중립화: 날짜×섹터별 팩터 평균을 차감.
+
+    삼성전자/SK하이닉스의 반도체 섹터 쏠림 효과를 제거하여
+    종목 고유의 알파만 남긴다.
+
+    Parameters
+    ----------
+    df : 팩터 값 + dt + sector_id 포함 DataFrame
+
+    Returns
+    -------
+    DataFrame with factor_col replaced by sector-neutralized values
+    """
+    if sector_col not in df.columns:
+        logger.warning("neutralize_sector: '%s' column not found, skipping", sector_col)
+        return df
+
+    return df.with_columns(
+        (pl.col(factor_col) - pl.col(factor_col).mean().over([date_col, sector_col]))
+        .alias(factor_col)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +725,7 @@ def compute_factor_metrics(
     turnover_series: list[float] | None = None,
     round_trip_cost: float = 0.0043,
     annualize: float = 252.0,
+    total_dates: int = 0,
 ) -> FactorMetrics:
     """IC 시리즈 + 수익률에서 집계 메트릭 산출.
 
@@ -647,6 +785,8 @@ def compute_factor_metrics(
         drawdown = (cum_returns - peak) / np.where(peak > 1e-12, peak, 1.0)
         max_drawdown = float(np.min(drawdown))
 
+    coverage_pct = len(ic_series) / total_dates if total_dates > 0 else 1.0
+
     return FactorMetrics(
         ic_mean=_sanitize_float(ic_mean),
         ic_std=_sanitize_float(ic_std),
@@ -656,6 +796,7 @@ def compute_factor_metrics(
         max_drawdown=_sanitize_float(max_drawdown),
         ic_series=ic_series,
         long_only_returns=long_only_returns or [],
+        coverage_pct=min(1.0, coverage_pct),
     )
 
 
@@ -665,14 +806,17 @@ def _collapse_to_daily(
 ) -> pl.DataFrame:
     """분봉 데이터를 일별 스냅샷으로 축소.
 
-    일별 첫 봉의 팩터값으로 종목 선택, 일별 close-to-close 수익률 사용.
-    이는 '매일 장 시작에 리밸런스, 장 끝까지 보유' 전략과 동일하다.
+    ALPHA_FWD_RETURN_MODE에 따라 수익률 정의가 달라진다:
+    - overnight (기본): close(T) → close(T+1) — 오버나잇 포함, 기존 동작
+    - intraday: open(첫봉) → close(마지막봉) — 당일 장중 수익률만
 
     Returns
     -------
     pl.DataFrame  (dt=Date, symbol, factor_col, fwd_return)
-        dt별 하루에 1행씩, fwd_return = 다음 거래일 종가/오늘 종가 - 1
     """
+    from app.core.config import settings
+
+    use_intraday = settings.ALPHA_FWD_RETURN_MODE == "intraday"
     date_col = _resolve_date_col(df)
 
     # dt → date 추출
@@ -681,23 +825,45 @@ def _collapse_to_daily(
     else:
         df = df.with_columns(pl.col(date_col).alias("_date"))
 
-    # 일별 첫 봉의 팩터값, 일별 마지막 봉의 종가
+    # 일별 집계: 첫 봉 팩터값 + 마지막 봉 종가
+    # [2026-04-05] intraday: 두 번째 봉 시가를 진입가로 사용 (시그널 확정 09:05 + 1봉 실행지연 = 09:10)
+    # 첫 봉 시가(09:00)는 시그널 확정 전이므로 사용 불가
+    agg_exprs = [
+        pl.col(factor_col).first().alias(factor_col),
+        pl.col("close").last().alias("close"),
+    ]
+    if use_intraday and "open" in df.columns:
+        # 두 번째 봉의 시가 = 시그널 확정 후 실제 진입 가능 가격
+        # shift(-1)로 다음 봉의 open을 가져옴 (group 내 정렬 후)
+        agg_exprs.append(
+            pl.col("open").sort_by(date_col).shift(-1).first().alias("_entry_open")
+        )
+
     first_factor = (
         df.sort(["symbol", date_col])
         .group_by(["symbol", "_date"])
-        .agg([
-            pl.col(factor_col).first().alias(factor_col),
-            pl.col("close").last().alias("close"),
-        ])
+        .agg(agg_exprs)
         .sort(["symbol", "_date"])
     )
 
-    # 일별 forward return: close(T+1) / close(T) - 1 (종목별)
-    first_factor = first_factor.with_columns(
-        (pl.col("close").shift(-1).over("symbol") / pl.col("close") - 1.0)
-        .alias("fwd_return")
-    ).rename({"_date": date_col})
+    if use_intraday and "_entry_open" in first_factor.columns:
+        # 장중 수익률: open(두번째봉, 09:10) → close(마지막봉, 15:25)
+        # 시그널(09:05 확정) 이후 진입 → 장 마감 청산, 겹침 구간 없음
+        # _entry_open이 null이면 봉 1개뿐인 날 → fwd_return도 null
+        first_factor = first_factor.with_columns(
+            pl.when(pl.col("_entry_open").is_not_null() & (pl.col("_entry_open") > 0))
+            .then(pl.col("close") / pl.col("_entry_open") - 1.0)
+            .otherwise(None)
+            .alias("fwd_return")
+        ).drop("_entry_open")
+    else:
+        # 기존: close(T) → close(T+1) 오버나잇 포함
+        first_factor = first_factor.with_columns(
+            (pl.col("close").shift(-1).over("symbol") / pl.col("close") - 1.0)
+            .alias("fwd_return")
+        )
 
+    first_factor = first_factor.rename({"_date": date_col})
     return first_factor
 
 
@@ -741,8 +907,7 @@ def evaluate_factor(
     if is_intraday(interval):
         # 분봉 → 일별 축소 후 평가 (Lo 2002, Kakushadze 2016)
         #
-        # _collapse_to_daily: 일별 첫 봉의 팩터값, 당일 종가 → 익일 종가 수익률
-        # 이는 "매일 장 시작에 팩터 기준으로 종목 선택, 장 끝까지 보유" 전략과 동일.
+        # _collapse_to_daily: 일별 첫 봉의 팩터값 + open(09:10)→close(15:25) 장중 수익률
         #
         # 바 단위 평가를 하지 않는 이유:
         # - 78개/일의 5분봉은 독립 관측이 아님 (자기상관)
@@ -755,6 +920,16 @@ def evaluate_factor(
         ls_returns = compute_quantile_returns(df_daily, factor_col=name)
         long_only_returns = compute_long_only_returns(df_daily, factor_col=name)
         pos_turnover, turnover_series = compute_position_turnover(df_daily, factor_col=name)
+
+        # [2026-04-06] 멀티호라이즌 IC (일별 축소 데이터 기준, 메모리 안전)
+        # 일별이므로 horizon = 일수 [1, 3, 5, 10, 20]
+        try:
+            _mh = compute_ic_multi_horizon(df_daily, factor_col=name, horizons=[1, 3, 5, 10, 20])
+            _multi_horizon = _mh
+            _optimal_h = _mh.get("optimal_horizon")
+        except Exception:
+            _multi_horizon = None
+            _optimal_h = None
 
         sharpe_annualize = 252.0  # 일별 수익률 → 연환산
         sharpe_cost = default_round_trip_cost(interval)
@@ -770,8 +945,10 @@ def evaluate_factor(
 
         sharpe_annualize = 252.0  # bars_per_year("1d") = 252
         sharpe_cost = default_round_trip_cost(interval)
+        _multi_horizon = None
+        _optimal_h = None
 
-    return compute_factor_metrics(
+    metrics = compute_factor_metrics(
         ic_series,
         ls_returns=ls_returns,
         long_only_returns=long_only_returns,
@@ -780,3 +957,6 @@ def evaluate_factor(
         round_trip_cost=sharpe_cost,
         annualize=sharpe_annualize,
     )
+    metrics.multi_horizon = _multi_horizon
+    metrics.optimal_horizon = _optimal_h
+    return metrics

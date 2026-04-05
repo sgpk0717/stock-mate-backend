@@ -82,24 +82,62 @@ class Settings(BaseSettings):
     CAUSAL_RANDOM_CAUSE_THRESHOLD: float = 0.05
     CAUSAL_NUM_SIMULATIONS: int = 999  # Davidson & MacKinnon(2000): 최소 399, 권장 999
     CAUSAL_USE_FAST_ENGINE: bool = True  # NumPy 고속 엔진 (False → DoWhy 레거시)
+    # [2026-03-31] 딥리서치 R3+R4 공통 권장 — 인과검증 속도 최적화
+    # FWL 벡터화(실측 3.8x~15.5x) + 적응적 사전판별 (Besag-Clifford 1991)
+    # multiprocessing은 실측 후 폐기 (spawn 오버헤드 64~127초 > to_thread 3.9초)
+    CAUSAL_QUICK_SCREEN_PERMS: int = 50  # 적응적 사전 판별 순열 수
+    CAUSAL_QUICK_SCREEN_THRESHOLD: int = 36  # 50회 중 36회 초과 시 MIRAGE 확정
+    CAUSAL_FWL_BATCH_SIZE: int = 250  # FWL 벡터화 배치 크기 (메모리: 250×780K×8B ≈ 1.5GB)
+
+    # [2026-03-31] 딥리서치 R3+R4 — 마이닝 품질 개선
+    # 5일 수익률: 기존 수급 팩터에는 역효과(실측). 새 마이닝 세션에서 재무/밸류 팩터 발굴용.
+    ALPHA_FORWARD_RETURN_PERIODS: int = 1  # 기본 1일 유지. 5로 변경 시 5일 수익률 예측.
+    # 섹터 중립화: 팩터값에서 날짜×섹터별 평균 차감. Cs_Rank 사용 팩터에는 효과 제한적.
+    ALPHA_NEUTRALIZE_SECTOR: bool = False  # 기본 off (실험적)
+    # [2026-04-06] 장 마감 매수 컷오프 — 장 마감 N분 전부터 신규 매수 금지 (분봉 전용)
+    # 15:30(장 마감) - 50분 = 14:40 이후 매수 금지
+    ALPHA_INTRADAY_BUY_CUTOFF_MINUTES: int = 50
+
+    # [2026-04-03] 분봉 fwd_return 정합성 — 딥리서치 결과
+    # overnight: close(T)→close(T+1) 오버나잇 포함
+    # intraday: open(첫봉)→close(마지막봉) 당일 장중 수익률
+    # 일봉 미만(시간봉/분봉)은 intraday가 기본. 일봉은 이 설정 무관하게 항상 overnight.
+    ALPHA_FWD_RETURN_MODE: str = "intraday"
 
     # Evolution Engine (진화형 팩토리)
     ALPHA_POPULATION_SIZE: int = 750  # 일봉 전환 (Koza 1992: 최소 500, 딥리서치 권고 500~1000)
     ALPHA_ELITE_PCT: float = 0.05
-    ALPHA_AST_MUTATION_RATIO: float = 0.92
-    ALPHA_LLM_MUTATION_RATIO: float = 0.08
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — LLM 비율 증가
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: 0.92→0.85 | 판단: LLM 비율 증가에 따른 AST 비율 조정
+    ALPHA_AST_MUTATION_RATIO: float = 0.85
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — LLM 비율 증가
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: 0.08→0.15 | 판단: R1 15-25%, R2 30-50%. 보수적으로 15% 선택. 구조적 수렴 탈출용
+    ALPHA_LLM_MUTATION_RATIO: float = 0.15
     ALPHA_LLM_PROVIDER: str = "gemini"  # "gemini" (저비용) | "anthropic" (고비용)
-    ALPHA_FITNESS_W_IC: float = 0.30       # Round 3: IC 정규화로 실질 영향력 5배 증가
-    ALPHA_FITNESS_W_ICIR: float = 0.30     # Round 3: 0.20→0.30 (ICIR 중심 진화)
-    ALPHA_FITNESS_W_SHARPE: float = 0.10   # Round 3: 0.20→0.10 (Sharpe 지배 완화)
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — ICIR 중심 진화로 전환
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: IC 0.30→0.15, ICIR 0.30→0.40, Sharpe 0.10→0.15 | 판단: IC 과대 기여 해소, ICIR이 예측 안정성의 핵심
+    ALPHA_FITNESS_W_IC: float = 0.15
+    ALPHA_FITNESS_W_ICIR: float = 0.40
+    ALPHA_FITNESS_W_SHARPE: float = 0.15
     ALPHA_FITNESS_W_MDD: float = 0.05
     ALPHA_FITNESS_W_TURNOVER: float = 0.10
-    ALPHA_FITNESS_W_COMPLEXITY: float = 0.15
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 복잡도 패널티 대폭 축소
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: 0.15→0.05 | 판단: R1 "제거 권장", R2 "적응형". 절충으로 대폭 축소하여 복잡한 다변수 팩터 발견 허용
+    ALPHA_FITNESS_W_COMPLEXITY: float = 0.05
     ALPHA_SHARPE_THRESHOLD: float = 0.3  # discovered 최소 Sharpe 기준
     ALPHA_MAX_TREE_DEPTH: int = 10
     ALPHA_MAX_TREE_SIZE: int = 30
     ALPHA_TOURNAMENT_K: int = 5
     ALPHA_NICHE_MAX_PCT: float = 0.25        # 니치별 최대 모집단 비율 (0.25=25%, 1.0=비활성화)
+    ALPHA_MIN_COVERAGE_DAYS: int = 60        # IC 유효 일수가 이 미만이면 팩터 탈락
+    # [2026-03-31] 딥리서치 R2 권장 — 커버리지 패널티 완화
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: 0.4→0.1 | 판단: 0.4 지수는 뉴스(18일)/프로그램매매(5일) 팩터를 사실상 차단. 0.1로 완화
+    ALPHA_COVERAGE_PENALTY_EXP: float = 0.1  # coverage^exp 적합도 스케일링 (1.0=패널티 없음)
 
     # Evolution Engine 병렬화
     ALPHA_LLM_MAX_CONCURRENT: int = 20       # LLM 동시 호출 수 (Tier 3 기준)
@@ -115,6 +153,14 @@ class Settings(BaseSettings):
     ALPHA_FACTORY_TOURNAMENT_K: int = 3
     ALPHA_FACTORY_ORTHOGONALITY_THRESHOLD: float = 0.7
     ALPHA_FACTORY_MAX_CYCLES: int = 10  # 야간 마이닝 최대 사이클 수 (API 비용 예산)
+
+    # Tier 2: 대리 강건성 평가 (CPCV 전 pass/fail 게이트)
+    ALPHA_TIER2_ENABLED: bool = False             # 기본 OFF
+    ALPHA_TIER2_TOP_K: int = 30                   # fitness 상위 N개만 평가
+    ALPHA_TIER2_SL_GRID: str = "0,0.10,0.15"     # 손절 그리드 (콤마 구분)
+    ALPHA_TIER2_TS_GRID: str = "0,0.30,0.50"     # 트레일링 그리드 (콤마 구분)
+    ALPHA_TIER2_TRAIN_RATIO: float = 0.50         # Tier2 ON 시 Train 비율
+    ALPHA_TIER2_EVAL_RATIO: float = 0.20          # Tier2 평가 구간 비율
 
     # Backtest
     BACKTEST_TIMEOUT_SECONDS: int = 1800  # 30분
@@ -148,7 +194,11 @@ class Settings(BaseSettings):
     WORKFLOW_ENABLED: bool = True
     WORKFLOW_TRADING_MODE: str = "paper"  # "paper" | "real"
     WORKFLOW_INITIAL_CAPITAL: float = 100_000_000
-    WORKFLOW_MULTI_FACTOR_COUNT: int = 3  # 동시 매매 팩터 수 (1~5)
+    WORKFLOW_MULTI_FACTOR_COUNT: int = 4  # 동시 매매 팩터 수 (deprecated, 하위호환용)
+    WORKFLOW_INTRADAY_FACTOR_COUNT: int = 2   # 5분봉 팩터 세션 수
+    WORKFLOW_DAILY_FACTOR_COUNT: int = 2      # 일봉 팩터 세션 수 (초기 생성)
+    WORKFLOW_DAILY_MAX_SESSIONS: int = 5      # 일봉 세션 최대 수
+    WORKFLOW_DAILY_AUTO_ROTATE: bool = False   # False=수동 교체만, True=자동 교체
     WORKFLOW_MAX_POSITIONS: int = 10
     WORKFLOW_STOP_LOSS_PCT: float = 5.0
     WORKFLOW_MAX_DRAWDOWN_PCT: float = 10.0
@@ -157,7 +207,7 @@ class Settings(BaseSettings):
     WORKFLOW_MIN_FACTOR_IC: float = 0.03
     WORKFLOW_REQUIRE_CAUSAL: bool = False
     WORKFLOW_FACTOR_MAX_AGE_DAYS: int = 30
-    WORKFLOW_DATA_INTERVAL: str = "5m"  # 분봉 단타 (1m/3m/5m)
+    WORKFLOW_DATA_INTERVAL: str = "5m"  # deprecated, 하위호환용
 
     # Strategy Pipeline (전략 레이어 필터)
     STRATEGY_PIPELINE_ENABLED: bool = True
