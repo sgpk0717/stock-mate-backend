@@ -14,10 +14,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-# KST timezone (프로젝트 전역 사용)
-_KST = timezone(timedelta(hours=9))
-
 import polars as pl
+
+from app.core.timezone import KST, now_kst, to_kst
 
 from app.backtest.cost_model import CostConfig, effective_buy_price, effective_sell_price
 from app.backtest.engine import generate_signals
@@ -133,34 +132,64 @@ async def _sync_session_to_redis(
     session: LiveSession,
     tick_summary: dict | None = None,
 ) -> None:
-    """세션 상태를 Redis Hash에 동기화 (Phase 1: 이중 기록)."""
-    try:
-        from app.core.redis import hset
-        import json
-        d = session.to_dict()
-        from app.core.redis import get_client
-        key = f"sessions:{session.id}"
-        data = {
-            "id": d["id"],
-            "context_id": d["context_id"],
-            "mode": d["mode"],
-            "strategy_name": d["strategy_name"],
-            "status": d["status"],
-            "positions": json.dumps(d["positions"], ensure_ascii=False),
-            "trade_count": str(d["trade_count"]),
-            "error_message": d["error_message"],
-            "started_at": d["started_at"],
-            "stopped_at": d["stopped_at"],
+    """세션 상태를 Redis Hash에 동기화.
+
+    TTL 120초: 세션이 tick을 보내지 않으면 자동 만료 → stale 방지.
+    """
+    from app.core.redis import hset
+    import json
+    d = session.to_dict()
+    key = f"sessions:{session.id}"
+
+    buy_count = sum(1 for t in session.trade_log if t.get("side") == "BUY")
+    sell_count = sum(1 for t in session.trade_log if t.get("side") == "SELL")
+    hold_count = len(session.positions)
+
+    positions_detail = {}
+    for sym, pos in session.positions.items():
+        positions_detail[sym] = {
+            "qty": pos.qty,
+            "avg_price": round(pos.avg_price, 2),
+            "name": get_stock_name(sym),
         }
-        # tick 요약 (모니터링용)
-        if tick_summary:
-            data.update(tick_summary)
-        await hset(key, data)
-        # 12시간 TTL — 날짜 변경 시 자동 만료
+
+    data = {
+        "id": d["id"],
+        "context_id": d["context_id"],
+        "mode": d["mode"],
+        "strategy_name": d["strategy_name"],
+        "status": d["status"],
+        "positions": json.dumps(positions_detail, ensure_ascii=False),
+        "trade_count": str(d["trade_count"]),
+        "error_message": d["error_message"],
+        "started_at": d["started_at"],
+        "stopped_at": d["stopped_at"],
+        "buy_signals": str(buy_count),
+        "sell_signals": str(sell_count),
+        "hold_count": str(hold_count),
+        "cash": str(round(session._cash)),
+        "max_positions": str(session.context.max_positions),
+        "interval": session.context.strategy.get("interval", "5m"),
+        "last_updated": now_kst().isoformat(),
+    }
+    if tick_summary:
+        for k, v in tick_summary.items():
+            if k not in data:
+                data[k] = v
+
+    # TTL 없음: tick 간격이 캔들 로딩(19M rows × 3세션)으로 10분+ 걸릴 수 있음.
+    # TTL을 걸면 정상 동작 중 만료되는 문제 반복.
+    # 장외 시간 stale 문제는 API 도메인 규칙(장 마감 후 running → DB 폴백)으로 처리.
+    # stopped 세션은 stop_session()에서 SREM으로 인덱스에서 제거됨.
+    await hset(key, data)
+
+    # 인덱스도 tick마다 갱신 (인덱스 만료 방지)
+    try:
+        from app.core.redis import get_client
         r = get_client()
-        await r.expire(key, 43200)
+        await r.sadd("sessions:index", session.id)
     except Exception:
-        pass  # Redis 실패해도 기존 동작에 영향 없음
+        pass
 
 
 async def _sync_sessions_index_to_redis() -> None:
@@ -172,12 +201,39 @@ async def _sync_sessions_index_to_redis() -> None:
         await r.delete("sessions:index")
         if ids:
             await r.sadd("sessions:index", *ids)
-    except Exception:
-        pass
+        # TTL 없음 — tick마다 SADD로 유지, 세션 종료 시 SREM으로 제거
+    except Exception as e:
+        logger.warning("Redis 세션 인덱스 동기화 실패: %s", e)
 
 
 async def start_session(ctx: TradingContext) -> LiveSession:
     """전략 실거래 세션 시작."""
+    # 자동매매 수동 중단 플래그 체크
+    try:
+        from app.core.redis import get_client as _get_redis
+        _r = _get_redis()
+        _flag = await _r.get("trading:user_stopped")
+        if _flag and str(_flag) == "true":
+            raise RuntimeError("자동매매 수동 중단 상태 — 세션 시작 차단")
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+
+    # #7: 동일 context_id(팩터)로 이미 실행 중인 세션 중복 방지
+    if ctx.id in _sessions:
+        existing = _sessions[ctx.id]
+        if existing.status == "running":
+            logger.warning(
+                "중복 세션 방지: context_id=%s (%s) 이미 실행 중 — 기존 세션 반환",
+                ctx.id[:8], ctx.strategy_name,
+            )
+            return existing
+        else:
+            # stopped/error 상태면 제거 후 새로 생성
+            logger.info("기존 세션 %s 상태=%s → 제거 후 재생성", ctx.id[:8], existing.status)
+            del _sessions[ctx.id]
+
     global _strategy_pipeline
     if _strategy_pipeline is None:
         _strategy_pipeline = StrategyPipeline.default()
@@ -188,7 +244,7 @@ async def start_session(ctx: TradingContext) -> LiveSession:
         id=ctx.id,
         context=ctx,
         status="running",
-        started_at=datetime.now(_KST).isoformat(),
+        started_at=now_kst().isoformat(),
         _cash=ctx.initial_capital,
     )
 
@@ -205,7 +261,7 @@ async def start_session(ctx: TradingContext) -> LiveSession:
             if last_trade_dt:
                 # DB는 UTC aware → enriched candles의 naive KST와 맞추기 위해 변환
                 if hasattr(last_trade_dt, 'astimezone'):
-                    last_trade_dt = last_trade_dt.astimezone(_KST).replace(tzinfo=None)
+                    last_trade_dt = to_kst(last_trade_dt).replace(tzinfo=None)
                 session._last_processed_dt = str(last_trade_dt)
                 logger.info("세션 %s: 오늘 마지막 매매 시각 복구 — %s (KST naive)", session.id[:8], last_trade_dt)
     except Exception as e:
@@ -235,8 +291,16 @@ async def stop_session(session_id: str) -> LiveSession | None:
     if not session:
         return None
 
+    # Paper 모드: pending orders 취소 + 예약 현금 반환
+    if session.pending_orders:
+        for order in session.pending_orders:
+            if order.get("side") == "BUY":
+                session._cash += order.get("reserved_cash", 0)
+        logger.info("세션 중지: pending orders %d건 취소, 현금 반환", len(session.pending_orders))
+        session.pending_orders.clear()
+
     session.status = "stopped"
-    session.stopped_at = datetime.now(_KST).isoformat()
+    session.stopped_at = now_kst().isoformat()
 
     if session._task and not session._task.done():
         session._task.cancel()
@@ -253,8 +317,14 @@ async def stop_session(session_id: str) -> LiveSession | None:
     # Redis 동기화 (Phase 1)
     await _sync_session_to_redis(session)
 
-    # _sessions에서 제거 → sessions:index에서도 사라짐
+    # _sessions에서 제거 + Redis 인덱스에서 명시적 제거
     _sessions.pop(session_id, None)
+    try:
+        from app.core.redis import get_client
+        r = get_client()
+        await r.srem("sessions:index", session_id)
+    except Exception:
+        pass
     await _sync_sessions_index_to_redis()
 
     await manager.broadcast("trading:status", {
@@ -370,8 +440,8 @@ async def _log_decision(
             ttl = await r.ttl(key)
             if ttl < 0:
                 await r.expire(key, 86400)
-    except Exception:
-        pass  # Redis 실패해도 기존 동작에 영향 없음
+    except Exception as e:
+        logger.warning("Redis 동기화 실패: %s", e)
 
 
 # ── 분할매매 헬퍼 ────────────────────────────────────────────
@@ -446,10 +516,54 @@ async def _run_loop(session: LiveSession) -> None:
     ps_cfg = ctx.position_sizing or {}
 
     check_interval = 30  # 초
+    interval = strategy.get("interval", "5m")
+    is_daily = interval == "1d"
+
+    # 일봉 세션: 장 시작 시 daily factor scores 캐싱
+    if is_daily:
+        try:
+            await _compute_daily_factor_scores(session)
+            logger.info(
+                "일봉 세션 %s: daily_scores 계산 완료 (%d종목)",
+                session.id[:8], len(getattr(session, "_daily_factor_scores", {})),
+            )
+        except Exception as e:
+            logger.warning("일봉 세션 %s: daily_scores 계산 실패 — %s", session.id[:8], e)
 
     try:
         while session.status == "running":
-            logger.info("_run_loop tick 시작: %s", session.id[:8])
+            # 자동매매 수동 중단 플래그 → 세션 자체 종료
+            try:
+                from app.core.redis import get_client as _get_redis
+                _r = _get_redis()
+                _stop_flag = await _r.get("trading:user_stopped")
+                if _stop_flag and str(_stop_flag) == "true":
+                    logger.info("_run_loop %s: 자동매매 수동 중단 감지 — 세션 종료", session.id[:8])
+                    break
+            except Exception:
+                pass
+
+            now = now_kst()
+
+            # 일봉 세션: 장외 시간에는 대기 (15:40 이후 ~ 다음날 08:50)
+            if is_daily:
+                if now.hour >= 16 or now.hour < 9 or (now.hour == 15 and now.minute >= 40):
+                    await _save_session_state(session)
+                    await _sync_session_to_redis(session)
+                    # 다음 장 시작까지 최대 1시간 단위로 대기
+                    logger.info("일봉 세션 %s 장외 대기 (현재 %s)", session.id[:8], now.strftime("%H:%M"))
+                    await asyncio.sleep(min(3600, _seconds_until_next_market(now)))
+                    # 다음 장 시작 시 daily_scores 재계산
+                    if now_kst().hour == 9 and now_kst().minute < 5:
+                        try:
+                            await _compute_daily_factor_scores(session)
+                            # 일봉 매도 체크: 스코어 미달 포지션 청산
+                            await _daily_rebalance_sell(session, cost)
+                        except Exception as e:
+                            logger.warning("일봉 세션 daily rebalance 실패: %s", e)
+                    continue
+
+            logger.info("_run_loop tick 시작: %s [%s]", session.id[:8], interval)
             try:
                 if is_paper:
                     await _paper_loop_tick(
@@ -495,13 +609,13 @@ async def _update_collector_status(
 ) -> None:
     """수집기 상태를 Redis에 기록 (모니터링 대시보드용)."""
     try:
-        from datetime import timezone, timedelta
         from app.core.redis import hset, get_client
-        KST = timezone(timedelta(hours=9))
-        now_str = datetime.now(KST).strftime("%H:%M:%S")
+        _now = now_kst()
+        now_str = _now.strftime("%H:%M:%S")
         await hset(f"collector:{collector_id}", {
             "status": status,
             "last_at": now_str,
+            "last_date": _now.strftime("%Y%m%d"),
             "last_count": str(last_count),
             "symbols_total": str(symbols_total),
             "next_at": next_at,
@@ -509,8 +623,24 @@ async def _update_collector_status(
         })
         r = get_client()
         await r.expire(f"collector:{collector_id}", 86400)
+    except Exception as e:
+        logger.warning("Redis 수집기 상태 업데이트 실패 (%s): %s", collector_id, e)
+
+
+async def _append_collector_log(collector_id: str, message: str) -> None:
+    """수집기 로그를 Redis List에 추가 (프론트 실시간 표시용)."""
+    try:
+        from app.core.redis import get_client
+        r = get_client()
+        ts = now_kst().strftime("%H:%M:%S")
+        entry = f"[{ts}] {message}"
+        key = f"collector:{collector_id}:logs"
+        await r.rpush(key, entry)
+        # 최근 500줄만 유지
+        await r.ltrim(key, -500, -1)
+        await r.expire(key, 86400)
     except Exception:
-        pass
+        pass  # 로그 실패는 무시
 
 
 async def start_intraday_candle_collector(symbols: list[str]) -> None:
@@ -531,38 +661,72 @@ async def start_intraday_candle_collector(symbols: list[str]) -> None:
 
 async def _intraday_collect_loop(symbols: list[str]) -> None:
     """5분 주기로 빈 구간 채우기 루프."""
-    from datetime import date as date_cls, timedelta, timezone as tz
-
-    KST = tz(timedelta(hours=9))
+    from datetime import date as date_cls, timedelta
 
     while True:
         try:
-            now_kst = datetime.now(KST)
+            now_kst_dt = now_kst()
+            # 09:00 이전이면 즉시 종료 (장 시간 외 실행 방지)
+            if now_kst_dt.hour < 9:
+                logger.warning(
+                    "장중 분봉 수집기: 09:00 이전 (%s) — 즉시 종료",
+                    now_kst_dt.strftime("%H:%M:%S"),
+                )
+                await _update_collector_status(
+                    "intraday", "stopped",
+                    symbols_total=len(symbols),
+                )
+                break
             # 15:30 이후면 종료
-            if now_kst.hour > 15 or (now_kst.hour == 15 and now_kst.minute >= 30):
+            if now_kst_dt.hour > 15 or (now_kst_dt.hour == 15 and now_kst_dt.minute >= 30):
                 logger.info("장중 분봉 수집기 종료 (15:30 이후)")
                 await _update_collector_status("intraday", "stopped", symbols_total=len(symbols))
                 break
 
-            today = now_kst.date()
+            today = now_kst_dt.date()
+            logger.info("━━━ 장중 분봉 수집 사이클 시작 (%s, %d종목) ━━━", now_kst_dt.strftime("%H:%M:%S"), len(symbols))
+            # 사이클 시작 시 이전 로그 클리어
+            try:
+                from app.core.redis import get_client as _gc
+                _r = _gc()
+                await _r.delete("collector:intraday:logs")
+            except Exception:
+                pass
+            await _append_collector_log("intraday", f"━━━ 사이클 시작: {len(symbols)}종목 ━━━")
             await _update_collector_status("intraday", "collecting", symbols_total=len(symbols))
-            collected = await _collect_missing_candles(symbols, today, now_kst)
-            # 1분봉 수집 후 완성된 5분봉 구간을 DB에서 리샘플링+저장
-            if collected > 0:
+
+            # 50종목씩 배치 수집 + 중간 리샘플링 (전체 수집 완료를 기다리지 않음)
+            collected = 0
+            five_min_count = 0
+            batch_size = 50
+            for batch_start in range(0, len(symbols), batch_size):
+                batch = symbols[batch_start:batch_start + batch_size]
+                batch_num = batch_start // batch_size + 1
+                total_batches = (len(symbols) + batch_size - 1) // batch_size
+
+                # 1분봉 수집
+                batch_collected = await _collect_missing_candles(batch, today, now_kst_dt)
+                collected += batch_collected
+
+                # 즉시 5분봉 리샘플링 (이 배치 종목만)
                 try:
-                    five_min_count = await _build_5m_from_db(symbols, today, now_kst)
+                    batch_5m = await _build_5m_from_db(batch, today, now_kst_dt)
+                    five_min_count += batch_5m
                 except Exception as e:
-                    logger.warning("5분봉 빌드 실패: %s", e)
-                    five_min_count = 0
-            else:
-                five_min_count = 0
-            next_at = (now_kst + timedelta(minutes=5)).strftime("%H:%M")
+                    logger.debug("배치 %d 5분봉 빌드 실패: %s", batch_num, e)
+                    batch_5m = 0
+
+                msg = f"배치 [{batch_num}/{total_batches}]: 1m={batch_collected}봉, 5m={batch_5m}봉 (누적 1m={collected}, 5m={five_min_count})"
+                await _append_collector_log("intraday", msg)
+
+            next_at = (now_kst() + timedelta(minutes=5)).strftime("%H:%M")
             await _update_collector_status(
                 "intraday", "idle",
                 last_count=collected, symbols_total=len(symbols), next_at=next_at,
             )
-            if collected > 0:
-                logger.info("장중 분봉 수집: %d봉 추가 (5m: %d봉)", collected, five_min_count)
+            msg = f"━━━ 사이클 완료: 1m={collected}봉, 5m={five_min_count}봉, 다음={next_at} ━━━"
+            logger.info(msg)
+            await _append_collector_log("intraday", msg)
 
         except Exception as e:
             logger.warning("장중 분봉 수집 루프 오류: %s", e)
@@ -574,14 +738,13 @@ async def _intraday_collect_loop(symbols: list[str]) -> None:
 async def _collect_missing_candles(
     symbols: list[str],
     today: "date",
-    now_kst: datetime,
+    now_kst_dt: datetime,
 ) -> int:
     """09:00~현재 사이 빈 구간을 앞쪽부터 채움."""
-    from datetime import timedelta, timezone as tz
+    from datetime import timedelta
     from app.core.database import async_session as get_session
     from sqlalchemy import text
 
-    KST = tz(timedelta(hours=9))
     today_str = today.strftime("%Y%m%d")
     market_open_kst = datetime(today.year, today.month, today.day, 9, 0, tzinfo=KST)
 
@@ -611,11 +774,11 @@ async def _collect_missing_candles(
         collect_from = market_open_kst
 
     # 이미 최신이면 스킵
-    if collect_from >= now_kst - timedelta(minutes=2):
+    if collect_from >= now_kst_dt - timedelta(minutes=2):
         return 0
 
-    # KIS API로 수집 (collect_from ~ now_kst 구간)
-    hour_str = now_kst.strftime("%H%M%S")
+    # KIS API로 수집 (collect_from ~ now_kst_dt 구간)
+    hour_str = now_kst_dt.strftime("%H%M%S")
 
     try:
         from app.trading.kis_client import get_kis_client
@@ -624,12 +787,18 @@ async def _collect_missing_candles(
         client = get_kis_client(is_mock=False)
         total_written = 0
 
+        collect_total = len(symbols)
+        collect_done = 0
+        collect_fail = 0
         for symbol in symbols:
+            collect_done += 1
+            sym_name = get_stock_name(symbol)
             try:
                 raw_candles, _, _ = await client.get_minute_candles(
                     symbol, today_str, hour_str,
                 )
                 if not raw_candles:
+                    logger.debug("1m 수집: %s (%s) — 데이터 없음", sym_name, symbol)
                     continue
 
                 one_min: list[dict] = []
@@ -640,7 +809,6 @@ async def _collect_missing_candles(
                     dt = datetime.strptime(dt_str, "%Y%m%d%H%M%S").replace(tzinfo=KST)
                     if dt.date() != today:
                         continue
-                    # collect_from 이후 데이터만 수집 (이미 있는 구간 스킵)
                     if dt <= collect_from:
                         continue
                     one_min.append({
@@ -655,12 +823,56 @@ async def _collect_missing_candles(
                 if one_min:
                     await write_candles_bulk(symbol, one_min, "1m")
                     total_written += len(one_min)
+                    msg = f"1m 수집 [{collect_done}/{collect_total}]: {sym_name} ({symbol}) — {len(one_min)}봉 저장"
+                    logger.info(msg)
+                    await _append_collector_log("intraday", msg)
+                else:
+                    msg = f"1m 수집 [{collect_done}/{collect_total}]: {sym_name} ({symbol}) — 최신 (신규 봉 없음)"
+                    logger.debug(msg)
+                    await _append_collector_log("intraday", msg)
 
             except Exception as e:
-                logger.warning("장중 분봉 수집 실패 (%s): %s", symbol, e)
+                collect_fail += 1
+                msg = f"1m 수집 실패 [{collect_done}/{collect_total}]: {sym_name} ({symbol}) — {e}"
+                logger.warning(msg)
+                await _append_collector_log("intraday", msg)
+                # 실패 시 1회 재시도 (2초 대기 후)
+                await asyncio.sleep(2)
+                try:
+                    raw_retry, _, _ = await client.get_minute_candles(symbol, today_str, hour_str)
+                    if raw_retry:
+                        retry_min = []
+                        for c in raw_retry:
+                            dt_str = c.get("stck_bsop_date", "") + c.get("stck_cntg_hour", "")
+                            if len(dt_str) != 14:
+                                continue
+                            dt = datetime.strptime(dt_str, "%Y%m%d%H%M%S").replace(tzinfo=KST)
+                            if dt.date() != today or dt <= collect_from:
+                                continue
+                            retry_min.append({
+                                "dt": dt,
+                                "open": float(c.get("stck_oprc", 0)),
+                                "high": float(c.get("stck_hgpr", 0)),
+                                "low": float(c.get("stck_lwpr", 0)),
+                                "close": float(c.get("stck_prpr", 0)),
+                                "volume": int(c.get("cntg_vol", 0)),
+                            })
+                        if retry_min:
+                            await write_candles_bulk(symbol, retry_min, "1m")
+                            total_written += len(retry_min)
+                            collect_fail -= 1  # 재시도 성공 시 실패 카운트 복구
+                            msg = f"1m 재시도 성공 [{collect_done}/{collect_total}]: {sym_name} ({symbol}) — {len(retry_min)}봉 저장"
+                            logger.info(msg)
+                            await _append_collector_log("intraday", msg)
+                except Exception:
+                    pass  # 재시도도 실패하면 다음 사이클에서 처리
                 continue
 
             await asyncio.sleep(0.1)  # rate limit
+
+        msg = f"1m 수집 완료: {collect_done}/{collect_total}종목, {total_written}봉 저장, {collect_fail}건 실패"
+        logger.info(msg)
+        await _append_collector_log("intraday", msg)
 
         return total_written
 
@@ -670,7 +882,7 @@ async def _collect_missing_candles(
 
 
 async def _build_5m_from_db(
-    symbols: list[str], today: "date", now_kst: datetime,
+    symbols: list[str], today: "date", now_kst_dt: datetime,
 ) -> int:
     """DB의 1분봉에서 완성된 5분봉 구간만 리샘플링하여 저장.
 
@@ -680,19 +892,18 @@ async def _build_5m_from_db(
     3. 완성된 5분 버킷(5개 1분봉)만 리샘플링
     4. 미완성 버킷(현재 진행 중)은 건너뜀
     """
-    from datetime import timedelta, timezone as tz
+    from datetime import timedelta
     from app.core.database import async_session as get_session
     from app.services.candle_writer import write_candles_bulk
     from sqlalchemy import text
 
-    KST = tz(timedelta(hours=9))
     total_5m = 0
 
     # 현재 시각 기준 완성된 마지막 5분 경계
     # 예: 10:37 → 10:35가 마지막 완성 버킷 시작 (10:31~10:35)
-    min_since_open = (now_kst.hour - 9) * 60 + now_kst.minute
+    min_since_open = (now_kst_dt.hour - 9) * 60 + now_kst_dt.minute
     last_complete_slot = (min_since_open // 5) * 5  # 완성된 마지막 슬롯 (분)
-    complete_boundary = now_kst.replace(
+    complete_boundary = now_kst_dt.replace(
         hour=9, minute=0, second=0, microsecond=0,
     ) + timedelta(minutes=last_complete_slot)
 
@@ -730,17 +941,22 @@ async def _build_5m_from_db(
                     ),
                     {"sym": symbol, "start": fetch_from, "end": complete_boundary + timedelta(minutes=5)},
                 )
-                candles_1m = [
-                    {
-                        "dt": row[0] if row[0].tzinfo else row[0].replace(tzinfo=KST),
+                candles_1m = []
+                for row in rows.fetchall():
+                    dt_val = row[0]
+                    # 항상 KST로 통일 (DB가 UTC로 저장)
+                    if dt_val.tzinfo is None:
+                        dt_val = dt_val.replace(tzinfo=KST)
+                    else:
+                        dt_val = to_kst(dt_val)
+                    candles_1m.append({
+                        "dt": dt_val,
                         "open": float(row[1]),
                         "high": float(row[2]),
                         "low": float(row[3]),
                         "close": float(row[4]),
                         "volume": int(row[5]),
-                    }
-                    for row in rows.fetchall()
-                ]
+                    })
 
                 if not candles_1m:
                     continue
@@ -758,13 +974,19 @@ async def _build_5m_from_db(
                 if five_min:
                     await write_candles_bulk(symbol, five_min, "5m")
                     total_5m += len(five_min)
+                    sym_name = get_stock_name(symbol)
+                    msg = f"5m 리샘플링: {sym_name} ({symbol}) — {len(five_min)}봉 생성 (1m={len(candles_1m)}봉)"
+                    logger.info(msg)
+                    await _append_collector_log("intraday", msg)
 
             except Exception as e:
-                logger.debug("5분봉 빌드 실패 (%s): %s", symbol, e)
+                logger.warning("5m 리샘플링 실패 (%s): %s", symbol, e)
                 continue
 
     if total_5m > 0:
-        logger.info("5분봉 빌드 완료: %d종목에서 %d봉", len(symbols), total_5m)
+        logger.info("5m 리샘플링 완료: %d종목, 총 %d봉 생성", len(symbols), total_5m)
+    else:
+        logger.info("5m 리샘플링: 새로 생성할 5분봉 없음")
 
     return total_5m
 
@@ -785,8 +1007,11 @@ def _resample_candles(candles_1m: list[dict], interval_min: int) -> list[dict]:
 
     for c in candles_1m:
         dt = c["dt"]
-        # 현재 버킷의 시작 시각 계산 (09:00 기준으로 interval_min 단위 절삭)
-        market_open_minutes = dt.hour * 60 + dt.minute - 9 * 60  # 09:00 기준 분 수
+        # UTC → KST 변환 (DB가 UTC로 저장하므로)
+        if dt.tzinfo is not None and dt.utcoffset() != timedelta(hours=9):
+            dt = to_kst(dt)
+        # 현재 버킷의 시작 시각 계산 (09:00 KST 기준으로 interval_min 단위 절삭)
+        market_open_minutes = dt.hour * 60 + dt.minute - 9 * 60  # 09:00 KST 기준 분 수
         if market_open_minutes < 0:
             market_open_minutes = 0
         slot = (market_open_minutes // interval_min) * interval_min
@@ -864,8 +1089,7 @@ async def _paper_loop_tick(
     )
 
     try:
-        # Worker 분리 후 to_thread 불필요 (API 이벤트 루프와 독립)
-        # to_thread + new_event_loop은 DB 세션 누수(idle in transaction) 유발
+        # Phase 1: DB 조회 (async — 이벤트 루프 차단 안 함)
         if is_alpha:
             from app.backtest.data_loader import load_enriched_candles
             df = await load_enriched_candles(scan_symbols, start, end, interval)
@@ -873,7 +1097,7 @@ async def _paper_loop_tick(
             from app.backtest.data_loader import load_candles
             df = await load_candles(scan_symbols, start, end, interval)
     except Exception as e:
-        logger.warning("캔들 로딩 실패: %s", e)
+        logger.warning("캔들 로딩 실패 [%s] %s: %s", interval, type(e).__name__, e, exc_info=True)
         return
 
     if df.is_empty():
@@ -901,27 +1125,48 @@ async def _paper_loop_tick(
         df.height, interval, len(scan_symbols),
     )
 
-    # 종목별로 시그널 생성 → 오늘 장중 봉 추출
-    sym_frames: dict[str, list[dict]] = {}
-    _skip_data = 0
-    _skip_error = 0
-    _no_today = 0
-    for sym in scan_symbols:
-        sym_df = df.filter(pl.col("symbol") == sym).sort("dt")
-        if sym_df.height < 30:
-            await _log_decision(session, sym, "SKIP_DATA",
-                          f"데이터 부족: {sym_df.height}봉 (최소 30봉 필요)")
-            _skip_data += 1
-            continue
-        try:
-            sym_df = generate_signals(sym_df, strategy)
-        except Exception as e:
-            await _log_decision(session, sym, "SKIP_ERROR",
-                          f"시그널 생성 실패: {type(e).__name__}: {e}")
-            _skip_error += 1
-            continue
+    # Phase 2: 시그널 생성 (CPU 바운드 — to_thread로 이벤트 루프 해방)
+    # Polars는 Rust 기반으로 GIL을 해제하므로 to_thread에서 다른 코루틴과 병행 가능
+    def _generate_all_signals_sync(
+        df: pl.DataFrame, symbols: list[str], strategy_cfg: dict,
+    ) -> tuple[dict[str, list[dict]], list[tuple[str, str, str]], int, int, int]:
+        """동기 함수: 종목별 filter → sort → generate_signals → to_dicts.
 
-        all_rows = sym_df.to_dicts()
+        Returns: (sym_frames, skip_logs, skip_data, skip_error, no_today)
+        """
+        from app.backtest.engine import generate_signals as _gen_signals
+        _sym_frames: dict[str, list[dict]] = {}
+        _skip_logs: list[tuple[str, str, str]] = []  # (symbol, action, reason)
+        _sd = 0
+        _se = 0
+        _nt = 0
+        for sym in symbols:
+            sym_df = df.filter(pl.col("symbol") == sym).sort("dt")
+            if sym_df.height < 30:
+                _skip_logs.append((sym, "SKIP_DATA", f"데이터 부족: {sym_df.height}봉 (최소 30봉 필요)"))
+                _sd += 1
+                continue
+            try:
+                sym_df = _gen_signals(sym_df, strategy_cfg)
+            except Exception as e:
+                _skip_logs.append((sym, "SKIP_ERROR", f"시그널 생성 실패: {type(e).__name__}: {e}"))
+                _se += 1
+                continue
+            _sym_frames[sym] = sym_df.to_dicts()
+        return _sym_frames, _skip_logs, _sd, _se, _nt
+
+    _result = await asyncio.to_thread(
+        _generate_all_signals_sync, df, scan_symbols, strategy,
+    )
+    sym_frames_raw, _skip_logs, _skip_data, _skip_error, _no_today = _result
+
+    # skip 로그는 async에서 처리 (await 필요)
+    for _sym, _action, _reason in _skip_logs:
+        await _log_decision(session, _sym, _action, _reason)
+
+    # sym_frames에서 오늘 장중 봉 추출
+    sym_frames: dict[str, list[dict]] = {}
+    for sym, all_rows in sym_frames_raw.items():
 
         if last_dt is None:
             # 첫 호출: 오늘 장 시작 이후 모든 봉을 워크스루
@@ -976,7 +1221,7 @@ async def _paper_loop_tick(
         )
         # Redis에도 빈 tick 상태 동기화
         await _sync_session_to_redis(session, tick_summary={
-            "last_tick_at": datetime.now(_KST).isoformat(),
+            "last_tick_at": now_kst().isoformat(),
             "bars_count": "0",
             "buy_signals": "0", "sell_signals": "0",
             "skip_buy": "0", "hold_count": "0",
@@ -1039,6 +1284,20 @@ async def _paper_loop_tick(
                     risk={"filter": filt.get("filter", "unknown")},
                 )
                 continue
+
+        # ── [2026-04-06] 장 마감 강제 청산 (분봉 intraday) ──
+        # 15:10 이후 보유 포지션 전량 시장가 청산 (MOC 캐스케이드)
+        if sym in session.positions and hasattr(dt_val, "hour"):
+            _dt_min = dt_val.hour * 60 + dt_val.minute
+            if _dt_min >= 15 * 60 + 10:  # 15:10 이후
+                pos = session.positions[sym]
+                sell_price = close_price * (1 - cost.sell_commission - cost.slippage)
+                pnl = (sell_price - pos["avg_price"]) / pos["avg_price"]
+                _paper_sell(
+                    session, sym, pos["qty"], close_price, sell_price, cost,
+                    step="S-MOC", reason="장 마감 강제 청산 (15:10+)",
+                )
+                continue  # 이 종목은 매수/리스크 체크 스킵
 
         # ── 고가 갱신 + 리스크 관리 (보유 포지션) ── decision_logic.evaluate_risk 사용
         if sym in session.positions:
@@ -1161,15 +1420,22 @@ async def _paper_loop_tick(
                                sizing=scale_decision.sizing)
 
         # ── 매수 시그널 (B1 신규 진입) ── decision_logic.evaluate_buy 사용
+        # [2026-04-06] 장 마감 매수 컷오프
+        if signal == 1 and sym not in session.positions and hasattr(dt_val, "hour"):
+            _dt_m = dt_val.hour * 60 + dt_val.minute
+            if _dt_m >= 15 * 60 + 30 - _cfg.ALPHA_INTRADAY_BUY_CUTOFF_MINUTES:
+                continue  # 장 마감 가까워서 매수 스킵
+
         if signal == 1 and sym not in session.positions:
             from app.trading.decision_logic import evaluate_buy
 
             buy_price = effective_buy_price(close_price, cost)
+            pending_buy_count = sum(1 for o in session.pending_orders if o.get("side") == "BUY")
             buy_decision = evaluate_buy(
                 signal=signal,
                 symbol=sym,
                 has_position=False,
-                current_positions=len(session.positions),
+                current_positions=len(session.positions) + pending_buy_count,
                 max_positions=ctx.max_positions,
                 cash=session._cash,
                 initial_capital=ctx.initial_capital,
@@ -1264,7 +1530,12 @@ async def _paper_loop_tick(
     pos_eval = 0.0
     for sym, pos in session.positions.items():
         pos_eval += pos.avg_price * pos.qty  # 보수적 추정
-    total_eval = session._cash + pos_eval
+    # pending BUY 주문의 예약 현금도 포트폴리오 가치에 포함
+    # (현금에서 차감되었지만, 체결 시 포지션으로 전환될 자산)
+    pending_reserved = sum(
+        o.get("reserved_cash", 0) for o in session.pending_orders if o.get("side") == "BUY"
+    )
+    total_eval = session._cash + pos_eval + pending_reserved
 
     if not hasattr(session, "_portfolio_peak"):
         session._portfolio_peak = ctx.initial_capital
@@ -1273,10 +1544,26 @@ async def _paper_loop_tick(
 
     if session._portfolio_peak > 0 and total_eval > 0:
         dd = (session._portfolio_peak - total_eval) / session._portfolio_peak * 100
+        if pending_reserved > 0:
+            logger.info(
+                "[paper] MDD: cash=%.0f pos=%.0f pending=%.0f total=%.0f peak=%.0f dd=%.2f%% (pending %d건)",
+                session._cash, pos_eval, pending_reserved, total_eval,
+                session._portfolio_peak, dd,
+                sum(1 for o in session.pending_orders if o.get("side") == "BUY"),
+            )
         if dd >= max_dd:
             logger.warning(
                 "[paper] 포트폴리오 MDD 서킷브레이커: %.2f%% >= %.1f%%", dd, max_dd,
             )
+            # 남은 pending BUY 주문 취소 + 예약 현금 반환
+            for order in session.pending_orders:
+                if order.get("side") == "BUY":
+                    session._cash += order.get("reserved_cash", 0)
+                    logger.info(
+                        "[paper] 서킷브레이커: pending BUY 취소 %s, 현금 반환 %s",
+                        order["symbol"], f"{order.get('reserved_cash', 0):,.0f}",
+                    )
+            session.pending_orders.clear()
             # 남은 포지션 전량 청산 (paper)
             for sym, pos in list(session.positions.items()):
                 sell_price = effective_sell_price(pos.avg_price, cost)
@@ -1286,7 +1573,7 @@ async def _paper_loop_tick(
                     reason=f"포트폴리오 MDD 서킷브레이커: -{dd:.2f}%",
                 )
             session.status = "stopped"
-            session.stopped_at = datetime.now(_KST).isoformat()
+            session.stopped_at = now_kst().isoformat()
             session.error_message = f"포트폴리오 MDD 서킷브레이커: -{dd:.2f}%"
             return
 
@@ -1299,18 +1586,19 @@ async def _paper_loop_tick(
     _holds = len(sym_frames) - _buy_sigs - _sell_sigs - _skip_buys
 
     logger.warning(
-        "[tick %s] 봉=%d종목 | BUY %d | SELL %d | SKIP_BUY %d | HOLD %d | 보유 %d/%d | 현금 %s | 매매 %d건",
+        "[tick %s] 봉=%d종목 | BUY %d | SELL %d | SKIP_BUY %d | HOLD %d | 보유 %d/%d | pending %d건 | 현금 %s | 매매 %d건",
         session.id[:8],
         len(sym_frames),
         _buy_sigs, _sell_sigs, _skip_buys, max(_holds, 0),
         len(session.positions), ctx.max_positions,
+        len(session.pending_orders),
         f"{session._cash:,.0f}",
         len(session.trade_log),
     )
 
     # tick 요약을 Redis에도 저장 (프론트엔드 모니터링용)
     _tick_summary = {
-        "last_tick_at": datetime.now(_KST).isoformat(),
+        "last_tick_at": now_kst().isoformat(),
         "bars_count": str(len(sym_frames)),
         "buy_signals": str(_buy_sigs),
         "sell_signals": str(_sell_sigs),
@@ -1347,8 +1635,8 @@ async def _paper_loop_tick(
                     )
                     evt_db.add(evt)
                     await evt_db.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("매매 이벤트 DB 기록 실패: %s", e)
 
     await manager.broadcast("trading:update", {
         "session_id": session.id,
@@ -1452,9 +1740,11 @@ def _fill_pending_buy(
     )
     result = {"success": True, "order_id": f"SIM-LMT-{uuid.uuid4().hex[:8]}",
               "message": f"지정가 체결 @ {order['price']:,.0f}"}
+    # #4: 매매 사유를 조건 기반 자연어로 생성
+    buy_reason = _build_condition_reason(order.get("conditions"), "매수", order.get('elapsed_bars', 0))
     _log_trade(
         session, sym, "BUY", order.get("step", "B1"), order["qty"], order["price"], result,
-        reason=f"지정가 매수 체결 (대기 {order.get('elapsed_bars', 0)}봉)",
+        reason=buy_reason,
         snapshot=order.get("snapshot"), conditions=order.get("conditions"),
         sizing=order.get("sizing"), candle_dt=candle_dt_str,
     )
@@ -1477,9 +1767,10 @@ def _fill_pending_sell(
     session._cash += proceeds
     result = {"success": True, "order_id": f"SIM-LMT-{uuid.uuid4().hex[:8]}",
               "message": f"지정가 체결 @ {order['price']:,.0f}"}
+    sell_reason = _build_condition_reason(order.get("conditions"), "매도", order.get('elapsed_bars', 0))
     _log_trade(
         session, sym, "SELL", order.get("step", ""), actual_qty, order["price"], result,
-        reason=f"지정가 매도 체결 (대기 {order.get('elapsed_bars', 0)}봉)",
+        reason=sell_reason,
         snapshot=order.get("snapshot"), conditions=order.get("conditions"),
         candle_dt=candle_dt_str, position=pos,
     )
@@ -1580,7 +1871,7 @@ async def _real_loop_tick(
             pos = session.positions[fsym]
             step = getattr(filled, "meta", {}).get("step", "B1") if hasattr(filled, "meta") else "B1"
             pos.entries.append(LiveScaleEntry(
-                date=datetime.now(_KST).isoformat(),
+                date=now_kst().isoformat(),
                 price=filled.filled_avg_price,
                 qty=filled.filled_qty,
                 step=step,
@@ -1593,7 +1884,7 @@ async def _real_loop_tick(
             session.positions[fsym] = LivePosition(
                 symbol=fsym,
                 entries=[LiveScaleEntry(
-                    date=datetime.now(_KST).isoformat(),
+                    date=now_kst().isoformat(),
                     price=filled.filled_avg_price,
                     qty=filled.filled_qty,
                     step=meta.get("step", "B1"),
@@ -1601,7 +1892,7 @@ async def _real_loop_tick(
                 highest_price=filled.filled_avg_price,
                 conviction=meta.get("conviction", 1.0),
                 target_qty=meta.get("target_qty", filled.filled_qty),
-                entry_candle_dt=datetime.now(_KST).isoformat(),
+                entry_candle_dt=now_kst().isoformat(),
             )
         elif filled.side == "SELL" and fsym in session.positions:
             pos = session.positions[fsym]
@@ -1679,7 +1970,7 @@ async def _real_loop_tick(
                 logger.warning("서킷브레이커 이벤트 기록 실패: %s", e)
             # 세션 중지
             session.status = "stopped"
-            session.stopped_at = datetime.now(_KST).isoformat()
+            session.stopped_at = now_kst().isoformat()
             session.error_message = f"포트폴리오 MDD 서킷브레이커 발동: -{portfolio_dd:.2f}%"
             await _clear_session_state(session.id)
             await manager.broadcast("trading:status", {
@@ -1701,14 +1992,14 @@ async def _real_loop_tick(
             elif kis_qty > local_qty:
                 # 외부 매수 발생 — synthetic entry 추가
                 pos.entries.append(LiveScaleEntry(
-                    date=datetime.now(_KST).isoformat(),
+                    date=now_kst().isoformat(),
                     price=kis_avg, qty=kis_qty - local_qty, step="B-EXT",
                 ))
         else:
             session.positions[sym] = LivePosition(
                 symbol=sym,
                 entries=[LiveScaleEntry(
-                    date=datetime.now(_KST).isoformat(),
+                    date=now_kst().isoformat(),
                     price=kis_avg, qty=kis_qty, step="B-EXT",
                 )],
                 highest_price=kp.get("current_price", kis_avg),
@@ -1992,6 +2283,126 @@ async def _real_check_signals(
 # ── 공통 유틸 ────────────────────────────────────────────────
 
 
+def _seconds_until_next_market(now: datetime) -> int:
+    """다음 장 시작(09:00 KST)까지 남은 초."""
+    next_open = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now.hour >= 9:
+        next_open += timedelta(days=1)
+    # 주말 건너뛰기 (토=5, 일=6)
+    while next_open.weekday() >= 5:
+        next_open += timedelta(days=1)
+    return max(60, int((next_open - now).total_seconds()))
+
+
+async def _compute_daily_factor_scores(session: "LiveSession") -> dict[str, float]:
+    """전일 종가 기준으로 일봉 팩터 스코어를 계산하여 세션에 캐싱.
+
+    장 시작 시 1회 호출. session._daily_factor_scores에 저장.
+    종가 고정이므로 장중에 변하지 않음.
+    """
+    from app.backtest.data_loader import load_enriched_candles
+    from app.backtest.engine import ensure_indicators
+    from datetime import date as date_cls
+
+    strategy = session.context.strategy
+    symbols = session.context.symbols
+
+    end = date_cls.today()
+    start = end - timedelta(days=150)
+    df = await load_enriched_candles(symbols, start, end, interval="1d")
+
+    if df.is_empty():
+        logger.warning("일봉 세션 %s: 일봉 데이터 없음", session.id[:8])
+        session._daily_factor_scores = {}
+        return {}
+
+    # 팩터 수식 적용 + 정규화 (backtest_bridge 재사용)
+    all_conds = strategy.get("buy_conditions", []) + strategy.get("sell_conditions", [])
+    df = ensure_indicators(df, all_conds)
+
+    # 종목별 마지막 행(전일 종가)의 스코어 추출
+    indicator_name = strategy["buy_conditions"][0]["indicator"]
+    if indicator_name not in df.columns:
+        logger.warning("일봉 세션 %s: 지표 %s 컬럼 없음", session.id[:8], indicator_name)
+        session._daily_factor_scores = {}
+        return {}
+
+    latest = df.sort(["symbol", "dt"]).group_by("symbol").last()
+    scores = {}
+    for row in latest.to_dicts():
+        sym = row.get("symbol", "")
+        val = row.get(indicator_name)
+        if val is not None and isinstance(val, (int, float)):
+            scores[sym] = float(val)
+        else:
+            scores[sym] = 0.5
+    session._daily_factor_scores = scores
+    logger.info("일봉 daily_scores: %d종목, 평균 %.3f", len(scores), sum(scores.values()) / max(len(scores), 1))
+    return scores
+
+
+async def _daily_rebalance_sell(session: "LiveSession", cost: "CostConfig") -> int:
+    """장 시작 시 일봉 팩터 스코어가 매도 기준 미만인 포지션을 청산한다.
+
+    Returns: 청산된 종목 수
+    """
+    daily_scores = getattr(session, "_daily_factor_scores", {})
+    strategy = session.context.strategy
+    sell_threshold = 0.3
+    sell_conds = strategy.get("sell_conditions", [])
+    if sell_conds:
+        sell_threshold = sell_conds[0].get("value", 0.3)
+
+    sell_count = 0
+    for sym in list(session.positions.keys()):
+        score = daily_scores.get(sym, 0.5)
+        if score < sell_threshold:
+            pos = session.positions[sym]
+            if pos.qty <= 0:
+                continue
+            sell_price = effective_sell_price(pos.avg_price, cost)
+            _paper_sell(
+                session, sym, pos.qty, pos.avg_price, sell_price, cost,
+                step="S-DAILY",
+                reason=f"일봉 팩터 스코어 {score:.3f} < {sell_threshold} (전일 종가 기준 매도)",
+            )
+            sell_count += 1
+            logger.info("일봉 리밸런스 매도: %s (스코어 %.3f)", sym, score)
+
+    if sell_count > 0:
+        await _sync_session_to_redis(session)
+    return sell_count
+
+
+def _build_condition_reason(conditions: dict | None, action: str, elapsed_bars: int = 0) -> str:
+    """매매 조건에서 사람이 읽을 수 있는 사유 텍스트를 생성한다.
+
+    예: "RSI 28.5 < 30 이고 거래량비 1.8 >= 1.5 충족하여 매수 (1봉 대기 후 체결)"
+    """
+    if not conditions:
+        return f"지정가 {action} 체결 (대기 {elapsed_bars}봉)"
+
+    cond_key = "buy_conditions" if action == "매수" else "sell_conditions"
+    cond_list = conditions.get(cond_key, [])
+    if not cond_list:
+        return f"지정가 {action} 체결 (대기 {elapsed_bars}봉)"
+
+    parts: list[str] = []
+    for c in cond_list:
+        ind = c.get("indicator", "?")
+        op = c.get("op", "?")
+        threshold = c.get("threshold", "?")
+        actual = c.get("actual", "?")
+        if isinstance(actual, float):
+            actual = round(actual, 2)
+        parts.append(f"{ind} {actual} {op} {threshold}")
+
+    logic = conditions.get("logic", "AND")
+    joiner = " 이고 " if logic == "AND" else " 또는 "
+    wait_info = f" (대기 {elapsed_bars}봉 후 체결)" if elapsed_bars > 0 else ""
+    return f"{joiner.join(parts)} 충족하여 {action}{wait_info}"
+
+
 def _log_trade(
     session: LiveSession,
     symbol: str,
@@ -2063,7 +2474,7 @@ def _log_trade(
                 pass
 
     # 타임스탬프: 캔들 dt가 있으면 캔들 시각, 없으면 현재 시각
-    ts = candle_dt if candle_dt else datetime.now(_KST).isoformat()
+    ts = candle_dt if candle_dt else now_kst().isoformat()
 
     entry = {
         "symbol": symbol,
@@ -2307,6 +2718,17 @@ async def restore_sessions_from_db() -> int:
 
     load_active_contexts_from_db() 호출 이후에 실행해야 한다.
     """
+    # 자동매매 수동 중단 플래그 체크 — 중단 상태면 복구 안 함
+    try:
+        from app.core.redis import get_client as _get_redis
+        _r = _get_redis()
+        _flag = await _r.get("trading:user_stopped")
+        if _flag and str(_flag) == "true":
+            logger.info("자동매매 수동 중단 상태 — 세션 복구 스킵")
+            return 0
+    except Exception:
+        pass
+
     from app.trading.context import list_contexts
 
     count = 0
