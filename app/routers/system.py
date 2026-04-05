@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -34,8 +36,7 @@ async def get_topology():
     if _topology_cache and now - _topology_cache_at < _CACHE_TTL:
         return _topology_cache
 
-    KST = timezone(timedelta(hours=9))
-    now_kst = datetime.now(KST)
+    now_kst_dt = now_kst()
 
     nodes = {}
     edges = []
@@ -90,7 +91,7 @@ async def get_topology():
     nodes["api"] = {
         "status": "healthy",
         "worker_mode": "external",
-        "uptime": now_kst.isoformat(),
+        "uptime": now_kst_dt.isoformat(),
     }
 
     # ── 노드: Worker ──
@@ -139,7 +140,7 @@ async def get_topology():
         async with async_session() as db:
             r = await db.execute(text(
                 "SELECT count(*) FROM mcp_audit_logs WHERE created_at >= :since"
-            ), {"since": now_kst - timedelta(hours=1)})
+            ), {"since": now_kst_dt - timedelta(hours=1)})
             mcp_calls_1h = r.scalar() or 0
             nodes["mcp"]["calls_1h"] = mcp_calls_1h
     except Exception:
@@ -226,7 +227,7 @@ async def get_topology():
     ]
 
     result = {
-        "timestamp": now_kst.isoformat(),
+        "timestamp": now_kst_dt.isoformat(),
         "nodes": nodes,
         "edges": edges,
         "events": events[:15],
@@ -254,24 +255,43 @@ async def get_collectors():
     if _collectors_cache and now - _collectors_cache_at < _CACHE_TTL:
         return _collectors_cache
 
-    KST = timezone(timedelta(hours=9))
     collectors: dict[str, dict] = {}
 
     # ── 장중 분봉 수집기 (Redis) ──
     try:
-        from app.core.redis import hgetall
+        from app.core.redis import hgetall, get_client
         raw = await hgetall("collector:intraday")
+        # 상세 로그 조회 (최근 100줄)
+        intraday_logs: list[str] = []
+        try:
+            r = get_client()
+            intraday_logs = await r.lrange("collector:intraday:logs", -100, -1)
+        except Exception:
+            pass
         if raw:
+            status = raw.get("status", "unknown")
+            last_date = raw.get("last_date", "")
+            logs = intraday_logs
+
+            # 다음 영업일(평일) 00시 자동 초기화: stopped → idle
+            _now = now_kst()
+            today_str = _now.strftime("%Y%m%d")
+            if status == "stopped" and last_date and last_date < today_str:
+                if _now.weekday() < 5:  # 월~금
+                    status = "idle"
+                    logs = []
+
             collectors["intraday_candle"] = {
                 "name": "장중 분봉",
                 "type": "realtime",
                 "interval": "5분",
-                "status": raw.get("status", "unknown"),
+                "status": status,
                 "last_at": raw.get("last_at", ""),
                 "last_count": int(raw.get("last_count", 0)),
                 "symbols_total": int(raw.get("symbols_total", 0)),
                 "next_at": raw.get("next_at", ""),
                 "error": raw.get("error", ""),
+                "logs": logs,
             }
         else:
             collectors["intraday_candle"] = {
@@ -279,6 +299,7 @@ async def get_collectors():
                 "type": "realtime",
                 "interval": "5분",
                 "status": "unknown",
+                "logs": [],
             }
     except Exception:
         collectors["intraday_candle"] = {
@@ -286,6 +307,7 @@ async def get_collectors():
             "type": "realtime",
             "interval": "5분",
             "status": "unknown",
+            "logs": [],
         }
 
     # ── 프로그램 매매 수집기 (Redis) ──
@@ -319,6 +341,85 @@ async def get_collectors():
             "type": "realtime",
             "interval": "5분",
             "status": "unknown",
+        }
+
+    # ── 종토방 수집기 (Redis) ──
+    try:
+        from app.core.redis import hgetall, get_client
+        raw = await hgetall("collector:discussion")
+        disc_logs: list[str] = []
+        try:
+            r = get_client()
+            disc_logs = await r.lrange("collector:discussion:logs", -100, -1)
+        except Exception:
+            pass
+        if raw:
+            collectors["discussion"] = {
+                "name": "종토방",
+                "type": "realtime",
+                "interval": "5~10분",
+                "status": raw.get("status", "unknown"),
+                "last_at": raw.get("last_at", ""),
+                "last_count": int(raw.get("last_count", 0)),
+                "symbols_total": int(raw.get("symbols_total", 0)),
+                "next_at": raw.get("next_at", ""),
+                "error": raw.get("error", ""),
+                "logs": disc_logs,
+            }
+        else:
+            collectors["discussion"] = {
+                "name": "종토방",
+                "type": "realtime",
+                "interval": "5~10분",
+                "status": "unknown",
+                "logs": [],
+            }
+    except Exception:
+        collectors["discussion"] = {
+            "name": "종토방",
+            "type": "realtime",
+            "interval": "5~10분",
+            "status": "unknown",
+            "logs": [],
+        }
+
+    # ── 공시+뉴스 API 수집기 (Redis) ──
+    try:
+        from app.core.redis import hgetall, get_client
+        raw = await hgetall("collector:news_api")
+        news_api_logs: list[str] = []
+        try:
+            r = get_client()
+            news_api_logs = await r.lrange("collector:news_api:logs", -100, -1)
+        except Exception:
+            pass
+        if raw:
+            collectors["news_api"] = {
+                "name": "공시+뉴스",
+                "type": "realtime",
+                "interval": "5~15분",
+                "status": raw.get("status", "unknown"),
+                "last_at": raw.get("last_at", ""),
+                "last_count": int(raw.get("last_count", 0)),
+                "next_at": raw.get("next_at", ""),
+                "error": raw.get("error", ""),
+                "logs": news_api_logs,
+            }
+        else:
+            collectors["news_api"] = {
+                "name": "공시+뉴스",
+                "type": "realtime",
+                "interval": "5~15분",
+                "status": "unknown",
+                "logs": [],
+            }
+    except Exception:
+        collectors["news_api"] = {
+            "name": "공시+뉴스",
+            "type": "realtime",
+            "interval": "5~15분",
+            "status": "unknown",
+            "logs": [],
         }
 
     # ── 일일 배치 스케줄러 잡 6개 (Redis 우선 → 로컬 폴백) ──
@@ -380,7 +481,7 @@ async def get_collectors():
         }
 
     result = {
-        "timestamp": datetime.now(KST).isoformat(),
+        "timestamp": now_kst().isoformat(),
         "scheduler_running": scheduler_running,
         "collectors": collectors,
     }
@@ -579,3 +680,159 @@ async def get_llm_usage_recent(limit: int = 50):
         }
         for r in rows
     ]
+
+
+@router.get("/llm-usage/summary")
+async def get_llm_usage_summary(
+    start: str | None = None,
+    end: str | None = None,
+    days: int = 7,
+):
+    """LLM 사용량 통합 요약 (일별 + 호출자별 + 프로바이더별 + 모델별).
+
+    start/end: YYYYMMDD (둘 다 있으면 기간 조회, 없으면 최근 N일)
+    """
+    from sqlalchemy import Date, cast, func, select
+
+    from app.core.database import async_session
+    from app.core.llm._models import LLMUsageLog
+
+    # 기간 결정
+    if start and end:
+        since = datetime.strptime(start, "%Y%m%d").replace(tzinfo=timezone.utc)
+        until = datetime.strptime(end, "%Y%m%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+    else:
+        until = datetime.now(timezone.utc)
+        since = until - timedelta(days=days)
+
+    async with async_session() as session:
+        base = select().where(
+            LLMUsageLog.created_at >= since,
+            LLMUsageLog.created_at <= until,
+        )
+
+        # 전체 요약
+        total_stmt = base.add_columns(
+            func.count().label("total_calls"),
+            func.sum(LLMUsageLog.input_tokens).label("input_tokens"),
+            func.sum(LLMUsageLog.output_tokens).label("output_tokens"),
+            func.sum(LLMUsageLog.total_tokens).label("total_tokens"),
+            func.sum(LLMUsageLog.cost_usd).label("cost_usd"),
+            func.avg(LLMUsageLog.duration_ms).label("avg_duration_ms"),
+            func.count().filter(LLMUsageLog.status != "success").label("error_count"),
+        )
+        total_row = (await session.execute(total_stmt)).one()
+
+        # 일별 집계
+        daily_stmt = (
+            base.add_columns(
+                cast(LLMUsageLog.created_at, Date).label("date"),
+                func.count().label("calls"),
+                func.sum(LLMUsageLog.total_tokens).label("tokens"),
+                func.sum(LLMUsageLog.cost_usd).label("cost_usd"),
+                func.sum(LLMUsageLog.input_tokens).label("input_tokens"),
+                func.sum(LLMUsageLog.output_tokens).label("output_tokens"),
+            )
+            .group_by(cast(LLMUsageLog.created_at, Date))
+            .order_by(cast(LLMUsageLog.created_at, Date))
+        )
+        daily_rows = (await session.execute(daily_stmt)).all()
+
+        # 호출자별
+        caller_stmt = (
+            base.add_columns(
+                LLMUsageLog.caller,
+                func.count().label("calls"),
+                func.sum(LLMUsageLog.total_tokens).label("tokens"),
+                func.sum(LLMUsageLog.cost_usd).label("cost_usd"),
+                func.avg(LLMUsageLog.duration_ms).label("avg_ms"),
+            )
+            .group_by(LLMUsageLog.caller)
+            .order_by(func.sum(LLMUsageLog.cost_usd).desc())
+        )
+        caller_rows = (await session.execute(caller_stmt)).all()
+
+        # 프로바이더별
+        provider_stmt = (
+            base.add_columns(
+                LLMUsageLog.provider,
+                func.count().label("calls"),
+                func.sum(LLMUsageLog.total_tokens).label("tokens"),
+                func.sum(LLMUsageLog.cost_usd).label("cost_usd"),
+            )
+            .group_by(LLMUsageLog.provider)
+            .order_by(func.sum(LLMUsageLog.cost_usd).desc())
+        )
+        provider_rows = (await session.execute(provider_stmt)).all()
+
+        # 모델별
+        model_stmt = (
+            base.add_columns(
+                LLMUsageLog.model,
+                LLMUsageLog.provider,
+                func.count().label("calls"),
+                func.sum(LLMUsageLog.total_tokens).label("tokens"),
+                func.sum(LLMUsageLog.cost_usd).label("cost_usd"),
+            )
+            .group_by(LLMUsageLog.model, LLMUsageLog.provider)
+            .order_by(func.sum(LLMUsageLog.cost_usd).desc())
+        )
+        model_rows = (await session.execute(model_stmt)).all()
+
+    return {
+        "period": {
+            "start": since.strftime("%Y-%m-%d"),
+            "end": until.strftime("%Y-%m-%d"),
+        },
+        "totals": {
+            "calls": total_row.total_calls or 0,
+            "input_tokens": total_row.input_tokens or 0,
+            "output_tokens": total_row.output_tokens or 0,
+            "total_tokens": total_row.total_tokens or 0,
+            "cost_usd": round(float(total_row.cost_usd or 0), 6),
+            "avg_duration_ms": int(total_row.avg_duration_ms or 0),
+            "error_count": total_row.error_count or 0,
+        },
+        "daily": [
+            {
+                "date": str(r.date),
+                "calls": r.calls,
+                "tokens": r.tokens or 0,
+                "cost_usd": round(float(r.cost_usd or 0), 6),
+                "input_tokens": r.input_tokens or 0,
+                "output_tokens": r.output_tokens or 0,
+            }
+            for r in daily_rows
+        ],
+        "by_caller": [
+            {
+                "caller": r.caller,
+                "calls": r.calls,
+                "tokens": r.tokens or 0,
+                "cost_usd": round(float(r.cost_usd or 0), 6),
+                "avg_ms": int(r.avg_ms or 0),
+            }
+            for r in caller_rows
+        ],
+        "by_provider": [
+            {
+                "provider": r.provider,
+                "calls": r.calls,
+                "tokens": r.tokens or 0,
+                "cost_usd": round(float(r.cost_usd or 0), 6),
+            }
+            for r in provider_rows
+        ],
+        "by_model": [
+            {
+                "model": r.model,
+                "provider": r.provider,
+                "calls": r.calls,
+                "tokens": r.tokens or 0,
+                "cost_usd": round(float(r.cost_usd or 0), 6),
+            }
+            for r in model_rows
+        ],
+    }

@@ -14,6 +14,8 @@ httpx 기반 경량 구현 (python-telegram-bot 의존성 없음).
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import json
 import logging
@@ -40,7 +42,7 @@ _MIN_INTERVAL = 1.5  # 발송 간격 (초) — 여유 확보
 
 
 async def _api(method: str, **kwargs) -> dict | None:
-    """Telegram Bot API 호출 (429 시 retry_after 대기 후 재시도)."""
+    """Telegram Bot API 호출 (별도 스레드에서 동기 실행 — LLM httpx 연결 풀 경쟁 회피)."""
     token = settings.TELEGRAM_BOT_TOKEN
     if not token:
         return None
@@ -48,21 +50,27 @@ async def _api(method: str, **kwargs) -> dict | None:
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, json=kwargs)
-                data = resp.json()
-                if data.get("ok"):
-                    return data.get("result")
-                # 429 Too Many Requests — retry_after 대기
-                if data.get("error_code") == 429:
-                    retry_after = data.get("parameters", {}).get("retry_after", 5)
-                    logger.info("Telegram 429 — %d초 대기 후 재시도 (%d/%d)", retry_after, attempt + 1, max_retries)
-                    await asyncio.sleep(retry_after)
-                    continue
-                logger.warning("Telegram API %s failed: %s", method, data)
-                return None
+            # 동기 httpx를 별도 스레드에서 실행 (이벤트 루프의 async 연결 풀과 분리)
+            def _sync_post():
+                return httpx.post(url, json=kwargs, timeout=30)
+
+            resp = await asyncio.to_thread(_sync_post)
+            data = resp.json()
+            if data.get("ok"):
+                return data.get("result")
+            if data.get("error_code") == 429:
+                retry_after = data.get("parameters", {}).get("retry_after", 5)
+                logger.info("Telegram 429 — %d초 대기 후 재시도 (%d/%d)", retry_after, attempt + 1, max_retries)
+                await asyncio.sleep(retry_after)
+                continue
+            logger.warning("Telegram API %s failed: %s", method, data)
+            return None
         except Exception as e:
-            logger.error("Telegram API %s error: %s", method, e)
+            err_type = type(e).__name__
+            logger.error("Telegram API %s error [%s]: %s", method, err_type, e or "(empty)")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+                continue
             return None
     return None
 
@@ -110,8 +118,7 @@ async def send_message(
 ) -> dict | None:
     """메시지를 Redis Stream에 발행. Redis 실패 시 인메모리 큐 폴백."""
     from datetime import datetime, timezone, timedelta
-    _KST = timezone(timedelta(hours=9))
-    _ts = datetime.now(_KST).strftime("[%Y-%m-%d %H:%M:%S KST]")
+    _ts = now_kst().strftime("[%Y-%m-%d %H:%M:%S KST]")
     text = f"{_ts}\n{text}"
 
     cid = chat_id or settings.TELEGRAM_CHAT_ID
@@ -288,8 +295,7 @@ async def send_once(
 
     from sqlalchemy import text as sa_text
 
-    _KST = timezone(timedelta(hours=9))
-    today = datetime.now(_KST).date()
+    today = now_kst().date()
 
     try:
         from app.core.database import async_session as _async_session

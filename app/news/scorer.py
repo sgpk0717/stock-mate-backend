@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST
+
 import logging
 import math
 from datetime import date, datetime, timedelta, timezone
@@ -47,9 +49,8 @@ async def compute_daily_scores(
         NewsSentimentDaily 레코드 또는 기사 없으면 None
     """
     # 해당 날짜+종목의 분석 완료된 기사 조회 (KST aware → DB timestamptz 자동 변환)
-    _KST = timezone(timedelta(hours=9))
-    start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=_KST)
-    end_dt = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=_KST)
+    start_dt = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=KST)
+    end_dt = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=KST)
 
     stmt = (
         select(NewsArticle)

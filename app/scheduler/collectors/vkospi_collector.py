@@ -8,6 +8,8 @@ Yahoo Finance ^KS200에서 최근 90일 데이터를 다운로드하고,
 
 from __future__ import annotations
 
+from app.core.timezone import KST
+
 import asyncio
 import logging
 import math
@@ -21,7 +23,6 @@ from app.scheduler.schemas import CollectionResult
 
 logger = logging.getLogger(__name__)
 
-KST = timezone(timedelta(hours=9))
 SYMBOL = "VKOSPI_PROXY"
 TICKER = "^KS200"
 ANNUALIZE_FACTOR = math.sqrt(252)
@@ -115,6 +116,7 @@ async def collect_vkospi(
     date: str,
     *,
     progress_cb: ProgressCb = None,
+    log_cb=None,
     cb: CircuitBreaker | None = None,
 ) -> CollectionResult:
     """VKOSPI_PROXY 일일 수집.
@@ -122,9 +124,12 @@ async def collect_vkospi(
     Args:
         date: YYYYMMDD (호환용, 실제로는 최근 180일 전체 upsert)
         progress_cb: 진행률 콜백
+        log_cb: UI 로그 콜백
         cb: 서킷 브레이커 (None 가능 — yfinance는 자체 rate limit)
     """
     logger.info("[VKOSPI] 수집 시작 (date=%s)", date)
+    if log_cb:
+        await log_cb(f"Yahoo Finance {TICKER} 다운로드 중 (최근 180일)...")
 
     try:
         if cb:
@@ -133,11 +138,18 @@ async def collect_vkospi(
             rows = await asyncio.to_thread(_download_and_compute)
     except Exception as e:
         logger.error("[VKOSPI] yfinance 다운로드 실패: %s", e, exc_info=True)
+        if log_cb:
+            await log_cb(f"yfinance 다운로드 실패: {str(e)[:80]}")
         return CollectionResult(job="vkospi", total=1, failed=1)
 
     if not rows:
         logger.warning("[VKOSPI] 데이터 없음")
+        if log_cb:
+            await log_cb("데이터 없음 (yfinance 반환 0건)")
         return CollectionResult(job="vkospi", total=1, completed=0)
+
+    if log_cb:
+        await log_cb(f"다운로드 완료: {len(rows)}건, DB 저장 중...")
 
     # DB 저장 (candle_writer 재사용)
     from app.services.candle_writer import write_candles_bulk
@@ -145,8 +157,12 @@ async def collect_vkospi(
         await write_candles_bulk(SYMBOL, rows, "1d")
         if progress_cb:
             await progress_cb(1, 1, SYMBOL)
+        if log_cb:
+            await log_cb(f"완료: {len(rows)}건 저장 (20일/60일 실현변동성)")
         logger.info("[VKOSPI] %d건 저장 완료", len(rows))
         return CollectionResult(job="vkospi", total=1, completed=1)
     except Exception as e:
         logger.error("[VKOSPI] DB 저장 실패: %s", e, exc_info=True)
+        if log_cb:
+            await log_cb(f"DB 저장 실패: {str(e)[:80]}")
         return CollectionResult(job="vkospi", total=1, failed=1)

@@ -9,6 +9,8 @@ AlphaFactoryScheduler(app/alpha/scheduler.py) 패턴을 따른다.
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -20,8 +22,6 @@ from app.scheduler.schemas import CollectionResult, JobStatus
 from app.services.ws_manager import manager
 
 logger = logging.getLogger(__name__)
-
-KST = timezone(timedelta(hours=9))
 
 JOB_NAMES = ("daily_candle", "minute_candle", "news", "margin_short", "investor", "dart_financial", "vkospi", "program_trading")
 
@@ -60,7 +60,7 @@ class _SchedulerState:
 
 
 def _now_kst() -> datetime:
-    return datetime.now(KST)
+    return now_kst()
 
 
 def _today_str() -> str:
@@ -192,7 +192,11 @@ class DailyScheduler:
     # ── 메인 루프 ──
 
     async def _already_collected_today(self) -> bool:
-        """레지스트리에서 오늘 수집 시작 여부 확인."""
+        """레지스트리에서 오늘 수집 완료 여부 확인.
+
+        시작(daily_collect_start)이 아닌 완료(daily_collect_complete)를 확인.
+        시작만 되고 완료 안 된 경우(Worker 중단 등) → False → catch-up 재실행.
+        """
         from app.core.database import async_session
         from sqlalchemy import text
 
@@ -202,7 +206,7 @@ class DailyScheduler:
                 result = await session.execute(
                     text(
                         "SELECT 1 FROM telegram_message_registry "
-                        "WHERE message_key = 'daily_collect_start' AND date = :d"
+                        "WHERE message_key = 'daily_collect_complete' AND date = :d"
                     ),
                     {"d": today},
                 )
@@ -476,6 +480,7 @@ class DailyScheduler:
             job.total = total
             job.completed = completed
             job.last_symbol = last_symbol
+            await self._sync_status_to_redis()
             await self._broadcast({
                 "type": "job_progress",
                 "job": job_name,

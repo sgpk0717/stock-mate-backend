@@ -4,6 +4,7 @@
 KIS REST API로 현재가/호가를 폴링하여 broadcast.
 """
 
+from app.core.timezone import KST, now_kst
 import asyncio
 import logging
 import random
@@ -21,8 +22,6 @@ logger = logging.getLogger(__name__)
 # 시뮬레이터 상태
 _running = False
 _prev_close: dict[str, int] = {}  # 종목별 전일종가
-_KST = timezone(timedelta(hours=9))
-
 # KIS API 직접 호출용 (kis_client 싱글톤과 별도)
 _kis_http: "httpx.AsyncClient | None" = None
 _kis_token: str = ""
@@ -151,7 +150,7 @@ async def simulate_ticks():
                 })
 
                 # DB에 틱 저장 (장중만: 09:00~15:30 KST)
-                now_kst = datetime.now(_KST)
+                now_kst = now_kst()
                 if 9 <= now_kst.hour < 16:
                     await enqueue_tick(symbol, new_price, volume)
 

@@ -108,4 +108,25 @@
   - [안전] avg IC 하락 ≤15% (현재 0.091)
   - [안전] max IC 유지 (현재 0.116 실질, 0.262 명목)
   - [관찰] discovered 팩터의 ICIR 분포 변화
+- **검증 결과**: PENDING (5분봉 기준, 일봉 전환 이후 별도 추적)
+
+### Round 4: 일봉 마이닝 부트스트랩 — interval 격리 + 최소 모집단 시딩
+- **시각**: 2026-03-26 21:30 KST
+- **문제 진단**: interval 격리(세대/모집단) 적용 후 일봉 활성 모집단 = 1개 → 10세대 연속 eval_ok=0% (749 시도 전부 실패). 부모 1개로는 의미있는 진화 불가.
+- **개선 내용**:
+  1. **interval 격리**: 세대 복원, 모집단 로드, 아카이브 주입, save_population 비활성화 — 4곳에 `AlphaFactor.interval == self._interval` 필터 추가
+  2. **최소 모집단 임계값**: `population < population_size * 0.1` (최소 10)이면 LLM 시딩으로 부트스트랩
+  3. **세대 명칭 분리**: `_INTERVAL_PREFIX` — 5분봉 `5m_evo_g445`, 일봉 `d_evo_g447`
+- **수정 파일**:
+  - `app/alpha/scheduler.py`: 세대 복원 interval 필터
+  - `app/alpha/evolution_engine.py`: load_population, _load_map_elites_archive, save_population interval 필터 + 최소 모집단 시딩
+  - `app/workflow/mining_config.py`: interval 변경 시 log_lines 초기화
+- **기대 효과**:
+  - 일봉 모집단 0~4개 → LLM 시딩으로 즉시 75개 확보
+  - eval_ok 0% → 정상 진화 재개
+  - 5분봉/일봉 세대·모집단 완전 격리
+- **검증 기준** (5사이클 후):
+  - [필수] eval_ok > 0% (최소 1개 이상 평가 성공)
+  - [필수] 일봉 discovered 팩터 ≥ 1개
+  - [관찰] 일봉 활성 모집단 50개 이상
 - **검증 결과**: PENDING

@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import JSON
 
 
 revision = "b0c1d2e3f4g5"
-down_revision = "a9b0c1d2e3f4"
+down_revision = "a9b0c1d2e3f5"
 branch_labels = None
 depends_on = None
 

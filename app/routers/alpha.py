@@ -8,7 +8,7 @@ import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.alpha.models import AlphaExperience, AlphaFactor, AlphaMiningRun
@@ -33,6 +33,8 @@ from app.alpha.schemas import (
     FactorChatMessageResponse,
     FactorChatSessionResponse,
     MiningIterationLogs,
+    MiningReportResponse,
+    MiningReportsRangeResponse,
 )
 from app.alpha.universe import Universe, get_universe_info
 from app.core.database import get_db
@@ -199,7 +201,7 @@ async def list_factors(
     interval: str | None = None,
     factor_type: str | None = None,
     search: str | None = None,
-    sort_by: str = "ic_mean",
+    sort_by: str = "created_at",
     order: str = "desc",
     offset: int = 0,
     limit: int = 100,
@@ -543,52 +545,133 @@ async def backtest_with_factor(
         symbols = symbols[:max_sym]
         logger.info("팩터 백테스트: %s — 종목 수 %d 제한 (OOM 방지)", bt_interval, max_sym)
 
-    cost_cfg = default_cost_config(bt_interval)
+    # 거래 비용 설정: 커스텀 값이 지정되면 적용, 아니면 인터벌 기본값
+    if data.buy_commission is not None or data.sell_commission is not None or data.slippage_pct is not None:
+        base_cfg = default_cost_config(bt_interval)
+        cost_cfg = CostConfig(
+            buy_commission=data.buy_commission if data.buy_commission is not None else base_cfg.buy_commission,
+            sell_commission=data.sell_commission if data.sell_commission is not None else base_cfg.sell_commission,
+            slippage_pct=data.slippage_pct if data.slippage_pct is not None else base_cfg.slippage_pct,
+            slippage_model=base_cfg.slippage_model,
+            vs_price_impact=base_cfg.vs_price_impact,
+            vs_volume_limit=base_cfg.vs_volume_limit,
+        )
+    else:
+        cost_cfg = default_cost_config(bt_interval)
 
-    run = BacktestRun(
-        strategy_name=f"Alpha: {factor.name}",
-        strategy_json={
-            "name": f"Alpha: {factor.name}",
-            "expression": factor.expression_str,
-            "mode": "cross_sectional_portfolio",
-            "interval": bt_interval,
-            "top_pct": data.top_pct,
-            "max_positions": data.max_positions,
-            "rebalance_freq": data.rebalance_freq,
-            "band_threshold": data.band_threshold,
-        },
-        start_date=start,
-        end_date=end,
-        initial_capital=float(data.initial_capital),
-        cost_config=cost_cfg.model_dump(),
-        status="PENDING",
-        progress=0,
-    )
-    db.add(run)
-    await db.commit()
-    await db.refresh(run)
+    # ── 듀얼 팩터 모드 분기 ──
+    intraday_factor = None
+    if data.intraday_factor_id:
+        intraday_result = await db.execute(
+            select(AlphaFactor).where(AlphaFactor.id == uuid.UUID(data.intraday_factor_id))
+        )
+        intraday_factor = intraday_result.scalar_one_or_none()
+        if not intraday_factor:
+            raise HTTPException(404, "Intraday factor not found")
 
-    asyncio.create_task(
-        execute_factor_backtest(
-            run_id=run.id,
-            expression_str=factor.expression_str,
-            symbols=symbols,
+    if intraday_factor:
+        # 듀얼 팩터: 일봉 팩터로 선별, 분봉 팩터로 진입/퇴출
+        run = BacktestRun(
+            strategy_name=f"Dual: {factor.name} + {intraday_factor.name}",
+            strategy_json={
+                "name": f"Dual: {factor.name} + {intraday_factor.name}",
+                "daily_expression": factor.expression_str,
+                "intraday_expression": intraday_factor.expression_str,
+                "mode": "dual_factor",
+                "interval": bt_interval,
+                "intraday_interval": data.intraday_interval,
+                "top_pct": data.top_pct,
+                "max_positions": data.max_positions,
+                "intraday_entry_threshold": data.intraday_entry_threshold,
+                "intraday_exit_threshold": data.intraday_exit_threshold,
+            },
             start_date=start,
             end_date=end,
-            initial_capital=data.initial_capital,
-            top_pct=data.top_pct,
-            max_positions=data.max_positions,
-            rebalance_freq=data.rebalance_freq,
-            band_threshold=data.band_threshold,
-            cost_config=cost_cfg,
-            interval=bt_interval,
-            stop_loss_pct=data.stop_loss_pct,
-            max_drawdown_pct=data.max_drawdown_pct,
-            eod_liquidation=data.eod_liquidation,
-            skip_opening_minutes=data.skip_opening_minutes,
-            engine=data.engine,
+            initial_capital=float(data.initial_capital),
+            cost_config=cost_cfg.model_dump(),
+            status="PENDING",
+            progress=0,
         )
-    )
+        db.add(run)
+        await db.commit()
+        await db.refresh(run)
+
+        from app.alpha.factor_backtest import execute_dual_factor_backtest
+
+        asyncio.create_task(
+            execute_dual_factor_backtest(
+                run_id=run.id,
+                daily_expression_str=factor.expression_str,
+                intraday_expression_str=intraday_factor.expression_str,
+                symbols=symbols,
+                start_date=start,
+                end_date=end,
+                initial_capital=data.initial_capital,
+                top_pct=data.top_pct,
+                max_positions=data.max_positions,
+                intraday_interval=data.intraday_interval,
+                intraday_entry_threshold=data.intraday_entry_threshold,
+                intraday_exit_threshold=data.intraday_exit_threshold,
+                stop_loss_pct=data.stop_loss_pct,
+                trailing_stop_pct=data.trailing_stop_pct,
+                cost_config=cost_cfg,
+                use_limit_orders=data.use_limit_orders,
+                strict_fill=data.strict_fill,
+                limit_ttl_bars=data.limit_ttl_bars,
+                collect_daily_snapshots=data.collect_daily_snapshots,
+            )
+        )
+    else:
+        # 단일 팩터 모드 (기존 로직)
+        run = BacktestRun(
+            strategy_name=f"Alpha: {factor.name}",
+            strategy_json={
+                "name": f"Alpha: {factor.name}",
+                "expression": factor.expression_str,
+                "mode": "cross_sectional_portfolio",
+                "interval": bt_interval,
+                "top_pct": data.top_pct,
+                "max_positions": data.max_positions,
+                "rebalance_freq": data.rebalance_freq,
+                "band_threshold": data.band_threshold,
+            },
+            start_date=start,
+            end_date=end,
+            initial_capital=float(data.initial_capital),
+            cost_config=cost_cfg.model_dump(),
+            status="PENDING",
+            progress=0,
+        )
+        db.add(run)
+        await db.commit()
+        await db.refresh(run)
+
+        asyncio.create_task(
+            execute_factor_backtest(
+                run_id=run.id,
+                expression_str=factor.expression_str,
+                symbols=symbols,
+                start_date=start,
+                end_date=end,
+                initial_capital=data.initial_capital,
+                top_pct=data.top_pct,
+                max_positions=data.max_positions,
+                rebalance_freq=data.rebalance_freq,
+                band_threshold=data.band_threshold,
+                cost_config=cost_cfg,
+                interval=bt_interval,
+                stop_loss_pct=data.stop_loss_pct,
+                trailing_stop_pct=data.trailing_stop_pct,
+                max_drawdown_pct=data.max_drawdown_pct,
+                eod_liquidation=data.eod_liquidation,
+                skip_opening_minutes=data.skip_opening_minutes,
+                engine=data.engine,
+                use_limit_orders=data.use_limit_orders,
+                strict_fill=data.strict_fill,
+                limit_ttl_bars=data.limit_ttl_bars,
+                collect_daily_snapshots=data.collect_daily_snapshots,
+            )
+        )
 
     return {"backtest_run_id": str(run.id)}
 
@@ -694,6 +777,190 @@ async def cancel_validation(job_id: str):
         raise HTTPException(404, "Validation job not found")
     job["cancelled"] = True
     return {"cancelled": True}
+
+
+# ── Causal Sweep (전수 인과검증) ──
+
+
+@router.post("/causal-sweep")
+async def start_causal_sweep(
+    interval: str = "1d",
+    db: AsyncSession = Depends(get_db),
+):
+    """마이닝 중단 → 미검증 전수 인과검증 → 자동 재시작."""
+    from app.alpha.factory_client import get_factory_client
+    from app.core.redis import get_client as get_redis
+
+    # 이미 sweep 진행 중이면 기존 job 반환 (중복 실행 방지)
+    # [2026-04-01] Worker 재시작 시 in-memory job 소멸 → Redis 플래그만 남는 좀비 방지
+    redis = get_redis()
+    existing_job = await redis.get("alpha:causal_sweep:running")
+    if existing_job:
+        existing_id = existing_job if isinstance(existing_job, str) else existing_job.decode()
+        # in-memory job이 실제로 살아있는지 확인
+        progress = await client.get_validation_progress(existing_id)
+        if progress and progress.get("status") != "completed":
+            return {"job_id": existing_id, "total": 0, "interval": interval, "auto_restart": False, "already_running": True}
+        # 좀비 플래그 — Worker 재시작 등으로 job이 사라짐 → 정리 후 새로 시작
+        await redis.delete("alpha:causal_sweep:running")
+        logger.info("좀비 sweep 플래그 정리: %s (in-memory job 부재)", existing_id)
+
+    client = get_factory_client(interval)
+
+    # 1. Factory 상태 확인 + 중지 (이미 중지 상태면 스킵)
+    status = await client.get_status()
+    was_running = status.get("running", False)
+    last_config = status.get("config") or {}
+
+    if was_running:
+        try:
+            await client.stop(interval=interval)
+        except TypeError:
+            await client.stop()
+        # user_stopped 플래그는 설정하지 않음 — sweep 완료 후 자동 재시작해야 하므로
+
+    # 2a. IC < threshold 팩터를 일괄 MIRAGE 처리 (검증 가치 없음)
+    low_ic_result = await db.execute(
+        update(AlphaFactor)
+        .where(
+            AlphaFactor.causal_robust.is_(None),
+            AlphaFactor.status.notin_(["validated", "mirage", "rejected"]),
+            AlphaFactor.ic_mean < 0.03,
+            AlphaFactor.interval == interval,
+        )
+        .values(causal_robust=False, status="mirage", causal_failure_type="LOW_IC")
+    )
+    await db.commit()
+    low_ic_count = low_ic_result.rowcount
+    if low_ic_count > 0:
+        logger.info("Causal sweep: %d factors marked as LOW_IC mirage (IC < 0.03)", low_ic_count)
+
+    # 2b. 검증 대상 팩터 수집 (IC >= threshold)
+    result = await db.execute(
+        select(AlphaFactor.id).where(
+            AlphaFactor.causal_robust.is_(None),
+            AlphaFactor.status.notin_(["validated", "mirage", "rejected"]),
+            AlphaFactor.ic_mean >= 0.03,
+            AlphaFactor.interval == interval,
+        ).order_by(AlphaFactor.mining_run_id, AlphaFactor.ic_mean.desc())
+    )
+    factor_ids = [str(row[0]) for row in result.fetchall()]
+
+    if not factor_ids:
+        # 미검증 없음 — 팩토리가 돌고 있었으면 재시작
+        if was_running and last_config:
+            from app.core.redis import get_client as get_redis
+
+            redis = get_redis()
+            # user_stopped 존중 — 플래그 삭제하지 않음
+            _flag = await redis.get("alpha:factory:user_stopped")
+            if not (_flag and str(_flag) == "true"):
+                await _restart_factory(client, last_config)
+        return {"job_id": None, "total": 0, "interval": interval, "auto_restart": was_running}
+
+    # 3. 배치 검증 시작 (기존 인프라 재사용)
+    job_id = uuid.uuid4().hex[:12]
+
+    # Sweep 진행 플래그 설정 (워치독이 팩토리를 재시작하지 않도록)
+    from app.core.redis import get_client as get_redis
+
+    redis = get_redis()
+    await redis.set("alpha:causal_sweep:running", job_id)
+
+    await client.start_validation_batch(factor_ids, job_id, len(factor_ids))
+
+    # 4. 완료 시 자동 재시작 태스크
+    if was_running and last_config:
+        asyncio.create_task(
+            _auto_restart_after_sweep(client, job_id, interval, last_config)
+        )
+
+    return {
+        "job_id": job_id,
+        "total": len(factor_ids),
+        "interval": interval,
+        "auto_restart": was_running,
+    }
+
+
+@router.post("/causal-sweep/cancel")
+async def cancel_causal_sweep(
+    job_id: str,
+    interval: str = "1d",
+):
+    """인과검증 취소 + 마이닝 즉시 재시작."""
+    from app.alpha.causal_runner import _validation_jobs
+    from app.alpha.factory_client import get_factory_client
+
+    # 1. 검증 취소
+    job = _validation_jobs.get(job_id)
+    if job and job.get("status") != "completed":
+        job["cancelled"] = True
+
+    # 2. Sweep 플래그 삭제
+    from app.core.redis import get_client as get_redis
+
+    redis = get_redis()
+    await redis.delete("alpha:causal_sweep:running")
+
+    # 3. Factory 재시작
+    client = get_factory_client(interval)
+    status = await client.get_status()
+    last_config = status.get("config") or {}
+
+    factory_restarted = False
+    if last_config:
+        # user_stopped 존중 — 플래그 삭제하지 않음
+        _flag = await redis.get("alpha:factory:user_stopped")
+        if not (_flag and str(_flag) == "true"):
+            try:
+                await _restart_factory(client, last_config)
+                factory_restarted = True
+            except Exception:
+                logger.exception("Causal sweep cancel: factory restart failed")
+
+    return {"cancelled": True, "factory_restarted": factory_restarted}
+
+
+async def _restart_factory(client, config: dict) -> None:
+    """config 딕셔너리로 팩토리 재시작. 내부 헬퍼."""
+    # config의 키를 scheduler.start()가 받는 kwargs로 매핑
+    kwargs = {k: v for k, v in config.items() if v is not None}
+    await client.start(**kwargs)
+
+
+async def _auto_restart_after_sweep(
+    client,
+    job_id: str,
+    interval: str,
+    last_config: dict,
+) -> None:
+    """검증 완료 대기 후 Factory 자동 재시작. 백그라운드 태스크."""
+    try:
+        while True:
+            await asyncio.sleep(5)
+            progress = await client.get_validation_progress(job_id)
+            if progress is None:
+                break
+            if progress.get("status") == "completed" or progress.get("cancelled"):
+                break
+
+        # Sweep 완료 플래그 삭제 + Factory 재시작
+        from app.core.redis import get_client as get_redis
+
+        redis = get_redis()
+        try:
+            await redis.delete("alpha:causal_sweep:running")
+        except Exception:
+            pass
+
+        # user_stopped 존중 — 플래그 삭제하지 않음
+        _flag = await redis.get("alpha:factory:user_stopped")
+        if not (_flag and str(_flag) == "true"):
+            await _restart_factory(client, last_config)
+        logger.info("Causal sweep complete — factory restarted (interval=%s)", interval)
+    except Exception:
+        logger.exception("Failed to restart factory after causal sweep (interval=%s)", interval)
 
 
 # ── 데이터 가용성 ──
@@ -873,13 +1140,44 @@ async def set_auto_restart(enabled: bool = True):
 
 
 @router.get("/factory/status", response_model=AlphaFactoryStatusResponse)
-async def get_factory_status(interval: str = "1d"):
+async def get_factory_status(
+    interval: str = "1d",
+    db: AsyncSession = Depends(get_db),
+):
     """알파 팩토리 상태 조회. interval별."""
     from app.alpha.factory_client import get_factory_client
 
     client = get_factory_client(interval=interval)
     status = await client.get_status()
-    return AlphaFactoryStatusResponse(**status)
+
+    # 미검증 팩터 수 추가
+    count_result = await db.execute(
+        select(func.count(AlphaFactor.id)).where(
+            AlphaFactor.causal_robust.is_(None),
+            AlphaFactor.status.notin_(["validated", "mirage", "rejected"]),
+            AlphaFactor.ic_mean >= 0.03,  # LOW_IC 제외 (sweep과 동일 기준)
+            AlphaFactor.interval == interval,
+        )
+    )
+    causal_pending = count_result.scalar() or 0
+
+    # Sweep job ID 조회
+    sweep_job_id = None
+    try:
+        from app.core.redis import get_client as get_redis
+
+        redis = get_redis()
+        sweep_val = await redis.get("alpha:causal_sweep:running")
+        if sweep_val:
+            sweep_job_id = sweep_val if isinstance(sweep_val, str) else sweep_val.decode()
+    except Exception:
+        pass
+
+    return AlphaFactoryStatusResponse(
+        **status,
+        causal_pending_count=causal_pending,
+        causal_sweep_job_id=sweep_job_id,
+    )
 
 
 @router.get("/factory/status/all")
@@ -891,6 +1189,205 @@ async def get_all_factory_status():
     for interval, scheduler in get_all_schedulers().items():
         result[interval] = scheduler.get_status()
     return result
+
+
+# ── Mega-Alpha (Phase 2 — 딥리서치 R1+R2) ──
+
+
+@router.post("/mega-alpha/build", status_code=202)
+async def build_mega_alpha(
+    interval: str = "1d",
+    min_icir: float = 0.3,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 메가알파 앙상블 구축
+    # 프로세스: /deep-research → 2건 보고서 교차 분석
+    # 변경/추가: 인과검증 통과 팩터 중 ICIR > min_icir인 것들을 자동 직교화 + 가중 결합
+    """
+    import json as _json
+    from app.core.redis import get_client as get_redis
+
+    # 후보 팩터 개수 사전 조회 (causal_robust=True AND icir >= min_icir)
+    count_result = await db.scalar(
+        select(func.count()).select_from(AlphaFactor).where(
+            AlphaFactor.causal_robust == True,  # noqa: E712
+            AlphaFactor.icir.isnot(None),
+            AlphaFactor.icir >= min_icir,
+            AlphaFactor.interval == interval,
+            AlphaFactor.factor_type == "single",
+        )
+    )
+    total_candidates = count_result or 0
+    if total_candidates < 3:
+        raise HTTPException(
+            400,
+            f"인과검증 통과 + ICIR>={min_icir} 팩터가 {total_candidates}개로 부족합니다 (최소 3개)",
+        )
+
+    job_id = uuid.uuid4().hex[:16]
+    redis_key = "alpha:mega_alpha:status"
+
+    # Redis에 초기 상태 저장
+    try:
+        redis = get_redis()
+        await redis.set(
+            redis_key,
+            _json.dumps({
+                "status": "pending",
+                "total_candidates": total_candidates,
+                "selected": 0,
+                "current_step": "초기화",
+                "logs": [],
+                "job_id": job_id,
+            }, ensure_ascii=False),
+        )
+        await redis.expire(redis_key, 86400)
+    except Exception as e:
+        logger.warning("Redis init failed for mega-alpha: %s", e)
+
+    asyncio.create_task(
+        _run_mega_alpha_build(job_id, interval, min_icir)
+    )
+
+    return {
+        "status": "pending",
+        "total_candidates": total_candidates,
+        "job_id": job_id,
+    }
+
+
+async def _run_mega_alpha_build(
+    job_id: str, interval: str, min_icir: float,
+) -> None:
+    """
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 메가알파 백그라운드 빌드
+    # 프로세스: /deep-research → 2건 보고서 교차 분석
+    # 변경/추가: auto_optimize_composite 호출 + Redis 진행 상태 업데이트
+    """
+    import json as _json
+    from app.alpha.portfolio import auto_optimize_composite
+    from app.core.database import async_session
+    from app.core.redis import get_client as get_redis
+
+    redis_key = "alpha:mega_alpha:status"
+
+    async def _update_status(data: dict) -> None:
+        try:
+            redis = get_redis()
+            existing_raw = await redis.get(redis_key)
+            existing = _json.loads(existing_raw) if existing_raw else {}
+            existing.update(data)
+            await redis.set(
+                redis_key,
+                _json.dumps(existing, ensure_ascii=False, default=str),
+            )
+            await redis.expire(redis_key, 86400)
+        except Exception:
+            pass
+
+    try:
+        await _update_status({
+            "status": "running",
+            "current_step": "auto_optimize_composite 실행 중",
+        })
+
+        async with async_session() as db:
+            # [2026-03-31] 딥리서치 R1+R2 공통 권장 — causal_only=True로 인과 통과 팩터만 사용
+            # 프로세스: /deep-research → 2건 보고서 교차 분석
+            # 변경/추가: min_icir을 내부 ICIR 필터와 맞추기 위해 max(min_icir, 0.3) 적용
+            result = await auto_optimize_composite(
+                db=db,
+                min_ic=0.03,
+                min_turnover=0.02,
+                max_k=7,
+                lambda_decorr=0.5,
+                shrinkage_delta=0.5,
+                interval=interval,
+                causal_only=True,
+                job_id=f"mega_{job_id}",
+            )
+
+        # 결과에서 best-K 추출
+        best_opt = next((r for r in result.results if r.k == result.best_k), None)
+        selected_count = result.best_k if best_opt else 0
+        logs = result.logs if hasattr(result, "logs") else []
+
+        # best-K 복합 팩터를 DB에 저장
+        saved_factor_id = None
+        if best_opt:
+            try:
+                async with async_session() as db2:
+                    composite = AlphaFactor(
+                        name=f"MegaAlpha K={best_opt.k} (IC={best_opt.composite_ic:.4f})",
+                        expression_str=best_opt.expression_str,
+                        factor_type="composite",
+                        interval=interval,
+                        ic_mean=best_opt.composite_ic,
+                        icir=best_opt.composite_icir,
+                        sharpe=best_opt.composite_sharpe,
+                        component_ids=best_opt.factor_ids,
+                        causal_robust=True,
+                        status="validated",
+                    )
+                    db2.add(composite)
+                    await db2.commit()
+                    saved_factor_id = str(composite.id)
+                    logger.info(
+                        "mega-alpha: composite saved (K=%d, id=%s)",
+                        best_opt.k, saved_factor_id,
+                    )
+            except Exception as e:
+                logger.warning("mega-alpha: DB save failed: %s", e)
+                logs.append(f"DB 저장 실패: {e}")
+
+        await _update_status({
+            "status": "completed",
+            "selected": selected_count,
+            "current_step": "완료",
+            "logs": logs,
+            "saved_factor_id": saved_factor_id,
+            "best_k": result.best_k,
+            "candidate_count": result.candidate_count,
+        })
+
+        logger.info("mega-alpha job %s completed: best_k=%d", job_id, result.best_k)
+
+    except ValueError as e:
+        logger.error("mega-alpha job %s ValueError: %s", job_id, e)
+        await _update_status({
+            "status": "failed",
+            "current_step": f"실패: {e}",
+            "logs": [str(e)],
+        })
+    except Exception as e:
+        logger.exception("mega-alpha job %s unexpected error: %s", job_id, e)
+        await _update_status({
+            "status": "failed",
+            "current_step": f"오류: {str(e)[:200]}",
+            "logs": [str(e)[:500]],
+        })
+
+
+@router.get("/mega-alpha/status")
+async def get_mega_alpha_status():
+    """
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 메가알파 구축 진행 상태 조회
+    # 프로세스: /deep-research → 2건 보고서 교차 분석
+    # 변경/추가: Redis에서 상태 JSON 조회하여 반환
+    """
+    import json as _json
+    from app.core.redis import get_client as get_redis
+
+    try:
+        redis = get_redis()
+        cached = await redis.get("alpha:mega_alpha:status")
+        if cached:
+            return _json.loads(cached)
+    except Exception as e:
+        logger.warning("mega-alpha status Redis read failed: %s", e)
+
+    return {"status": "idle"}
 
 
 # ── Phase 3: 팩터 포트폴리오 ──
@@ -1350,12 +1847,17 @@ def _factor_to_response(f: AlphaFactor) -> AlphaFactorResponse:
 
 
 @router.get("/improvement-history")
-async def get_improvement_history():
-    """마이닝 개선 히스토리 JSON 반환."""
+async def get_improvement_history(interval: str = "5m"):
+    """마이닝 개선 히스토리 JSON 반환 (인터벌별 분리)."""
     import json
     from pathlib import Path
 
-    json_path = Path(__file__).parent.parent.parent / "docs" / "mining_improvements.json"
+    docs_dir = Path(__file__).parent.parent.parent / "docs"
+    # 인터벌별 파일: mining_improvements_1d.json, mining_improvements_5m.json
+    json_path = docs_dir / f"mining_improvements_{interval}.json"
+    if not json_path.exists():
+        # fallback: 기존 파일명
+        json_path = docs_dir / "mining_improvements.json"
     if not json_path.exists():
         return {"rounds": []}
 
@@ -1364,3 +1866,133 @@ async def get_improvement_history():
         return data
     except Exception:
         return {"rounds": []}
+
+
+# ── 마이닝 리포트 대시보드 ──
+
+
+@router.get("/mining-report", response_model=MiningReportResponse)
+async def get_mining_report(
+    interval: str = "1d",
+    db: AsyncSession = Depends(get_db),
+):
+    """최신 마이닝 리포트 데이터 반환 (Redis 캐시 → DB fallback)."""
+    import json
+    from app.core.redis import get_client as get_redis
+
+    # 1차: Redis 캐시 (사이클 완료 시 갱신, TTL 600초)
+    try:
+        redis = get_redis()
+        cached = await redis.get(f"alpha:mining_report:{interval}")
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
+
+    # 2차: DB fallback — 캐시 만료 시 DB에서 직접 조회
+    from sqlalchemy import text
+    from app.alpha.report_metrics import compute_ic_trend
+
+    ic_trend = await compute_ic_trend(interval=interval, limit=10)
+    if not ic_trend:
+        return MiningReportResponse()
+
+    # 최근 세대의 상위 팩터 5개
+    latest_gen = ic_trend[-1]["gen"] if ic_trend else 0
+    result = await db.execute(
+        text("""
+            SELECT expression_str, ic_mean, icir, sharpe, max_drawdown, turnover
+            FROM alpha_factors
+            WHERE interval = :interval AND generation = :gen AND ic_mean > 0
+            ORDER BY ic_mean DESC LIMIT 5
+        """),
+        {"interval": interval, "gen": latest_gen},
+    )
+    top_factors = [
+        {
+            "expression": row.expression_str[:70],
+            "ic_mean": round(float(row.ic_mean), 4),
+            "icir": round(float(row.icir or 0), 2),
+            "sharpe": round(float(row.sharpe or 0), 2),
+            "max_drawdown": round(float(row.max_drawdown or 0), 3),
+            "turnover": round(float(row.turnover or 0), 3),
+            "hypothesis": None,
+        }
+        for row in result.fetchall()
+    ]
+
+    # 총 발견 수
+    count_result = await db.execute(
+        text("SELECT COUNT(*) FROM alpha_factors WHERE interval = :interval AND ic_mean > 0"),
+        {"interval": interval},
+    )
+    total = count_result.scalar() or 0
+
+    return MiningReportResponse(
+        generation=latest_gen,
+        total_discovered=total,
+        data_interval=interval,
+        discovered_factors=top_factors,
+        ic_trend=ic_trend,
+    )
+
+
+@router.get("/mining-reports", response_model=MiningReportsRangeResponse)
+async def get_mining_reports(
+    interval: str = "1d",
+    gen_from: int | None = None,
+    gen_to: int | None = None,
+    date_from: str | None = None,  # YYYY-MM-DD
+    date_to: str | None = None,  # YYYY-MM-DD
+    db: AsyncSession = Depends(get_db),
+):
+    """세대별 마이닝 리포트 범위 조회."""
+    from sqlalchemy import select as sa_select
+
+    from app.alpha.models import AlphaGenerationReport
+
+    query = sa_select(AlphaGenerationReport).where(
+        AlphaGenerationReport.data_interval == interval
+    )
+
+    if gen_from is not None:
+        query = query.where(AlphaGenerationReport.generation >= gen_from)
+    if gen_to is not None:
+        query = query.where(AlphaGenerationReport.generation <= gen_to)
+    if date_from:
+        from datetime import datetime as _dt
+
+        query = query.where(
+            AlphaGenerationReport.created_at >= _dt.fromisoformat(date_from)
+        )
+    if date_to:
+        from datetime import datetime as _dt
+        from datetime import timedelta
+
+        end = _dt.fromisoformat(date_to) + timedelta(days=1)
+        query = query.where(AlphaGenerationReport.created_at < end)
+
+    query = query.order_by(AlphaGenerationReport.generation.asc()).limit(200)
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    # 해당 인터벌의 전체 min/max 세대 조회 (슬라이더 범위용)
+    from sqlalchemy import func as sa_func
+
+    bounds = await db.execute(
+        sa_select(
+            sa_func.min(AlphaGenerationReport.generation),
+            sa_func.max(AlphaGenerationReport.generation),
+        ).where(AlphaGenerationReport.data_interval == interval)
+    )
+    bounds_row = bounds.one_or_none()
+    min_gen = bounds_row[0] or 0 if bounds_row else 0
+    max_gen = bounds_row[1] or 0 if bounds_row else 0
+
+    return MiningReportsRangeResponse(
+        reports=[row.report_data for row in rows],
+        total=len(rows),
+        interval=interval,
+        min_gen=min_gen,
+        max_gen=max_gen,
+    )

@@ -1,11 +1,12 @@
 """Redis 연결 풀 + IPC 래퍼.
 
 서비스 분리 시 API ↔ Worker ↔ MCP 간 통신에 사용.
-Phase 0: 연결 풀만 생성. 기존 코드 변경 없음.
+모든 쓰기 함수: 3회 재시도 + WARNING 로깅 (silent failure 방지).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 _pool: aioredis.ConnectionPool | None = None
 
+# 재시도 설정
+_MAX_RETRIES = 3
+_RETRY_DELAYS = (0.1, 0.3, 0.7)  # 지수 백오프 (총 ~1.1초)
+
 
 def get_pool() -> aioredis.ConnectionPool:
     """싱글턴 Redis 연결 풀."""
@@ -27,6 +32,8 @@ def get_pool() -> aioredis.ConnectionPool:
             settings.REDIS_URL,
             max_connections=20,
             decode_responses=True,
+            socket_connect_timeout=10,
+            socket_timeout=10,
         )
     return _pool
 
@@ -44,11 +51,48 @@ async def close() -> None:
         _pool = None
 
 
+async def _retry_write(op_name: str, coro_factory, *args, **kwargs) -> bool:
+    """Redis 쓰기 연산 재시도 (3회, 지수 백오프).
+
+    Returns:
+        True = 성공, False = 모든 재시도 실패
+    """
+    last_err = None
+    for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+        try:
+            await coro_factory(*args, **kwargs)
+            return True
+        except (aioredis.ConnectionError, aioredis.TimeoutError,
+                ConnectionRefusedError, OSError) as e:
+            last_err = e
+            if attempt < _MAX_RETRIES:
+                await asyncio.sleep(delay)
+        except Exception as e:
+            # 직렬화 에러 등 재시도 무의미한 에러
+            logger.warning("Redis %s 실패 (재시도 불가): %s", op_name, e)
+            return False
+
+    logger.warning(
+        "Redis %s 실패 (%d회 재시도 소진): %s",
+        op_name, _MAX_RETRIES, last_err,
+    )
+    return False
+
+
 # ── 상태 캐시 (Hash) ──
 
 
-async def hset(key: str, mapping: dict[str, Any]) -> None:
-    """Redis Hash에 상태 저장."""
+async def hset(key: str, mapping: dict[str, Any], ttl: int | None = None) -> bool:
+    """Redis Hash에 상태 저장 (재시도 포함).
+
+    Args:
+        key: Redis 키
+        mapping: 저장할 데이터
+        ttl: TTL 초 (None이면 TTL 미설정)
+
+    Returns:
+        True = 성공, False = 실패
+    """
     r = get_client()
     # dict 값을 문자열로 직렬화
     serialized = {}
@@ -59,10 +103,13 @@ async def hset(key: str, mapping: dict[str, Any]) -> None:
             serialized[k] = ""
         else:
             serialized[k] = str(v)
-    try:
+
+    async def _do():
         await r.hset(key, mapping=serialized)
-    except Exception as e:
-        logger.debug("Redis hset 실패 (%s): %s", key, e)
+        if ttl:
+            await r.expire(key, ttl)
+
+    return await _retry_write(f"hset({key})", _do)
 
 
 async def hgetall(key: str) -> dict[str, str]:
@@ -71,7 +118,7 @@ async def hgetall(key: str) -> dict[str, str]:
     try:
         return await r.hgetall(key)
     except Exception as e:
-        logger.debug("Redis hgetall 실패 (%s): %s", key, e)
+        logger.warning("Redis hgetall 실패 (%s): %s", key, e)
         return {}
 
 
@@ -81,7 +128,7 @@ async def delete(key: str) -> None:
     try:
         await r.delete(key)
     except Exception as e:
-        logger.debug("Redis delete 실패 (%s): %s", key, e)
+        logger.warning("Redis delete 실패 (%s): %s", key, e)
 
 
 # ── 판단 로그 (List) ──
@@ -93,7 +140,7 @@ async def rpush(key: str, *values: str) -> int | None:
     try:
         return await r.rpush(key, *values)
     except Exception as e:
-        logger.debug("Redis rpush 실패 (%s): %s", key, e)
+        logger.warning("Redis rpush 실패 (%s): %s", key, e)
         return None
 
 
@@ -103,7 +150,7 @@ async def lrange(key: str, start: int = 0, end: int = -1) -> list[str]:
     try:
         return await r.lrange(key, start, end)
     except Exception as e:
-        logger.debug("Redis lrange 실패 (%s): %s", key, e)
+        logger.warning("Redis lrange 실패 (%s): %s", key, e)
         return []
 
 
@@ -120,7 +167,7 @@ async def xadd(stream: str, fields: dict[str, str], maxlen: int | None = None) -
             kwargs["approximate"] = True
         return await r.xadd(stream, fields, **kwargs)
     except Exception as e:
-        logger.debug("Redis xadd 실패 (%s): %s", stream, e)
+        logger.warning("Redis xadd 실패 (%s): %s", stream, e)
         return None
 
 
@@ -177,7 +224,7 @@ async def publish(channel: str, message: dict | str) -> None:
         data = json.dumps(message, ensure_ascii=False, default=str) if isinstance(message, dict) else message
         await r.publish(channel, data)
     except Exception as e:
-        logger.debug("Redis publish 실패 (%s): %s", channel, e)
+        logger.warning("Redis publish 실패 (%s): %s", channel, e)
 
 
 # ── 유틸 ──

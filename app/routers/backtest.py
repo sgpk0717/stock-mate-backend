@@ -188,6 +188,38 @@ async def delete_backtest_run(run_id: str, db: AsyncSession = Depends(get_db)):
     )
 
 
+@router.get("/run/{run_id}/trades/{trade_index}/timeline")
+async def get_trade_timeline(
+    run_id: str,
+    trade_index: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """거래별 보유기간 일별 타임라인 조회."""
+    from app.backtest.models import BacktestDailySnapshot
+
+    result = await db.execute(
+        select(BacktestDailySnapshot)
+        .where(
+            BacktestDailySnapshot.backtest_run_id == uuid.UUID(run_id),
+            BacktestDailySnapshot.trade_index == trade_index,
+        )
+        .order_by(BacktestDailySnapshot.snapshot_date)
+    )
+    rows = result.scalars().all()
+
+    symbol = rows[0].symbol if rows else ""
+    snapshots = [
+        {
+            "date": row.snapshot_date.isoformat(),
+            "close": row.close,
+            "variables": row.variables or {},
+        }
+        for row in rows
+    ]
+
+    return {"symbol": symbol, "snapshots": snapshots}
+
+
 # ── 헬퍼 ──
 
 def _run_to_response(run: BacktestRun) -> BacktestRunResponse:

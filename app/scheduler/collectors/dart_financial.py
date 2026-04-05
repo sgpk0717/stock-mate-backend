@@ -11,18 +11,16 @@ import asyncio
 import logging
 import time
 from datetime import date, timedelta
-from typing import Callable
 
 from sqlalchemy import text
 
 from app.core.config import settings
 from app.core.database import async_session
 from app.scheduler.circuit_breaker import CircuitBreaker
+from app.scheduler.collectors import LogCb, ProgressCb, load_symbol_name_map
 from app.scheduler.schemas import CollectionResult
 
 logger = logging.getLogger(__name__)
-
-ProgressCb = Callable[[int, int, str], object] | None
 
 
 def _current_quarter() -> tuple[int, str, str]:
@@ -141,6 +139,7 @@ async def collect_dart_financials(
     date_str: str,
     *,
     progress_cb: ProgressCb = None,
+    log_cb: LogCb = None,
     cb: CircuitBreaker,
 ) -> CollectionResult:
     """DART 재무 데이터 증분 수집.
@@ -149,12 +148,16 @@ async def collect_dart_financials(
     """
     if not settings.DART_API_KEY:
         logger.info("[DART 재무] API 키 미설정 — 스킵")
+        if log_cb:
+            await log_cb("DART API 키 미설정 — 스킵")
         return CollectionResult(job="dart_financial")
 
     try:
         import OpenDartReader  # noqa: N811
     except ImportError:
         logger.warning("[DART 재무] opendartreader 미설치 — 스킵")
+        if log_cb:
+            await log_cb("opendartreader 미설치 — 스킵")
         return CollectionResult(job="dart_financial", error="opendartreader 미설치")
 
     year, quarter, reprt_code = _current_quarter()
@@ -162,18 +165,25 @@ async def collect_dart_financials(
 
     if not symbols:
         logger.info("[DART 재무] 이미 모든 종목 수집 완료 (year=%d %s)", year, quarter)
+        if log_cb:
+            await log_cb(f"이미 모든 종목 수집 완료 ({year}년 {quarter})")
         return CollectionResult(job="dart_financial", total=0, completed=0)
 
     logger.info(
         "[DART 재무] 수집 시작: year=%d %s, 미수집 %d종목",
         year, quarter, len(symbols),
     )
+    if log_cb:
+        await log_cb(f"DART 재무 수집: {year}년 {quarter}, 미수집 {len(symbols)}종목")
+        await log_cb(f"API: OpenDartReader finstate (DART 전자공시)")
 
+    name_map = await load_symbol_name_map()
     dart = OpenDartReader(settings.DART_API_KEY)
     completed = 0
     failed = 0
 
     for i, sym in enumerate(symbols):
+        name = name_map.get(sym, sym)
         try:
             record = await cb.call(
                 asyncio.to_thread,
@@ -201,14 +211,32 @@ async def collect_dart_financials(
                     await db.commit()
                 completed += 1
 
+                if log_cb:
+                    eps = record.get("eps")
+                    bps = record.get("bps")
+                    om = record.get("operating_margin")
+                    eps_s = f"EPS {eps:,.0f}" if eps else "EPS -"
+                    bps_s = f"BPS {bps:,.0f}" if bps else "BPS -"
+                    om_s = f"영업이익률 {om:.1%}" if om else "영업이익률 -"
+                    await log_cb(
+                        f"  [{i+1}/{len(symbols)}] {name}({sym}) — {eps_s}, {bps_s}, {om_s}"
+                    )
+            else:
+                if log_cb:
+                    await log_cb(
+                        f"  [{i+1}/{len(symbols)}] {name}({sym}) — 공시 데이터 없음"
+                    )
+
             # DART API 쓰로틀링
             await asyncio.sleep(0.15)
 
         except Exception as e:
             failed += 1
             logger.debug("[DART 재무] %s 실패: %s", sym, e)
+            if log_cb:
+                await log_cb(f"  [{i+1}/{len(symbols)}] {name}({sym}) — 실패: {str(e)[:60]}")
 
-        if progress_cb and (i + 1) % 100 == 0:
+        if progress_cb and (i + 1) % 20 == 0:
             await progress_cb(len(symbols), i + 1, sym)
 
     logger.info(

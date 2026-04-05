@@ -12,6 +12,8 @@ Robustness 설계:
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
@@ -22,7 +24,6 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_KST = timezone(timedelta(hours=9))
 _running = False
 _task: asyncio.Task | None = None
 _pool: asyncpg.Pool | None = None
@@ -37,7 +38,7 @@ _daily_stats = {
 
 
 def _now_kst() -> datetime:
-    return datetime.now(_KST)
+    return now_kst()
 
 
 def _is_market_hours() -> bool:
@@ -106,16 +107,18 @@ async def _save_batch(rows: list[tuple]) -> int:
     async with pool.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO program_trading (symbol, dt, pgm_buy_qty, pgm_sell_qty,
-                pgm_net_qty, pgm_buy_amount, pgm_sell_amount, pgm_net_amount, collected_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO program_trading (symbol, dt, pgm_buy_amount, pgm_sell_amount,
+                pgm_net_amount, arbt_buy_amount, arbt_sell_amount,
+                nabt_buy_amount, nabt_sell_amount, collected_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (symbol, dt) DO UPDATE
-            SET pgm_buy_qty = EXCLUDED.pgm_buy_qty,
-                pgm_sell_qty = EXCLUDED.pgm_sell_qty,
-                pgm_net_qty = EXCLUDED.pgm_net_qty,
-                pgm_buy_amount = EXCLUDED.pgm_buy_amount,
+            SET pgm_buy_amount = EXCLUDED.pgm_buy_amount,
                 pgm_sell_amount = EXCLUDED.pgm_sell_amount,
                 pgm_net_amount = EXCLUDED.pgm_net_amount,
+                arbt_buy_amount = EXCLUDED.arbt_buy_amount,
+                arbt_sell_amount = EXCLUDED.arbt_sell_amount,
+                nabt_buy_amount = EXCLUDED.nabt_buy_amount,
+                nabt_sell_amount = EXCLUDED.nabt_sell_amount,
                 collected_at = EXCLUDED.collected_at
             """,
             rows,
@@ -176,12 +179,13 @@ async def _collect_round(
             data = await client.inquire_program_trading(symbol)  # type: ignore[attr-defined]
             batch.append((
                 symbol, dt,
-                data.get("pgm_buy_qty", 0),
-                data.get("pgm_sell_qty", 0),
-                data.get("pgm_net_qty", 0),
                 data.get("pgm_buy_amount", 0),
                 data.get("pgm_sell_amount", 0),
                 data.get("pgm_net_amount", 0),
+                data.get("arbt_buy_amount", 0),
+                data.get("arbt_sell_amount", 0),
+                data.get("nabt_buy_amount", 0),
+                data.get("nabt_sell_amount", 0),
                 collected_at,
             ))
         except Exception as e:

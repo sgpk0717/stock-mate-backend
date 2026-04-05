@@ -8,19 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable
 
 from app.core.config import settings
 from app.scheduler.circuit_breaker import CircuitBreaker
+from app.scheduler.collectors import LogCb, ProgressCb
 from app.scheduler.schemas import CollectionResult
 from app.services.candle_writer import write_candles_bulk
 
 logger = logging.getLogger(__name__)
 
-ProgressCb = Callable[[int, int, str], object] | None
 
-
-async def _bulk_fetch(date: str) -> list[dict]:
+async def _bulk_fetch(date: str, log_cb=None, progress_cb=None) -> list[dict]:
     """pykrx 종목별 호출 — 전종목 OHLCV.
 
     pykrx get_market_ohlcv_by_ticker(벌크)가 불안정하므로,
@@ -37,10 +35,18 @@ async def _bulk_fetch(date: str) -> list[dict]:
         )
         symbols = [r[0] for r in result.fetchall()]
 
+    # progress_log: 스레드 안전 진행 메시지 큐
+    import queue
+    _progress_q: queue.Queue = queue.Queue()
+
     def _fetch():
         from pykrx import stock as krx
+        import signal
+        import time
 
         rows = []
+        total = len(symbols)
+        failed = 0
         for i, sym in enumerate(symbols):
             try:
                 df = krx.get_market_ohlcv_by_date(date, date, sym)
@@ -60,19 +66,40 @@ async def _bulk_fetch(date: str) -> list[dict]:
                     "volume": int(row.get("거래량", 0)),
                 })
             except Exception:
-                pass  # 개별 종목 실패는 무시
-            # IP 차단 방지
-            if (i + 1) % 100 == 0:
-                import time
-                time.sleep(1)
+                failed += 1
+            # IP 차단 방지 + 진행 로그 (50종목마다)
+            if (i + 1) % 50 == 0:
+                _progress_q.put(f"pykrx 진행 {i+1}/{total} (성공 {len(rows)}, 실패 {failed})")
+                time.sleep(0.5)
         return rows
 
-    return await asyncio.to_thread(_fetch)
+    # 벌크 수집을 백그라운드 스레드에서 실행하면서 진행 로그를 폴링
+    import asyncio
+    task = asyncio.get_event_loop().run_in_executor(None, _fetch)
+
+    while not task.done():
+        await asyncio.sleep(5)
+        while not _progress_q.empty():
+            msg = _progress_q.get_nowait()
+            if log_cb:
+                await log_cb(msg)
+            if progress_cb:
+                # 메시지에서 진행률 추출
+                try:
+                    parts = msg.split("/")
+                    current = int(parts[0].split()[-1])
+                    await progress_cb(len(symbols), current, "")
+                except Exception:
+                    pass
+
+    rows = task.result()
+    return rows
 
 
 async def _per_stock_fallback(
     date: str,
     progress_cb: ProgressCb,
+    log_cb: LogCb,
     cb: CircuitBreaker,
 ) -> CollectionResult:
     """벌크 실패 시 종목별 개별 호출."""
@@ -85,6 +112,9 @@ async def _per_stock_fallback(
             text("SELECT symbol FROM stock_masters ORDER BY symbol"),
         )
         symbols = [r[0] for r in result.fetchall()]
+
+    if log_cb:
+        await log_cb(f"종목별 개별 수집 시작 ({len(symbols)}종목, pykrx)")
 
     completed = 0
     failed = 0
@@ -100,8 +130,10 @@ async def _per_stock_fallback(
         except Exception as e:
             failed += 1
             logger.warning("일봉 fallback 실패 %s: %s", sym, e)
+            if log_cb and failed % 5 == 0:
+                await log_cb(f"  누적 실패 {failed}건 (최근: {sym} — {str(e)[:60]})")
 
-        if progress_cb and (i + 1) % 100 == 0:
+        if progress_cb and (i + 1) % 50 == 0:
             await progress_cb(len(symbols), completed, sym)
 
         await asyncio.sleep(settings.DAILY_PYKRX_THROTTLE_SEC)
@@ -142,6 +174,7 @@ async def collect_daily_candles(
     date: str,
     *,
     progress_cb: ProgressCb = None,
+    log_cb: LogCb = None,
     cb: CircuitBreaker,
 ) -> CollectionResult:
     """전 종목 당일 일봉 수집.
@@ -151,9 +184,12 @@ async def collect_daily_candles(
     """
     logger.info("[일봉] 수집 시작 (date=%s)", date)
 
+    if log_cb:
+        await log_cb("벌크 수집 시작 (pykrx 전종목 OHLCV)")
+
     # 벌크 시도
     try:
-        rows = await cb.call(_bulk_fetch, date)
+        rows = await cb.call(_bulk_fetch, date, log_cb=log_cb, progress_cb=progress_cb)
 
         if rows:
             completed = 0
@@ -166,6 +202,8 @@ async def collect_daily_candles(
                 await progress_cb(completed, completed, rows[-1]["symbol"] if rows else "")
 
             logger.info("[일봉] 벌크 완료: %d종목", completed)
+            if log_cb:
+                await log_cb(f"벌크 완료: {completed}종목")
             return CollectionResult(
                 job="daily_candle",
                 total=completed,
@@ -173,6 +211,8 @@ async def collect_daily_candles(
             )
     except Exception as e:
         logger.warning("[일봉] 벌크 실패, fallback 전환: %s", e)
+        if log_cb:
+            await log_cb(f"벌크 실패: {str(e)[:80]} → 종목별 개별 수집 전환")
 
     # fallback
-    return await _per_stock_fallback(date, progress_cb, cb)
+    return await _per_stock_fallback(date, progress_cb, log_cb, cb)

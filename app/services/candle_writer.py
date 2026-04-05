@@ -6,15 +6,14 @@
 """
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
 from sqlalchemy import text
 
 from app.core.database import async_session
+from app.core.timezone import KST, now_kst
 
 logger = logging.getLogger(__name__)
-
-KST = timezone(timedelta(hours=9))
 
 
 async def write_candle(symbol: str, payload: dict):
@@ -64,7 +63,7 @@ async def write_candle(symbol: str, payload: dict):
                 "low": payload.get("low", 0),
                 "close": payload.get("close", 0),
                 "volume": payload.get("volume", 0),
-                "collected_at": datetime.now(KST),
+                "collected_at": now_kst(),
             },
         )
         await db.commit()

@@ -15,44 +15,65 @@ logger = logging.getLogger(__name__)
 
 
 async def _start_redis_ws_bridge() -> None:
-    """Redis Pub/Sub → WebSocket 브릿지.
+    """Redis Pub/Sub → WebSocket 브릿지 (자동 재연결).
 
     Worker 컨테이너의 broadcast가 Redis에 발행한 메시지를
-    API의 WebSocket 매니저로 재전달. (서비스 분리 후 WS 이벤트 전달용)
+    API의 WebSocket 매니저로 재전달.
+
+    전용 Redis 클라이언트 사용 (연결 풀 공유 안 함 — Pub/Sub 모드 격리).
+    socket_timeout=None (Pub/Sub은 대기 시간 무제한이어야 함).
     """
     import json
-    try:
-        from app.core.redis import get_client
-        from app.services.ws_manager import manager
+    import redis.asyncio as aioredis
+    from app.core.config import settings
+    from app.services.ws_manager import manager
 
-        r = get_client()
-        pubsub = r.pubsub()
-        # 주요 WS 채널 구독
-        await pubsub.subscribe(
-            "ws:alpha:factory",
-            "ws:trading:status",
-            "ws:trading:update",
-        )
-        logger.info("Redis→WS 브릿지 시작 (alpha:factory, trading:*)")
+    _CHANNELS = [
+        "ws:alpha:factory",
+        "ws:trading:status",
+        "ws:trading:update",
+        "ws:scheduler:jobs",
+    ]
+    retry_delay = 1.0
 
-        async for msg in pubsub.listen():
-            if msg["type"] != "message":
-                continue
-            try:
-                channel = msg["channel"]
-                if isinstance(channel, bytes):
-                    channel = channel.decode()
-                # "ws:alpha:factory" → "alpha:factory"
-                ws_channel = channel.removeprefix("ws:")
-                data = json.loads(msg["data"])
-                # 로컬 WS에만 전달 (Redis 재발행 안 함 — 무한 루프 방지)
-                await manager._broadcast_local(ws_channel, data)
-            except Exception:
-                pass
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.warning("Redis→WS 브릿지 실패: %s", e)
+    while True:
+        try:
+            # 전용 클라이언트: Pub/Sub 전용, 풀과 분리, timeout 없음
+            client = aioredis.from_url(
+                settings.REDIS_URL,
+                decode_responses=True,
+                socket_timeout=None,  # Pub/Sub은 무한 대기
+                socket_connect_timeout=5.0,
+                health_check_interval=30,
+            )
+            pubsub = client.pubsub()
+            await pubsub.subscribe(*_CHANNELS)
+            logger.info("Redis→WS 브릿지 시작 (%d채널, 재연결 delay=%.1fs)", len(_CHANNELS), retry_delay)
+            retry_delay = 1.0  # 성공 시 리셋
+
+            while True:
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=None,  # 이벤트 루프에 양보하면서 대기
+                )
+                if msg is None:
+                    continue
+                try:
+                    channel = msg["channel"]
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
+                    ws_channel = channel.removeprefix("ws:")
+                    data = json.loads(msg["data"])
+                    await manager._broadcast_local(ws_channel, data)
+                except Exception:
+                    pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Redis→WS 브릿지 실패 (%.1fs 후 재연결): %s", retry_delay, e)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30.0)
 
 
 @asynccontextmanager
@@ -95,6 +116,17 @@ async def lifespan(app: FastAPI):
                 logger.info("좀비 트레이딩 세션 %d건 정리 (running → stopped)", sess_count)
     except Exception as e:
         logger.warning("서버 시작 정리 실패: %s", e)
+
+    # 좀비 causal sweep 플래그 정리 (API 재시작 시 인메모리 job 소실 → Redis 플래그만 잔류)
+    try:
+        from app.core.redis import get_client as get_redis
+        _redis = get_redis()
+        _sweep_flag = await _redis.get("alpha:causal_sweep:running")
+        if _sweep_flag:
+            await _redis.delete("alpha:causal_sweep:running")
+            logger.info("좀비 causal sweep 플래그 정리: %s", _sweep_flag)
+    except Exception as e:
+        logger.warning("causal sweep 플래그 정리 실패: %s", e)
 
     # Agent 세션 TTL 설정
     from app.agents.session import session_store

@@ -32,7 +32,13 @@ logger = logging.getLogger(__name__)
 
 async def main() -> None:
     """Worker 메인 루프."""
+    from concurrent.futures import ThreadPoolExecutor
     from app.core.config import settings
+
+    # 전역 스레드 풀: Polars CPU 바운드 작업용 (GIL 해제됨)
+    # max_workers=2: 8코어 기준, Polars Rayon 내부 스레드와 경합 방지
+    _executor = ThreadPoolExecutor(max_workers=2)
+    asyncio.get_event_loop().set_default_executor(_executor)
 
     logger.info("=== Stock Mate Worker 시작 ===")
 
@@ -54,6 +60,16 @@ async def main() -> None:
         logger.info("stock_masters 캐시 로드: %d종목", len(get_all_stocks()))
     except Exception as e:
         logger.warning("stock_masters 캐시 로드 실패: %s", e)
+
+    # 임베딩 모델 사전 로딩 (to_thread — 마이닝 중 블로킹 방지)
+    try:
+        def _preload_embedding():
+            from app.sector.embedder import _get_model
+            _get_model()
+        await asyncio.to_thread(_preload_embedding)
+        logger.info("임베딩 모델 사전 로딩 완료")
+    except Exception as e:
+        logger.warning("임베딩 모델 사전 로딩 실패 (마이닝 시 로딩): %s", e)
 
     # DB 좀비 정리 (main.py와 동일)
     try:
@@ -286,6 +302,22 @@ async def main() -> None:
         except Exception as e:
             logger.warning("프로그램 매매 수집기 실패: %s", e)
 
+    # 종토방 24시간 수집기
+    try:
+        from app.scheduler.collectors.discussion_collector import start_discussion_collector
+        await start_discussion_collector()
+        logger.info("종토방 수집기 시작 (24시간)")
+    except Exception as e:
+        logger.warning("종토방 수집기 시작 실패: %s", e)
+
+    # 공시+뉴스 API 24시간 수집기
+    try:
+        from app.scheduler.collectors.news_api_collector import start_news_api_collector
+        await start_news_api_collector()
+        logger.info("공시+뉴스 API 수집기 시작 (24시간)")
+    except Exception as e:
+        logger.warning("공시+뉴스 API 수집기 시작 실패: %s", e)
+
     # 알파 팩토리 스케줄러
     if settings.WORKER_MODE in ("inline", "worker"):
         try:
@@ -306,57 +338,9 @@ async def main() -> None:
         except Exception as e:
             logger.warning("인과 검증 스케줄러 실패: %s", e)
 
-    # 알파 스코어 엔진 (실시간 랭킹)
-    if settings.WORKFLOW_ENABLED:
-        try:
-            from app.trading.alpha_score_engine import start_score_engine_loop
-
-            # 현재 활성 팩터 설정 로드
-            async def _load_and_start_score_engine() -> None:
-                from app.core.database import async_session
-                from sqlalchemy import text
-                import json
-
-                factor_configs = []
-                async with async_session() as db:
-                    # 활성 세션의 팩터 수식 로드
-                    r = await db.execute(text(
-                        "SELECT strategy::text FROM trading_contexts "
-                        "WHERE status = 'active' AND strategy IS NOT NULL "
-                        "ORDER BY created_at DESC LIMIT 10"
-                    ))
-                    for row in r.fetchall():
-                        try:
-                            s = json.loads(row[0])
-                            fid = s.get("factor_id")
-                            expr = s.get("expression_str")
-                            if fid and expr:
-                                factor_configs.append({"id": fid, "expression_str": expr})
-                        except Exception:
-                            pass
-
-                if not factor_configs:
-                    logger.info("알파 스코어 엔진: 활성 팩터 없음 — 대기")
-                    return
-
-                # 유니버스 로드
-                try:
-                    from app.alpha.universe import resolve_universe, Universe
-                    symbols = await resolve_universe(Universe("KOSPI200"))
-                except Exception:
-                    from app.core.stock_master import get_all_stocks
-                    symbols = [s["symbol"] for s in get_all_stocks()[:200]]
-
-                logger.info(
-                    "알파 스코어 엔진 시작: %d종목, %d팩터",
-                    len(symbols), len(factor_configs),
-                )
-                await start_score_engine_loop(symbols, factor_configs, interval_seconds=300)
-
-            tasks.append(asyncio.create_task(_load_and_start_score_engine()))
-            logger.info("알파 스코어 엔진 태스크 등록")
-        except Exception as e:
-            logger.warning("알파 스코어 엔진 시작 실패: %s", e)
+    # 알파 스코어 엔진 — orchestrator.py의 market_open에서 시작 (이중 호출 방지)
+    # worker.py에서는 시작하지 않음
+    logger.info("알파 스코어 엔진: orchestrator market_open에서 시작 예정")
 
     # 일일 배치 스케줄러
     if settings.DAILY_SCHEDULER_ENABLED:

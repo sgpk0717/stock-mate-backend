@@ -6,12 +6,11 @@ live_runner, sim_engine, backtest 모두 이 함수를 사용하여
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 from datetime import datetime, timedelta, timezone
 
 from app.core.stock_master import get_stock_name
-
-_KST = timezone(timedelta(hours=9))
-
 
 def log_decision(
     log_store: list[dict],
@@ -48,7 +47,7 @@ def log_decision(
     dict : 추가된 엔트리 (SSE 스트림 등에서 재사용 가능)
     """
     entry = {
-        "timestamp": timestamp or datetime.now(_KST).isoformat(),
+        "timestamp": timestamp or now_kst().isoformat(),
         "symbol": symbol,
         "name": get_stock_name(symbol),
         "action": action,

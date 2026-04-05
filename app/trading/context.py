@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST
+
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -51,7 +53,7 @@ class TradingContext:
     symbols: list[str] = field(default_factory=list)
 
     # 메타
-    created_at: str = field(default_factory=lambda: datetime.now(timezone(timedelta(hours=9))).isoformat())
+    created_at: str = field(default_factory=lambda: now_kst().isoformat())
     source_backtest_id: str | None = None  # 원본 백테스트 run ID
     source_factor_id: str | None = None  # 원본 알파 팩터 ID
 

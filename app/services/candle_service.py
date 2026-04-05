@@ -5,6 +5,7 @@ stock_candles(키움 TR 과거 데이터)를 병합(stitching)하여
 1m ~ 1M 전 인터벌의 캔들 데이터를 통합 제공한다.
 """
 
+from app.core.timezone import KST, to_kst
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Lightweight Charts는 UTC 기준 표시 → KST 오프셋을 더해 한국 시간으로 보이게 함
 _KST_OFFSET = 9 * 3600
-_KST_TZ = timezone(timedelta(hours=9))
+
 
 # 일봉 이상 인터벌 (KST 거래일 기준 정규화 대상)
 _DAILY_OR_ABOVE = {"1d", "1w", "1M"}
@@ -29,7 +30,7 @@ def _to_chart_ts(dt_val: datetime, interval: str) -> int:
     분봉/시봉: KST 오프셋으로 한국 시간 표시.
     """
     if interval in _DAILY_OR_ABOVE:
-        kst = dt_val.astimezone(_KST_TZ)
+        kst = dt_val.astimezone(KST)
         return int(datetime(kst.year, kst.month, kst.day,
                             tzinfo=timezone.utc).timestamp())
     return int(dt_val.timestamp()) + _KST_OFFSET
@@ -43,6 +44,46 @@ _CA_MAP = {
 
 # 1분봉에서 집계하는 인터벌
 _DERIVED_FROM_1M = {"3m", "5m", "15m", "30m", "1h"}
+
+
+async def get_candles_by_date_range(
+    db: AsyncSession,
+    symbol: str,
+    interval: str,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """날짜 범위 기반 캔들 조회 (stock_candles 테이블)."""
+    from datetime import date as date_type
+    sd = date_type.fromisoformat(start_date) if isinstance(start_date, str) else start_date
+    ed = date_type.fromisoformat(end_date) if isinstance(end_date, str) else end_date
+    result = await db.execute(
+        text("""
+            SELECT dt, open, high, low, close, volume
+            FROM stock_candles
+            WHERE symbol = :symbol AND interval = :interval
+              AND dt >= :start_date AND dt <= :end_date
+            ORDER BY dt
+        """),
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "start_date": sd,
+            "end_date": ed,
+        },
+    )
+    return [
+        {
+            "time": _to_chart_ts(r.dt, interval),
+            "dt": str(r.dt),
+            "open": float(r.open),
+            "high": float(r.high),
+            "low": float(r.low),
+            "close": float(r.close),
+            "volume": int(r.volume),
+        }
+        for r in result.fetchall()
+    ]
 
 
 async def get_candles(

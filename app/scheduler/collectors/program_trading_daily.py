@@ -9,10 +9,11 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import logging
 from datetime import date as date_type, datetime, timedelta, timezone
-from typing import Callable
 
 from sqlalchemy import text
 
@@ -36,7 +37,7 @@ async def _get_symbols() -> list[str]:
         return [r[0] for r in result.fetchall()]
 
 
-async def _get_existing_symbols(target_date: str) -> set[str]:
+async def _get_existing_symbols(target_date: date_type) -> set[str]:
     """이미 수집된 종목 (빠진 데이터만 보충하기 위해)."""
     async with async_session() as db:
         result = await db.execute(
@@ -50,68 +51,102 @@ async def _get_existing_symbols(target_date: str) -> set[str]:
 
 
 async def collect_program_trading_daily(
-    target_date: date_type | None = None,
-    log_cb: LogCb | None = None,
-    progress_cb: ProgressCb | None = None,
+    target_date: date_type | str | None = None,
+    *,
+    progress_cb: ProgressCb = None,
+    log_cb: LogCb = None,
+    cb: CircuitBreaker | None = None,
 ) -> CollectionResult:
     """장후 프로그램 매매 일일 수집 (빠진 종목 보충).
 
     Args:
-        target_date: 수집 대상일 (None이면 오늘)
+        target_date: 수집 대상일 (None이면 오늘, str이면 YYYYMMDD)
+        cb: 외부 CircuitBreaker (None이면 모듈 내부 _cb 사용)
     """
-    KST = timezone(timedelta(hours=9))
+    breaker = cb or _cb
     if target_date is None:
-        target_date = datetime.now(KST).date()
-    date_str = target_date.strftime("%Y%m%d")
+        target_date = now_kst().date()
+    # manual_runner가 문자열("20260324")로 전달
+    if isinstance(target_date, str):
+        date_str = target_date.replace("-", "")
+        target_date = datetime.strptime(date_str[:8], "%Y%m%d").date()
+    else:
+        date_str = target_date.strftime("%Y%m%d")
 
     if log_cb:
-        await log_cb(f"프로그램 매매 일일 수집 시작: {target_date}")
+        await log_cb(f"프로그램 매매 수집 시작: {target_date}")
 
     # 전 종목 로드
     all_symbols = await _get_symbols()
     if not all_symbols:
-        return CollectionResult(source="program_trading_daily", success=False, message="종목 없음")
+        if log_cb:
+            await log_cb("종목 없음 — 수집 중단")
+        return CollectionResult(job="program_trading")
 
     # 이미 수집된 종목 제외
-    existing = await _get_existing_symbols(date_str[:4] + "-" + date_str[4:6] + "-" + date_str[6:8])
+    existing = await _get_existing_symbols(target_date)
     missing = [s for s in all_symbols if s not in existing]
 
     if log_cb:
-        await log_cb(f"전체 {len(all_symbols)}종목, 기존 {len(existing)}종목, 보충 {len(missing)}종목")
-
-    if not missing:
-        return CollectionResult(
-            source="program_trading_daily",
-            success=True,
-            rows_affected=0,
-            message=f"보충 필요 없음 (전체 {len(all_symbols)}종목 수집 완료)",
+        await log_cb(
+            f"전체 {len(all_symbols)}종목, 기존 {len(existing)}종목, "
+            f"보충 대상 {len(missing)}종목"
         )
 
+    if not missing:
+        if log_cb:
+            await log_cb("보충 필요 없음 — 전체 수집 완료 상태")
+        return CollectionResult(
+            job="program_trading",
+            total=len(all_symbols),
+            completed=len(existing),
+        )
+
+    # KIS 클라이언트 + 토큰 warmup
     client = get_kis_client()
+
+    for attempt in range(3):
+        try:
+            await client._get_token()
+            break
+        except Exception as e:
+            if "403" in str(e) and attempt < 2:
+                logger.info("[프로그램 매매] 토큰 1분 제한 — 65초 대기 (attempt %d)", attempt + 1)
+                if log_cb:
+                    await log_cb(f"KIS 토큰 1분 제한 — 65초 대기 (시도 {attempt + 1}/3)")
+                for remaining in range(65, 0, -10):
+                    await asyncio.sleep(min(10, remaining))
+                    if log_cb and remaining > 10:
+                        await log_cb(f"  토큰 대기 중... {remaining - 10}초 남음")
+            else:
+                logger.error("[프로그램 매매] 토큰 발급 실패: %s", e)
+                if log_cb:
+                    await log_cb(f"토큰 발급 실패: {e}")
+                return CollectionResult(
+                    job="program_trading",
+                    total=len(missing),
+                    error=f"토큰 발급 실패: {e}",
+                )
+
     collected = 0
     failed = 0
+    skipped = 0
     total = len(missing)
 
+    dt = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=KST)
+
     for i, symbol in enumerate(missing):
-        if progress_cb and i % 50 == 0:
-            await progress_cb(int((i / total) * 100))
-
         try:
-            _cb.check()
-        except CircuitBreakerOpen:
-            if log_cb:
-                await log_cb("서킷 브레이커 오픈 — 수집 중단")
-            break
-
-        try:
-            data = await client.inquire_program_trading(symbol, date=date_str)
+            data = await breaker.call(
+                client.inquire_program_trading, symbol, date=date_str,
+            )
 
             # 값이 전부 0이면 스킵 (데이터 없는 종목)
             if data["pgm_buy_amount"] == 0 and data["pgm_sell_amount"] == 0:
+                skipped += 1
                 continue
 
             # DB UPSERT
-            dt = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=KST)
             async with async_session() as db:
                 await db.execute(
                     text("""
@@ -139,25 +174,48 @@ async def collect_program_trading_daily(
                 )
                 await db.commit()
             collected += 1
-            _cb.record_success()
+
+        except CircuitBreakerOpen:
+            remaining_count = total - i
+            logger.warning(
+                "[프로그램 매매] 서킷 OPEN — 나머지 %d종목 스킵", remaining_count
+            )
+            if log_cb:
+                await log_cb(f"서킷 브레이커 OPEN — 나머지 {remaining_count}종목 스킵")
+            return CollectionResult(
+                job="program_trading",
+                total=total,
+                completed=collected,
+                failed=failed,
+                skipped=remaining_count,
+                error="KIS 서킷 브레이커 OPEN",
+            )
 
         except Exception as e:
             failed += 1
-            _cb.record_failure()
-            if failed <= 3:
-                logger.warning("프로그램 매매 수집 실패 (%s): %s", symbol, e)
+            if log_cb and failed % 5 == 0:
+                await log_cb(f"  누적 실패 {failed}건 (최근: {symbol} — {str(e)[:60]})")
+
+        # 진행률 — 10건마다 보고 (무음 구간 최대 ~1초)
+        if progress_cb and (i + 1) % 10 == 0:
+            await progress_cb(total, i + 1, symbol)
 
         # Rate limit (15req/s)
         await asyncio.sleep(0.08)
 
+    # 최종 진행률 보고
     if progress_cb:
-        await progress_cb(100)
+        await progress_cb(total, total, "done")
     if log_cb:
-        await log_cb(f"프로그램 매매 수집 완료: {collected}종목 수집, {failed}실패")
+        await log_cb(
+            f"프로그램 매매 수집 완료: {collected}종목 저장, "
+            f"{failed}실패, {skipped}스킵 (데이터 없음)"
+        )
 
     return CollectionResult(
-        source="program_trading_daily",
-        success=True,
-        rows_affected=collected,
-        message=f"{collected}종목 수집 ({failed}실패), 기존 {len(existing)}종목 보존",
+        job="program_trading",
+        total=total,
+        completed=collected,
+        failed=failed,
+        skipped=skipped,
     )

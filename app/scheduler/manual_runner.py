@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import json
 import logging
@@ -19,12 +21,11 @@ from app.scheduler.schemas import ActiveJob, CollectionResult, ManualTriggerRequ
 
 logger = logging.getLogger(__name__)
 
-KST = timezone(timedelta(hours=9))
-
 # DailyScheduler의 JOB_NAMES와 동일
 VALID_COLLECTORS = (
     "daily_candle", "minute_candle", "news",
     "margin_short", "investor", "dart_financial",
+    "program_trading",
 )
 
 _BREAKER_MAP: dict[str, str] = {
@@ -34,6 +35,7 @@ _BREAKER_MAP: dict[str, str] = {
     "margin_short": "kis",
     "investor": "kis",
     "dart_financial": "dart",
+    "program_trading": "kis",
 }
 
 _COLLECTOR_LABELS: dict[str, str] = {
@@ -43,6 +45,7 @@ _COLLECTOR_LABELS: dict[str, str] = {
     "margin_short": "신용/공매도",
     "investor": "투자자 수급",
     "dart_financial": "DART 재무",
+    "program_trading": "프로그램 매매",
 }
 
 # 완료된 잡 유지 시간 (초)
@@ -50,7 +53,7 @@ _COMPLETED_TTL = 300
 
 
 def _now_kst() -> datetime:
-    return datetime.now(KST)
+    return now_kst()
 
 
 def _today_str() -> str:
@@ -89,7 +92,7 @@ def _resolve_dates(req: ManualTriggerRequest) -> list[str]:
     raise ValueError(f"알 수 없는 모드: {req.mode}")
 
 
-_MAX_LOGS = 100  # 잡당 최대 로그 줄수
+_MAX_LOGS = 500  # 잡당 최대 로그 줄수
 
 
 @dataclass
@@ -393,36 +396,44 @@ class ManualJobRunner:
             nonlocal _last_log_count
             job.total = total
             job.completed = completed
-            # 매 100건마다 로그 + Redis 동기화
-            if completed - _last_log_count >= 100 or completed == total:
+            # Redis 동기화 (로그는 수집기 log_cb에서 직접 출력)
+            if completed - _last_log_count >= 20 or completed == total:
                 _last_log_count = completed
-                rj.log(f"  진행 {completed}/{total} (최근: {last_symbol})")
                 await self._sync_to_redis(job.job_id)
             await self._broadcast_progress(job)
 
+        async def _log_cb(msg: str) -> None:
+            """수집기 → UI 자유 텍스트 로그."""
+            rj.log(msg)
+            await self._sync_to_redis(job.job_id)
+
         if collector == "daily_candle":
             from app.scheduler.collectors.daily_candle import collect_daily_candles
-            return await collect_daily_candles(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_daily_candles(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb)
 
         if collector == "minute_candle":
             from app.scheduler.collectors.minute_candle import collect_minute_candles
-            return await collect_minute_candles(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_minute_candles(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb)
 
         if collector == "news":
             from app.scheduler.collectors.news_batch import collect_news
-            return await collect_news(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_news(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb)
 
         if collector == "margin_short":
             from app.scheduler.collectors.margin_short import collect_margin_short
-            return await collect_margin_short(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_margin_short(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb, cancel_event=rj.cancel_event)
 
         if collector == "investor":
             from app.scheduler.collectors.investor import collect_investor
-            return await collect_investor(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_investor(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb, cancel_event=rj.cancel_event)
 
         if collector == "dart_financial":
             from app.scheduler.collectors.dart_financial import collect_dart_financials
-            return await collect_dart_financials(date, progress_cb=_progress_cb, cb=cb)
+            return await collect_dart_financials(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb)
+
+        if collector == "program_trading":
+            from app.scheduler.collectors.program_trading_daily import collect_program_trading_daily
+            return await collect_program_trading_daily(date, progress_cb=_progress_cb, log_cb=_log_cb, cb=cb)
 
         return CollectionResult(job=collector)
 
@@ -457,7 +468,8 @@ class ManualJobRunner:
             if j.status in ("running", "cancelling"):
                 await r.sadd("scheduler:active_job_ids", job_id)
             else:
-                # 완료된 잡도 TTL 동안 유지
+                # 완료된 잡: active set에서 제거 + TTL 설정
+                await r.srem("scheduler:active_job_ids", job_id)
                 await r.expire(f"scheduler:jobs:{job_id}", _COMPLETED_TTL)
         except Exception as e:
             logger.debug("Redis 잡 동기화 실패: %s", e)
@@ -479,6 +491,21 @@ class ManualJobRunner:
             })
         except Exception:
             pass
+
+    async def dismiss_job(self, job_id: str) -> bool:
+        """잡을 인메모리 + Redis에서 강제 삭제."""
+        rj = self._jobs.pop(job_id, None)
+        if rj and rj.task and not rj.task.done():
+            rj.cancel_event.set()
+            rj.task.cancel()
+        try:
+            from app.core.redis import get_client
+            r = get_client()
+            await r.delete(f"scheduler:jobs:{job_id}")
+            await r.srem("scheduler:active_job_ids", job_id)
+        except Exception:
+            pass
+        return True
 
     def _cleanup_expired(self) -> None:
         """TTL 지난 완료 잡 제거."""

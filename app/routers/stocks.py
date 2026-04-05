@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.stock_master import get_all_stocks, search_stocks
 from app.schemas.stock import CandleResponse, StockInfoResponse, TickResponse
-from app.services.candle_service import get_candles
+from app.services.candle_service import get_candles, get_candles_by_date_range
 from app.services.candle_writer import write_candles_bulk
 
 router = APIRouter(prefix="/stocks", tags=["stocks"])
@@ -29,11 +29,16 @@ async def get_candles_endpoint(
     symbol: str,
     interval: str = "1d",
     count: int = 200,
+    start_date: str | None = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: str | None = Query(None, description="End date YYYY-MM-DD"),
     indicators: str | None = Query(None, description="Comma-separated: rsi,macd,bb"),
     db: AsyncSession = Depends(get_db),
 ):
     """멀티타임프레임 캔들 조회. 1m, 3m, 5m, 15m, 30m, 1h, 1d, 1w, 1M 지원."""
-    candles = await get_candles(db, symbol, interval, count)
+    if start_date and end_date:
+        candles = await get_candles_by_date_range(db, symbol, interval, start_date, end_date)
+    else:
+        candles = await get_candles(db, symbol, interval, count)
 
     if not indicators:
         return candles

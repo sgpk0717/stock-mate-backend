@@ -8,6 +8,8 @@ KIS Open API를 통해 데이터를 수집한다.
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import asyncio
 import logging
 from datetime import date as date_type, datetime, timedelta, timezone
@@ -17,12 +19,11 @@ from sqlalchemy import text
 
 from app.core.database import async_session
 from app.scheduler.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
+from app.scheduler.collectors import LogCb, ProgressCb, load_symbol_name_map
 from app.scheduler.schemas import CollectionResult
 from app.trading.kis_client import get_kis_client
 
 logger = logging.getLogger(__name__)
-
-ProgressCb = Callable[[int, int, str], object] | None
 
 
 async def _get_all_symbols() -> list[str]:
@@ -82,7 +83,7 @@ async def _upsert_investor(
                     "inst_sell_vol": row["orgn_sell_vol"],
                     "retail_buy_vol": row["prsn_buy_vol"],
                     "retail_sell_vol": row["prsn_sell_vol"],
-                    "collected_at": datetime.now(timezone(timedelta(hours=9))),
+                    "collected_at": now_kst(),
                 },
             )
             upserted += 1
@@ -96,19 +97,27 @@ async def collect_investor(
     date: str,
     *,
     progress_cb: ProgressCb = None,
+    log_cb: LogCb = None,
     cb: CircuitBreaker,
+    cancel_event: asyncio.Event | None = None,
 ) -> CollectionResult:
     """전 종목 당일 투자자별 매매동향 수집.
 
     Args:
         date: YYYYMMDD (당일).
         progress_cb: 진행률 콜백.
+        log_cb: UI 로그 콜백.
         cb: KIS API 서킷 브레이커.
     """
     logger.info("[투자자별수급] 수집 시작 (date=%s)", date)
 
     symbols = await _get_all_symbols()
+    name_map = await load_symbol_name_map()
     client = get_kis_client(is_mock=False)
+
+    if log_cb:
+        await log_cb(f"총 {len(symbols)}종목 대상 (투자자별 매매동향)")
+        await log_cb(f"API: KIS 투자자매매동향(FHPTJ04160001)")
 
     # 토큰 warmup: 다른 모듈이 먼저 토큰을 발급받아
     # 1분 쿼터를 소진했을 수 있으므로, 403 시 65초 대기 후 재시도
@@ -119,9 +128,16 @@ async def collect_investor(
         except Exception as e:
             if "403" in str(e) and attempt < 2:
                 logger.info("[투자자별수급] 토큰 1분 제한 — 65초 대기 (attempt %d)", attempt + 1)
-                await asyncio.sleep(65)
+                if log_cb:
+                    await log_cb(f"KIS 토큰 1분 제한 — 65초 대기 (시도 {attempt + 1}/3)")
+                for remaining in range(65, 0, -10):
+                    await asyncio.sleep(min(10, remaining))
+                    if log_cb and remaining > 10:
+                        await log_cb(f"  토큰 대기 중... {remaining - 10}초 남음")
             else:
                 logger.error("[투자자별수급] 토큰 발급 실패: %s", e)
+                if log_cb:
+                    await log_cb(f"토큰 발급 실패: {e}")
                 return CollectionResult(
                     job="investor",
                     total=len(symbols),
@@ -132,6 +148,11 @@ async def collect_investor(
     failed = 0
 
     for i, sym in enumerate(symbols):
+        if cancel_event and cancel_event.is_set():
+            if log_cb:
+                await log_cb("· 사용자 중단 요청 감지 — 수집 중단")
+            break
+        name = name_map.get(sym, sym)
         try:
             rows = await cb.call(
                 client.inquire_daily_investor, sym, date,
@@ -141,11 +162,29 @@ async def collect_investor(
             await _upsert_investor(sym, date, rows)
             completed += 1
 
+            if log_cb:
+                if rows:
+                    r = rows[0]
+                    frgn = int(r.get("frgn_net", 0))
+                    inst = int(r.get("orgn_net", 0))
+                    frgn_s = f"+{frgn:,}" if frgn >= 0 else f"{frgn:,}"
+                    inst_s = f"+{inst:,}" if inst >= 0 else f"{inst:,}"
+                    await log_cb(
+                        f"  [{i+1}/{len(symbols)}] {name}({sym}) — "
+                        f"외국인 {frgn_s}, 기관 {inst_s}"
+                    )
+                else:
+                    await log_cb(
+                        f"  [{i+1}/{len(symbols)}] {name}({sym}) — 데이터 없음"
+                    )
+
         except CircuitBreakerOpen:
             logger.warning(
                 "[투자자별수급] 서킷 OPEN — 나머지 %d종목 스킵",
                 len(symbols) - i,
             )
+            if log_cb:
+                await log_cb(f"서킷 브레이커 OPEN — 나머지 {len(symbols) - i}종목 스킵")
             return CollectionResult(
                 job="investor",
                 total=len(symbols),
@@ -157,8 +196,10 @@ async def collect_investor(
         except Exception as e:
             failed += 1
             logger.warning("[투자자별수급] %s 실패: %s", sym, e)
+            if log_cb:
+                await log_cb(f"  [{i+1}/{len(symbols)}] {name}({sym}) — 실패: {str(e)[:60]}")
 
-        if progress_cb and (i + 1) % 50 == 0:
+        if progress_cb and (i + 1) % 10 == 0:
             await progress_cb(len(symbols), i + 1, sym)
 
     logger.info("[투자자별수급] 완료: %d종목 성공, %d 실패", completed, failed)

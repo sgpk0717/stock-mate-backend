@@ -7,8 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.workflow.orchestrator import get_orchestrator
+from app.workflow.mining_config import get_mining_config, set_mining_config
 from app.workflow.schemas import (
     BestFactorOut,
+    MiningConfigOut,
+    MiningConfigUpdate,
     TradingFeedbackSubmit,
     WorkflowEventOut,
     WorkflowRunOut,
@@ -268,3 +271,15 @@ async def get_best_factors(
         )
         for r in results
     ]
+
+
+@router.get("/mining-config", response_model=MiningConfigOut)
+async def read_mining_config():
+    """현재 마이닝 설정 조회."""
+    return await get_mining_config()
+
+
+@router.put("/mining-config", response_model=MiningConfigOut)
+async def update_mining_config(body: MiningConfigUpdate):
+    """마이닝 interval 변경 (프리셋 자동 적용)."""
+    return await set_mining_config(body.interval)

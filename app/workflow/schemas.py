@@ -145,3 +145,22 @@ class TradingFeedbackSubmit(BaseModel):
     review_text: str = ""
     improvement_suggestions: list[str] = []
     market_regime: str | None = None
+
+
+# ── MiningConfig ──
+
+class MiningConfigOut(BaseModel):
+    """마이닝 설정 응답."""
+
+    interval: str
+    cpcv_n_groups: int
+    cpcv_n_test: int
+    cpcv_embargo_days: int
+    population_size: int
+    max_iterations: int
+
+
+class MiningConfigUpdate(BaseModel):
+    """마이닝 설정 변경 요청."""
+
+    interval: str = Field(..., pattern=r"^(5m|1d)$")

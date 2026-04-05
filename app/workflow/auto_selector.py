@@ -135,6 +135,35 @@ async def select_best_factors(
     return scored[:limit]
 
 
+async def select_dual_factors(
+    session: AsyncSession,
+    *,
+    intraday_count: int = 2,
+    daily_count: int = 2,
+    min_ic: float | None = None,
+    min_sharpe: float | None = None,
+    require_causal: bool | None = None,
+) -> dict[str, list[dict]]:
+    """5분봉과 일봉 팩터를 각각 선별하여 반환한다.
+
+    Returns:
+        {"intraday": [...], "daily": [...]}
+    """
+    intraday = await select_best_factors(
+        session, limit=intraday_count, interval="5m",
+        min_ic=min_ic, min_sharpe=min_sharpe, require_causal=require_causal,
+    )
+    daily = await select_best_factors(
+        session, limit=daily_count, interval="1d",
+        min_ic=min_ic, min_sharpe=min_sharpe, require_causal=require_causal,
+    )
+    logger.info(
+        "듀얼 팩터 선별: 5분봉 %d개, 일봉 %d개",
+        len(intraday), len(daily),
+    )
+    return {"intraday": intraday, "daily": daily}
+
+
 async def _resolve_symbols(
     session: AsyncSession, factor: AlphaFactor
 ) -> list[str]:

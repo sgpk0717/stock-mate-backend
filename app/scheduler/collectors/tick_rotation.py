@@ -6,6 +6,8 @@ Data Pump(32-bit)이 이 파일을 읽어 QTimer 기반으로 실시간 수신 �
 
 from __future__ import annotations
 
+from app.core.timezone import KST, now_kst
+
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -17,9 +19,6 @@ from app.core.config import settings
 from app.core.database import async_session
 
 logger = logging.getLogger(__name__)
-
-KST = timezone(timedelta(hours=9))
-
 
 async def _get_all_symbols() -> list[str]:
     """stock_masters에서 전 종목 코드 조회."""
@@ -56,7 +55,7 @@ async def generate_tick_schedule() -> Path:
         "total_symbols": len(symbols),
         "batch_size": batch_size,
         "interval_minutes": interval_min,
-        "generated_at": datetime.now(KST).isoformat(),
+        "generated_at": now_kst().isoformat(),
     }
 
     out_path = Path(settings.TICK_ROTATION_SCHEDULE_FILE)

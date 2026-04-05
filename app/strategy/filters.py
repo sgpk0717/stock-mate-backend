@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+from app.core.timezone import KST, to_kst
+
 import logging
 from datetime import datetime, time, timezone, timedelta
 from typing import Any
@@ -16,9 +18,6 @@ from typing import Any
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-
-_KST = timezone(timedelta(hours=9))
-
 
 def time_filter(
     signal: int,

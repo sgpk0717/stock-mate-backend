@@ -257,3 +257,21 @@ class LiveFeedback(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class ReplayRun(Base):
+    """장중매매 리플레이 결과."""
+
+    __tablename__ = "replay_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    factor_ids: Mapped[list] = mapped_column(JSON, nullable=False)
+    config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    sessions: Mapped[list] = mapped_column(JSON, nullable=False)
+    aggregate_metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

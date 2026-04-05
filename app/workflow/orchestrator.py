@@ -20,7 +20,9 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import settings
 from app.core.database import async_session
+from app.core.timezone import KST, now_kst, to_kst, today_kst
 from app.workflow.auto_selector import build_context_from_factor, select_best_factors
+from app.workflow.mining_config import get_mining_config
 from app.workflow.models import TradingContextModel, WorkflowEvent, WorkflowRun
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,7 @@ class DailyWorkflowOrchestrator:
 
         팩토리가 실행 중이면 MINING 상태로 시작 (마이닝 상시가동).
         """
-        today = date.today()
+        today = today_kst()
         stmt = select(WorkflowRun).where(WorkflowRun.date == today)
         result = await session.execute(stmt)
         run = result.scalar_one_or_none()
@@ -152,8 +154,8 @@ class DailyWorkflowOrchestrator:
         try:
             from app.core.redis import hset
             await hset("workflow:status", {"phase": new_phase, "status": run.status or ""})
-        except Exception:
-            pass  # Redis 실패해도 DB는 이미 업데이트됨
+        except Exception as e:
+            logger.warning("Redis 워크플로우 상태 캐시 실패: %s", e)
 
         return True
 
@@ -172,16 +174,25 @@ class DailyWorkflowOrchestrator:
         status: str,
         **extra,
     ) -> None:
-        """step_status에서 특정 단계 갱신."""
+        """step_status에서 특정 단계 갱신 + Redis 즉시 동기화."""
         steps = dict(run.step_status or {})
-        _KST = timezone(timedelta(hours=9))
         steps[step_name] = {
             "status": status,
-            "at": datetime.now(_KST).isoformat(),
+            "at": now_kst().isoformat(),
             **extra,
         }
         run.step_status = steps
         flag_modified(run, "step_status")
+
+        # Redis 즉시 동기화 (lazy sync 문제 해결)
+        try:
+            import json as _json
+            from app.core.redis import hset
+            await hset("workflow:status", {
+                "step_status": _json.dumps(steps, ensure_ascii=False, default=str),
+            }, ttl=300)
+        except Exception as e:
+            logger.warning("Redis step_status 동기화 실패: %s", e)
 
     # ── 거래일 확인 ──
 
@@ -190,7 +201,7 @@ class DailyWorkflowOrchestrator:
 
         pykrx 데이터가 없거나 예외 시 평일(월-금)이면 거래일로 간주.
         """
-        today = date.today()
+        today = today_kst()
         is_weekday = today.weekday() < 5  # 0=월 ~ 4=금
 
         try:
@@ -215,6 +226,9 @@ class DailyWorkflowOrchestrator:
 
     async def handle_pre_market(self, *, force: bool = False) -> dict:
         """08:30 — 거래일 확인, 팩토리 중지, 최적 팩터 확인."""
+        # user_stopped 플래그는 사용자가 명시적으로 해제할 때만 삭제.
+        # pre_market에서 자동 초기화하지 않음 (사용자 의도 존중).
+
         async with async_session() as session:
             run = await self._get_or_create_today(session)
 
@@ -282,35 +296,45 @@ class DailyWorkflowOrchestrator:
                 except Exception as e:
                     logger.warning("PRE_MARKET 다이버전스 체크 실패: %s", e)
 
-                # 최적 팩터 선택 (설계서 §8.4 필터, 멀티 팩터 지원)
-                multi_count = settings.WORKFLOW_MULTI_FACTOR_COUNT
-                best = await select_best_factors(
+                # 듀얼 타임프레임 팩터 선택 (5분봉 + 일봉)
+                from app.workflow.auto_selector import select_dual_factors
+                dual = await select_dual_factors(
                     session,
-                    limit=multi_count,
+                    intraday_count=settings.WORKFLOW_INTRADAY_FACTOR_COUNT,
+                    daily_count=settings.WORKFLOW_DAILY_FACTOR_COUNT,
                     min_ic=settings.WORKFLOW_MIN_FACTOR_IC,
                     min_sharpe=settings.WORKFLOW_MIN_FACTOR_SHARPE,
                     require_causal=settings.WORKFLOW_REQUIRE_CAUSAL,
-                    interval=settings.WORKFLOW_DATA_INTERVAL,
                 )
+                best = dual["intraday"] + dual["daily"]  # 하위호환: 합쳐서 best로 사용
                 if best:
                     # 첫 번째 팩터를 selected_factor_id에 설정 (기존 호환)
                     factor = best[0]["factor"]
                     run.selected_factor_id = factor.id
 
-                    # 전체 선택 팩터 목록도 config에 저장
+                    # interval별로 구분하여 config에 저장
                     run.config = run.config or {}
                     run.config["selected_factors"] = [
                         {
                             "factor_id": str(b["factor"].id),
                             "name": b["factor"].name,
                             "score": round(b["score"], 4),
+                            "interval": b["factor"].interval,
                         }
                         for b in best
+                    ]
+                    run.config["selected_factors_intraday"] = [
+                        {"factor_id": str(b["factor"].id), "name": b["factor"].name}
+                        for b in dual["intraday"]
+                    ]
+                    run.config["selected_factors_daily"] = [
+                        {"factor_id": str(b["factor"].id), "name": b["factor"].name}
+                        for b in dual["daily"]
                     ]
                     flag_modified(run, "config")
 
                     factors_desc = ", ".join(
-                        f"{b['factor'].name}({b['score']:.4f})" for b in best
+                        f"{b['factor'].name}[{b['factor'].interval}]({b['score']:.4f})" for b in best
                     )
                     await self._log_event(
                         session, run, "factor_selected",
@@ -356,6 +380,17 @@ class DailyWorkflowOrchestrator:
         async with async_session() as session:
             run = await self._get_or_create_today(session)
 
+            # 자동매매 수동 중단 플래그 체크 — TRADING 페이즈는 정상 전환, 세션만 안 시작
+            _trading_user_stopped = False
+            try:
+                from app.core.redis import get_client as _get_redis
+                _r = _get_redis()
+                _flag = await _r.get("trading:user_stopped")
+                if _flag and str(_flag) == "true":
+                    _trading_user_stopped = True
+            except Exception:
+                pass
+
             # 비거래일 체크
             if not await self._is_trading_day():
                 logger.info("market_open: 비거래일 — 스킵")
@@ -380,8 +415,13 @@ class DailyWorkflowOrchestrator:
                 if _sessions:
                     running = [s for s in _sessions.values() if s.status == "running"]
                     if running:
-                        logger.info("market_open: 이미 %d개 세션 실행 중 — 스킵", len(running))
-                        await session.commit()
+                        # 세션은 이미 돌고 있지만 phase가 PRE_MARKET이면 TRADING으로 전이
+                        if run.phase != "TRADING":
+                            await self._transition(session, run, "TRADING")
+                            await self._set_step(session, run, "market_open", "completed",
+                                                 detail=f"sessions={len(running)}, reused=True")
+                            await session.commit()
+                        logger.info("market_open: 이미 %d개 세션 실행 중 — phase=%s", len(running), run.phase)
                         return {"success": True, "message": f"기존 {len(running)}개 세션 운영 중"}
             except Exception:
                 pass
@@ -389,6 +429,7 @@ class DailyWorkflowOrchestrator:
             # pre_market이 미실행된 경우 여기서 직접 팩터 선택 (catch-up)
             if run.selected_factor_id is None and run.phase == "IDLE":
                 logger.info("market_open: pre_market 미실행 — 팩터 직접 선택 시도")
+                _mcfg = await get_mining_config()
                 multi_count = settings.WORKFLOW_MULTI_FACTOR_COUNT
                 best = await select_best_factors(
                     session,
@@ -396,7 +437,7 @@ class DailyWorkflowOrchestrator:
                     min_ic=settings.WORKFLOW_MIN_FACTOR_IC,
                     min_sharpe=settings.WORKFLOW_MIN_FACTOR_SHARPE,
                     require_causal=settings.WORKFLOW_REQUIRE_CAUSAL,
-                    interval=settings.WORKFLOW_DATA_INTERVAL,
+                    interval=_mcfg["interval"],
                 )
                 if best:
                     factor = best[0]["factor"]
@@ -446,6 +487,18 @@ class DailyWorkflowOrchestrator:
                     await session.commit()
                     return {"success": False, "message": f"전이 불가: {run.phase} → TRADING"}
 
+            # 자동매매 수동 중단 — TRADING 페이즈로는 전환했지만 세션 시작 안 함
+            if _trading_user_stopped:
+                logger.info("market_open: 자동매매 수동 중단 — TRADING 전환 완료, 세션 시작 스킵")
+                await self._set_step(session, run, "market_open", "completed",
+                                     detail="trading_user_stopped")
+                await self._log_event(
+                    session, run, "trading_skipped",
+                    "자동매매 수동 중단 상태 — 세션 시작 스킵",
+                )
+                await session.commit()
+                return {"success": True, "phase": "TRADING", "detail": "trading_user_stopped"}
+
             await self._set_step(session, run, "market_open", "running")
 
             try:
@@ -478,6 +531,60 @@ class DailyWorkflowOrchestrator:
                 mode = settings.WORKFLOW_TRADING_MODE
                 started_sessions: list[dict] = []
                 context_ids: list[str] = []
+
+                # ── 일봉 세션 보존 처리 ──
+                # 이미 실행 중인 일봉 세션이 있으면 그대로 유지 (포지션 보존)
+                from app.trading.live_runner import list_sessions as _list_live
+                existing_daily_live = [
+                    s for s in _list_live()
+                    if s.status == "running"
+                    and s.context.strategy.get("interval") == "1d"
+                ]
+                # 이미 활성인 일봉 팩터 ID 추출
+                active_daily_factor_ids = {
+                    s.context.strategy.get("factor_id", "")
+                    for s in existing_daily_live
+                }
+                # selected_factors에서 이미 활성인 일봉 팩터는 제외 (세션 중복 방지)
+                selected_factors = [
+                    f for f in selected_factors
+                    if f.get("interval") != "1d" or f["factor_id"] not in active_daily_factor_ids
+                ]
+                if existing_daily_live:
+                    logger.info(
+                        "market_open: 일봉 세션 %d개 이미 활성 — 포지션 유지 (%s)",
+                        len(existing_daily_live),
+                        ", ".join(s.context.strategy_name for s in existing_daily_live),
+                    )
+                    # 일봉 세션의 daily_scores 재계산 + 리밸런스 매도
+                    for ds in existing_daily_live:
+                        try:
+                            from app.trading.live_runner import _compute_daily_factor_scores, _daily_rebalance_sell
+                            from app.backtest.cost_model import CostConfig as _CostConfig
+                            await _compute_daily_factor_scores(ds)
+                            sell_count = await _daily_rebalance_sell(ds, _CostConfig(
+                                buy_commission=ds.context.cost_config.buy_commission,
+                                sell_commission=ds.context.cost_config.sell_commission,
+                                slippage_pct=ds.context.cost_config.slippage_pct,
+                            ))
+                            if sell_count > 0:
+                                await self._log_event(
+                                    session, run, "daily_rebalance",
+                                    f"일봉 세션 {ds.context.strategy_name}: {sell_count}종목 리밸런스 매도",
+                                )
+                        except Exception as e:
+                            logger.warning("일봉 세션 리밸런스 실패 (%s): %s", ds.id[:8], e)
+                    # 이미 실행 중인 세션은 started_sessions에 추가
+                    for ds in existing_daily_live:
+                        started_sessions.append({
+                            "factor_id": ds.context.strategy.get("factor_id", ""),
+                            "factor_name": ds.context.strategy_name,
+                            "context_id": ds.context.id,
+                            "session_id": ds.id,
+                            "capital": round(ds._cash + sum(p.avg_price * p.qty for p in ds.positions.values()), 2),
+                            "interval": "1d",
+                            "reused": True,
+                        })
 
                 # ── 기존 context 재사용 체크 (서버 재시작 시 중복 생성 방지) ──
                 # 오늘 이미 생성된 context를 factor_id별로 매핑
@@ -662,6 +769,44 @@ class DailyWorkflowOrchestrator:
                 except Exception as _e:
                     logger.warning("장중 분봉 수집기 시작 실패: %s", _e)
 
+                # 알파 스코어 엔진 자동 시작 (팩터별 실시간 랭킹)
+                try:
+                    from app.trading.alpha_score_engine import get_score_engine, start_score_engine_loop
+                    engine = get_score_engine()
+                    if not engine._running and started_sessions:
+                        factor_configs = []
+                        for ss in started_sessions:
+                            fid = ss.get("factor_id", "")
+                            fname = ss.get("factor_name", "")
+                            # DB에서 팩터 수식 조회
+                            try:
+                                f_stmt = select(AlphaFactor).where(AlphaFactor.id == uuid.UUID(fid))
+                                f_result = await session.execute(f_stmt)
+                                f_obj = f_result.scalar_one_or_none()
+                                if f_obj and f_obj.expression_str:
+                                    factor_configs.append({
+                                        "id": fid,
+                                        "name": fname,
+                                        "expression_str": f_obj.expression_str,
+                                        "interval": f_obj.interval or "5m",
+                                    })
+                            except Exception:
+                                pass
+                        if factor_configs:
+                            from app.alpha.universe import resolve_universe, Universe
+                            try:
+                                univ_enum = Universe(settings.WORKFLOW_UNIVERSE)
+                            except (ValueError, KeyError):
+                                univ_enum = Universe.KOSPI200
+                            univ_symbols = await resolve_universe(univ_enum)
+                            # KOSPI200 전체 종목 사용 (Redis pipeline 배치로 타임아웃 해소)
+                            asyncio.create_task(start_score_engine_loop(
+                                univ_symbols, factor_configs, interval_seconds=300,
+                            ))
+                            logger.info("알파 스코어 엔진 시작: %d팩터, %d종목", len(factor_configs), len(univ_symbols))
+                except Exception as e:
+                    logger.warning("알파 스코어 엔진 시작 실패: %s", e)
+
                 return {
                     "success": True,
                     "phase": "TRADING",
@@ -726,41 +871,62 @@ class DailyWorkflowOrchestrator:
             except Exception as e:
                 logger.warning("장마감 미체결 취소 실패: %s", e)
 
-            # 모든 LiveSession 중지 + 전량 청산 + 로그 저장
+            # LiveSession 중지: 5분봉은 전량 청산, 일봉은 포지션 유지
             total_trades = 0
             try:
-                from app.trading.live_runner import list_sessions, stop_session
+                from app.trading.live_runner import list_sessions, stop_session, _save_session_state, _sync_session_to_redis
                 for live_session in list_sessions():
-                    if live_session.status == "running":
-                        await self._close_all_positions(live_session)
+                    if live_session.status != "running":
+                        continue
 
-                        # 로그 파일 저장 (stop 전에 데이터 접근)
-                        try:
-                            from app.trading.log_writer import save_session_log
-                            ctx = live_session.context
-                            log_path = save_session_log(
-                                session_id=live_session.id,
-                                mode=ctx.mode,
-                                strategy_name=ctx.strategy_name,
-                                initial_capital=ctx.initial_capital,
-                                position_size_pct=ctx.position_size_pct,
-                                max_positions=ctx.max_positions,
-                                trade_log=live_session.trade_log,
-                                decision_log=live_session.decision_log,
-                                cost_config=ctx.cost_config,
-                            )
-                            if log_path:
-                                logger.info("매매 로그 파일: %s", log_path)
-                        except Exception as e:
-                            logger.error("매매 로그 저장 실패: %s", e)
+                    interval = live_session.context.strategy.get("interval", "5m")
 
-                        stopped = await stop_session(live_session.id)
-                        if stopped:
-                            total_trades += len(stopped.trade_log)
-                            await self._log_event(
-                                session, run, "session_stopped",
-                                f"세션 {live_session.id} 중지 (거래 {len(stopped.trade_log)}건)",
-                            )
+                    if interval == "1d":
+                        # ── 일봉 세션: 포지션 유지, 세션 상태 저장만 ──
+                        await _save_session_state(live_session)
+                        await _sync_session_to_redis(live_session)
+                        pos_count = len(live_session.positions)
+                        logger.info(
+                            "일봉 세션 %s (%s) 장 마감 — 포지션 %d종목 유지 (오버나잇)",
+                            live_session.id[:8], live_session.context.strategy_name, pos_count,
+                        )
+                        await self._log_event(
+                            session, run, "daily_session_overnight",
+                            f"일봉 세션 {live_session.context.strategy_name} — {pos_count}종목 오버나잇 보유",
+                        )
+                        total_trades += len(live_session.trade_log)
+                        continue
+
+                    # ── 5분봉 세션: 현재 로직 그대로 (전량 청산 + 세션 종료) ──
+                    await self._close_all_positions(live_session)
+
+                    # 로그 파일 저장 (stop 전에 데이터 접근)
+                    try:
+                        from app.trading.log_writer import save_session_log
+                        ctx = live_session.context
+                        log_path = save_session_log(
+                            session_id=live_session.id,
+                            mode=ctx.mode,
+                            strategy_name=ctx.strategy_name,
+                            initial_capital=ctx.initial_capital,
+                            position_size_pct=ctx.position_size_pct,
+                            max_positions=ctx.max_positions,
+                            trade_log=live_session.trade_log,
+                            decision_log=live_session.decision_log,
+                            cost_config=ctx.cost_config,
+                        )
+                        if log_path:
+                            logger.info("매매 로그 파일: %s", log_path)
+                    except Exception as e:
+                        logger.error("매매 로그 저장 실패: %s", e)
+
+                    stopped = await stop_session(live_session.id)
+                    if stopped:
+                        total_trades += len(stopped.trade_log)
+                        await self._log_event(
+                            session, run, "session_stopped",
+                            f"5분봉 세션 {live_session.id} 중지 (거래 {len(stopped.trade_log)}건)",
+                        )
             except Exception as e:
                 logger.error("LiveSession 중지 실패: %s", e)
 
@@ -872,6 +1038,15 @@ class DailyWorkflowOrchestrator:
         """
         ctx = live_session.context
         is_paper = ctx.mode != "real"
+
+        # Paper 모드: pending orders 취소 + 예약 현금 반환
+        if is_paper and hasattr(live_session, 'pending_orders') and live_session.pending_orders:
+            for order in live_session.pending_orders:
+                if order.get("side") == "BUY":
+                    live_session._cash += order.get("reserved_cash", 0)
+            cancelled_count = len(live_session.pending_orders)
+            live_session.pending_orders.clear()
+            logger.info("장마감 pending orders %d건 취소 [paper]", cancelled_count)
 
         for symbol, pos in list(live_session.positions.items()):
             if pos.qty <= 0:
@@ -1146,6 +1321,22 @@ class DailyWorkflowOrchestrator:
                 await self._ensure_mining_running()
                 return {"success": True, "phase": "MINING", "message": "이미 MINING 상태"}
 
+            # Redis 플래그 체크: 사용자가 수동 중지한 경우 MINING 전이하지 않음
+            try:
+                from app.core.redis import get_client as get_redis
+                _r = get_redis()
+                _flag = await _r.get("alpha:factory:user_stopped")
+                if _flag and str(_flag) == "true":
+                    logger.info("마이닝 사용자 중지 플래그 감지 — MINING 전이 건너뜀")
+                    await self._log_event(
+                        session, run, "mining_skipped",
+                        "팩토리 수동 중단 상태 — 마이닝 스킵",
+                    )
+                    await session.commit()
+                    return {"success": True, "phase": run.phase, "detail": "factory_user_stopped"}
+            except Exception:
+                pass
+
             if not await self._transition(session, run, "MINING"):
                 # 전이 실패 시 강제 전이 (마이닝은 항상 가동 가능해야 함)
                 logger.warning("MINING 전이 실패 — force 폴백: %s → MINING", run.phase)
@@ -1157,24 +1348,14 @@ class DailyWorkflowOrchestrator:
 
             mining_context = run.mining_context or "자동 워크플로우 상시 마이닝"
             try:
-                # Redis 플래그 체크: 사용자가 수동 중지한 경우 시작 안 함
-                try:
-                    from app.core.redis import get_client as get_redis
-                    _r = get_redis()
-                    _flag = await _r.get("alpha:factory:user_stopped")
-                    if _flag and str(_flag) == "true":
-                        logger.info("마이닝 사용자 중지 플래그 감지 — 시작 건너뜀")
-                        await self._set_step(session, run, "mining", "skipped_user_stopped")
-                        return
-                except Exception:
-                    pass
 
                 from app.alpha.factory_client import get_factory_client
-                _data_interval = settings.WORKFLOW_DATA_INTERVAL
+                _mcfg = await get_mining_config()
+                _data_interval = _mcfg["interval"]
                 factory = get_factory_client(interval=_data_interval)
                 if not (await factory.get_status())["running"]:
                     # 인터벌별 디폴트 날짜 (메모리 효율 + 통계적 유의성)
-                    _today = date.today().isoformat()
+                    _today = today_kst().isoformat()
                     _start_date = "2014-01-01" if _data_interval == "1d" else ""
                     _end_date = _today if _data_interval == "1d" else ""
 
@@ -1183,10 +1364,14 @@ class DailyWorkflowOrchestrator:
                         start_date=_start_date,
                         end_date=_end_date,
                         interval_minutes=0,
-                        max_iterations=settings.ALPHA_FACTORY_MAX_ITERATIONS,
+                        max_iterations=_mcfg["max_iterations"],
                         enable_crossover=settings.ALPHA_FACTORY_CROSSOVER_ENABLED,
                         max_cycles=0,  # 무제한 (PRE_MARKET에 의해 중지)
                         data_interval=_data_interval,
+                        population_size=_mcfg["population_size"],
+                        cpcv_n_groups=_mcfg["cpcv_n_groups"],
+                        cpcv_n_test=_mcfg["cpcv_n_test"],
+                        cpcv_embargo_days=_mcfg["cpcv_embargo_days"],
                     )
                     await self._log_event(
                         session, run, "mining_start",
@@ -1267,16 +1452,14 @@ class DailyWorkflowOrchestrator:
         공휴일은 pykrx 비동기 호출이 필요해서 여기서는 주말만 체크.
         (공휴일은 각 핸들러의 _is_trading_day()에서 걸러짐)
         """
-        from datetime import timezone as tz
-        KST = tz(timedelta(hours=9))
-        now_kst = datetime.now(KST)
+        now_kst_dt = now_kst()
 
         # 주말이면 항상 마이닝
-        if now_kst.weekday() >= 5:  # 5=토, 6=일
+        if now_kst_dt.weekday() >= 5:  # 5=토, 6=일
             return "MINING", "handle_mining"
 
         for start, end, phase, handler in self._PHASE_SCHEDULE:
-            if start <= now_kst.time() < end:
+            if start <= now_kst_dt.time() < end:
                 return phase, handler
         # 23:59:59 이후 (사실상 없지만 안전장치)
         return "MINING", "handle_mining"
@@ -1349,14 +1532,8 @@ class DailyWorkflowOrchestrator:
                         _at = step_info.get("at", "")
                         if _at:
                             try:
-                                _KST = timezone(timedelta(hours=9))
                                 _dt = datetime.fromisoformat(_at)
-                                if _dt.tzinfo is None:
-                                    # naive → KST로 간주 (신규 저장 형식)
-                                    _completed_hour = _dt.hour
-                                else:
-                                    # aware → KST로 변환 후 hour 추출
-                                    _completed_hour = _dt.astimezone(_KST).hour
+                                _completed_hour = to_kst(_dt).hour
                                 _STEP_MIN_HOUR = {
                                     "pre_market": 8, "market_open": 9,
                                     "market_close": 15, "review": 16,
@@ -1411,6 +1588,24 @@ class DailyWorkflowOrchestrator:
         except Exception as e:
             logger.error("Phase Watchdog 오류: %s", e)
 
+    # catch-up 시 각 페이즈가 실행 가능한 시간 윈도우 (KST)
+    _PHASE_VALID_WINDOW: dict[str, tuple[time_type, time_type]] = {
+        "PRE_MARKET": (time_type(8, 0), time_type(9, 30)),
+        "TRADING": (time_type(8, 50), time_type(15, 40)),
+        "MARKET_CLOSE": (time_type(15, 20), time_type(17, 0)),
+        "REVIEW": (time_type(15, 20), time_type(20, 0)),
+        # MINING: 항상 실행 가능 (윈도우 없음)
+    }
+
+    def _should_skip_catchup_phase(self, phase_name: str) -> bool:
+        """catch-up 시 현재 시간이 해당 페이즈의 유효 윈도우 밖이면 True."""
+        window = self._PHASE_VALID_WINDOW.get(phase_name)
+        if window is None:
+            return False  # MINING 등은 항상 실행
+        now_t = now_kst().time()
+        start, end = window
+        return not (start <= now_t < end)
+
     async def _catchup_to_phase(self, actual: str, target: str) -> None:
         """actual → target까지 누락된 페이즈 핸들러를 순차 실행."""
         order = self._PHASE_ORDER
@@ -1439,6 +1634,13 @@ class DailyWorkflowOrchestrator:
             phase_name = order[i]
             handler = handlers.get(phase_name)
             if handler is None:
+                continue
+            # 현재 시간이 해당 페이즈의 유효 시간대가 아니면 스킵
+            if self._should_skip_catchup_phase(phase_name):
+                logger.info(
+                    "Phase Watchdog catch-up: %s 스킵 (현재 시간대 불일치)",
+                    phase_name,
+                )
                 continue
             try:
                 logger.info("Phase Watchdog catch-up: %s 실행", phase_name)
@@ -1469,6 +1671,16 @@ class DailyWorkflowOrchestrator:
 
     async def _session_health_check(self) -> None:
         """TRADING 페이즈 중 LiveSession 건강 상태를 점검하고 비정상 시 재시작."""
+        # 자동매매 수동 중단 플래그 → 건강 체크 비활성화
+        try:
+            from app.core.redis import get_client as _get_redis
+            _r = _get_redis()
+            _flag = await _r.get("trading:user_stopped")
+            if _flag and str(_flag) == "true":
+                return
+        except Exception:
+            pass
+
         try:
             from app.trading.live_runner import list_sessions
 
@@ -1539,22 +1751,25 @@ class DailyWorkflowOrchestrator:
 
             # 장중 분봉 수집기 생존 체크 (Worker 재시작 시 Task 유실 대응)
             try:
-                from app.trading.live_runner import _intraday_collector_task, start_intraday_candle_collector
-                if _intraday_collector_task is None or _intraday_collector_task.done():
-                    # 수집 대상 종목 결정
-                    scan_symbols: list[str] = []
-                    for s in sessions:
-                        scan_symbols.extend(getattr(s, "scan_symbols", []))
-                    if not scan_symbols:
-                        from sqlalchemy import text as _t
-                        async with async_session() as _db:
-                            _r = await _db.execute(
-                                _t("SELECT symbol FROM stock_masters WHERE market = 'KOSPI' ORDER BY symbol LIMIT 200")
-                            )
-                            scan_symbols = [r[0] for r in _r.fetchall()]
-                    if scan_symbols:
-                        asyncio.create_task(start_intraday_candle_collector(scan_symbols))
-                        logger.warning("장중 분봉 수집기 재시작 (%d종목) — Task 유실 감지", len(scan_symbols))
+                _now_t = now_kst().time()
+                # 09:00~15:30 장중 시간대에서만 수집기 재시작
+                if time_type(9, 0) <= _now_t < time_type(15, 30):
+                    from app.trading.live_runner import _intraday_collector_task, start_intraday_candle_collector
+                    if _intraday_collector_task is None or _intraday_collector_task.done():
+                        # 수집 대상 종목 결정
+                        scan_symbols: list[str] = []
+                        for s in sessions:
+                            scan_symbols.extend(getattr(s, "scan_symbols", []))
+                        if not scan_symbols:
+                            from sqlalchemy import text as _t
+                            async with async_session() as _db:
+                                _r = await _db.execute(
+                                    _t("SELECT symbol FROM stock_masters WHERE market = 'KOSPI' ORDER BY symbol LIMIT 200")
+                                )
+                                scan_symbols = [r[0] for r in _r.fetchall()]
+                        if scan_symbols:
+                            asyncio.create_task(start_intraday_candle_collector(scan_symbols))
+                            logger.warning("장중 분봉 수집기 재시작 (%d종목) — Task 유실 감지", len(scan_symbols))
             except Exception as _e:
                 logger.debug("분봉 수집기 체크 실패: %s", _e)
 
@@ -1621,7 +1836,7 @@ class DailyWorkflowOrchestrator:
                 ctx_model = await build_context_from_factor(db, factor, mode=mode)
 
                 # 5. interval 오버라이드 (현재 config 반영)
-                current_interval = settings.WORKFLOW_DATA_INTERVAL
+                current_interval = (await get_mining_config())["interval"]
                 if ctx_model.strategy.get("interval") != current_interval:
                     strategy = dict(ctx_model.strategy)
                     strategy["interval"] = current_interval
@@ -1686,13 +1901,23 @@ class DailyWorkflowOrchestrator:
             except Exception:
                 pass
 
+            # Causal sweep 진행 중이면 재시작 건너뜀
+            try:
+                _sweep_flag = await _redis.get("alpha:causal_sweep:running")
+                if _sweep_flag:
+                    logger.info("인과검증 전수 진행 중 — watchdog 재시작 건너뜀")
+                    return
+            except Exception:
+                pass
+
             # ★ 모든 interval 스케줄러 중 하나라도 실행 중이면 재시작 불필요
             for _iv, _sched in get_all_schedulers().items():
                 if _sched._task and not _sched._task.done():
                     return
 
             # 설정된 interval의 스케줄러 가져오기 (5m 고정 아님)
-            scheduler = get_scheduler(settings.WORKFLOW_DATA_INTERVAL)
+            _mcfg = await get_mining_config()
+            scheduler = get_scheduler(_mcfg["interval"])
 
             status = scheduler.get_status()
             if not status["running"]:
@@ -1724,13 +1949,22 @@ class DailyWorkflowOrchestrator:
                 async with async_session() as session:
                     run = await self._get_or_create_today(session)
                     mining_context = run.mining_context or "자동 워크플로우 상시 마이닝 (watchdog 복구)"
+                    _today = today_kst().isoformat()
+                    _ws = "2014-01-01" if _mcfg["interval"] == "1d" else ""
+                    _we = _today if _mcfg["interval"] == "1d" else ""
                     await scheduler.start(
                         context=mining_context,
+                        start_date=_ws,
+                        end_date=_we,
                         interval_minutes=0,
-                        max_iterations=settings.ALPHA_FACTORY_MAX_ITERATIONS,
+                        max_iterations=_mcfg["max_iterations"],
                         enable_crossover=settings.ALPHA_FACTORY_CROSSOVER_ENABLED,
                         max_cycles=0,
-                        data_interval=settings.WORKFLOW_DATA_INTERVAL,
+                        data_interval=_mcfg["interval"],
+                        population_size=_mcfg["population_size"],
+                        cpcv_n_groups=_mcfg["cpcv_n_groups"],
+                        cpcv_n_test=_mcfg["cpcv_n_test"],
+                        cpcv_embargo_days=_mcfg["cpcv_embargo_days"],
                     )
                     await self._log_event(
                         session, run, "watchdog_mining_restart",
@@ -1825,7 +2059,7 @@ class DailyWorkflowOrchestrator:
     async def get_status(self) -> dict:
         """현재 워크플로우 상태를 반환."""
         async with async_session() as session:
-            today = date.today()
+            today = today_kst()
             stmt = select(WorkflowRun).where(WorkflowRun.date == today)
             result = await session.execute(stmt)
             run = result.scalar_one_or_none()
@@ -1838,12 +2072,36 @@ class DailyWorkflowOrchestrator:
                     "message": "오늘 워크플로우 미시작",
                 }
 
+            # 선택된 팩터 이름/IC 조회
+            factor_name = None
+            factor_ic = None
+            selected_factors_info = (run.config or {}).get("selected_factors", [])
+            if selected_factors_info:
+                # 멀티 팩터: 첫 번째 팩터 이름 + 전체 개수
+                names = [f.get("name", "?") for f in selected_factors_info]
+                factor_name = ", ".join(names[:3])
+                if len(names) > 3:
+                    factor_name += f" 외 {len(names) - 3}개"
+            elif run.selected_factor_id:
+                try:
+                    from app.alpha.models import AlphaFactor
+                    f_stmt = select(AlphaFactor).where(AlphaFactor.id == run.selected_factor_id)
+                    f_result = await session.execute(f_stmt)
+                    factor = f_result.scalar_one_or_none()
+                    if factor:
+                        factor_name = factor.name
+                        factor_ic = factor.ic_mean
+                except Exception:
+                    pass
+
             data = {
                 "phase": run.phase,
                 "date": str(run.date),
                 "status": run.status,
                 "step_status": run.step_status,
                 "selected_factor_id": str(run.selected_factor_id) if run.selected_factor_id else None,
+                "selected_factor_name": factor_name,
+                "selected_factor_ic": factor_ic,
                 "trading_context_id": str(run.trading_context_id) if run.trading_context_id else None,
                 "trade_count": run.trade_count,
                 "pnl_pct": run.pnl_pct,

@@ -159,6 +159,29 @@ async def scheduler_cancel_job(job_id: str):
     return {"success": True, "message": "중단 요청됨"}
 
 
+@router.delete("/jobs/{job_id}")
+async def scheduler_dismiss_job(job_id: str):
+    """잡을 목록에서 강제 제거 (멈춘 잡 정리용)."""
+    from app.core.config import settings
+
+    if settings.WORKER_MODE == "external":
+        # Redis에서 직접 제거 + Worker에 cancel 명령 전송
+        from app.core.redis import get_client, xadd
+        r = get_client()
+        await r.delete(f"scheduler:jobs:{job_id}")
+        await r.srem("scheduler:active_job_ids", job_id)
+        # Worker에도 cancel 전달 (태스크 정리)
+        await xadd("commands:scheduler", {
+            "action": "cancel_job",
+            "job_id": job_id,
+        }, maxlen=100)
+        return {"success": True, "message": "잡 제거 완료"}
+
+    from app.scheduler.manual_runner import get_manual_runner
+    await get_manual_runner().dismiss_job(job_id)
+    return {"success": True, "message": "잡 제거 완료"}
+
+
 async def _read_jobs_from_redis() -> list[ActiveJob]:
     """Redis에서 활성 잡 목록을 읽는다."""
     try:

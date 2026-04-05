@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from app.core.timezone import now_kst
+
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -17,16 +19,13 @@ from app.workflow.models import LiveFeedback
 
 logger = logging.getLogger(__name__)
 
-_KST = timezone(timedelta(hours=9))
-
-
 async def check_staleness(session: AsyncSession) -> dict:
     """활성 팩터의 스탈니스 검사.
 
     Returns:
         {"warned": int, "stale": int, "retired": int}
     """
-    now = datetime.now(_KST)
+    now = now_kst()
     warned = 0
     stale_count = 0
     retired_count = 0

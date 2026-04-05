@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
+from app.core.timezone import KST
+
+import asyncio
 import json
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Generic, TypeVar
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
@@ -37,8 +41,8 @@ class CollectionStatusItem(BaseModel):
     display_name: str
     total_rows: int
     earliest_date: str | None
-    latest_date: str | None
-    last_collected_at: str | None
+    latest_date: str | None          # 실제 데이터 최신 날짜 (MAX(dt))
+    last_collected_at: str | None    # 수집 시도 시각 (참고용)
 
 
 class InvestorTradingRow(BaseModel):
@@ -90,12 +94,13 @@ class ProgramTradingRow(BaseModel):
     symbol: str
     name: str | None
     dt: str
-    pgm_buy_qty: int
-    pgm_sell_qty: int
-    pgm_net_qty: int
     pgm_buy_amount: int
     pgm_sell_amount: int
     pgm_net_amount: int
+    arbt_buy_amount: int = 0
+    arbt_sell_amount: int = 0
+    nabt_buy_amount: int = 0
+    nabt_sell_amount: int = 0
     collected_at: str | None
 
 
@@ -118,6 +123,20 @@ class NewsExplorerRow(BaseModel):
     published_at: str
     sentiment_score: float | None
     market_impact: float | None
+
+
+class DiscussionExplorerRow(BaseModel):
+    id: str
+    symbol: str
+    name: str | None = None
+    title: str
+    content: str | None = None
+    author: str | None = None
+    published_at: str
+    likes: int
+    dislikes: int
+    comment_count: int
+    sentiment_score: float | None = None
 
 
 class DataGapItem(BaseModel):
@@ -177,6 +196,10 @@ async def collection_status():
     SELECT 'news_articles', '뉴스 기사',
            COUNT(*), MIN(published_at), MAX(published_at), MAX(created_at)
     FROM news_articles
+    UNION ALL
+    SELECT 'discussion_posts', '종토방',
+           COUNT(*), MIN(published_at), MAX(published_at), MAX(created_at)
+    FROM discussion_posts
     """
     async with async_session() as session:
         result = await session.execute(text(sql))
@@ -362,8 +385,10 @@ async def get_program_trading(
     async with async_session() as session:
         total = await _count_query(session, "program_trading t", where, {k: v for k, v in params.items() if k not in ("limit", "offset")})
         sql = (
-            f"SELECT t.id, t.symbol, m.name, t.dt, t.pgm_buy_qty, t.pgm_sell_qty, t.pgm_net_qty, "
-            f"t.pgm_buy_amount, t.pgm_sell_amount, t.pgm_net_amount, t.collected_at "
+            f"SELECT t.id, t.symbol, m.name, t.dt, "
+            f"t.pgm_buy_amount, t.pgm_sell_amount, t.pgm_net_amount, "
+            f"COALESCE(t.arbt_buy_amount, 0), COALESCE(t.arbt_sell_amount, 0), "
+            f"COALESCE(t.nabt_buy_amount, 0), COALESCE(t.nabt_sell_amount, 0), t.collected_at "
             f"FROM program_trading t LEFT JOIN stock_masters m ON t.symbol = m.symbol "
             f"{where} ORDER BY t.dt DESC LIMIT :limit OFFSET :offset"
         )
@@ -373,9 +398,10 @@ async def get_program_trading(
     items = [
         ProgramTradingRow(
             id=r[0], symbol=r[1], name=r[2], dt=_fmt_date(r[3]),
-            pgm_buy_qty=r[4], pgm_sell_qty=r[5], pgm_net_qty=r[6],
-            pgm_buy_amount=r[7], pgm_sell_amount=r[8], pgm_net_amount=r[9],
-            collected_at=_fmt_date(r[10]),
+            pgm_buy_amount=r[4], pgm_sell_amount=r[5], pgm_net_amount=r[6],
+            arbt_buy_amount=r[7], arbt_sell_amount=r[8],
+            nabt_buy_amount=r[9], nabt_sell_amount=r[10],
+            collected_at=_fmt_date(r[11]),
         ) for r in rows
     ]
     return PagedResponse(items=items, total=total, page=page, limit=limit)
@@ -443,6 +469,64 @@ async def get_news(
             source=r[2], title=r[3], url=r[4],
             published_at=_fmt_date(r[5]), sentiment_score=r[6], market_impact=r[7],
         ))
+    return PagedResponse(items=items, total=total, page=page, limit=limit)
+
+
+@router.get("/discussion")
+async def get_discussion(
+    symbol: str | None = Query(None),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    page: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+) -> PagedResponse[DiscussionExplorerRow]:
+    """종토방 게시글 조회."""
+    clauses: list[str] = []
+    params: dict = {}
+    if symbol:
+        clauses.append("d.symbol = :symbol")
+        params["symbol"] = symbol
+    if start:
+        clauses.append("d.published_at >= :start")
+        params["start"] = start
+    if end:
+        clauses.append("d.published_at < :end_next")
+        params["end_next"] = end + timedelta(days=1)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    offset = page * limit
+    params["limit"] = limit
+    params["offset"] = offset
+
+    async with async_session() as session:
+        total = await _count_query(
+            session, "discussion_posts d", where,
+            {k: v for k, v in params.items() if k not in ("limit", "offset")},
+        )
+
+        sql = (
+            f"SELECT d.id, d.symbol, d.title, d.content, d.author, "
+            f"d.published_at, d.likes, d.dislikes, d.comment_count, d.sentiment_score "
+            f"FROM discussion_posts d "
+            f"{where} "
+            f"ORDER BY d.published_at DESC LIMIT :limit OFFSET :offset"
+        )
+        result = await session.execute(text(sql), params)
+        rows = result.fetchall()
+
+        name_result = await session.execute(text("SELECT symbol, name FROM stock_masters"))
+        name_map: dict[str, str] = {r[0]: r[1] for r in name_result.fetchall()}
+
+    items = [
+        DiscussionExplorerRow(
+            id=str(r[0]), symbol=r[1], name=name_map.get(r[1]),
+            title=r[2], content=(r[3] or "")[:200], author=r[4],
+            published_at=_fmt_date(r[5]),
+            likes=r[6] or 0, dislikes=r[7] or 0, comment_count=r[8] or 0,
+            sentiment_score=r[9],
+        )
+        for r in rows
+    ]
     return PagedResponse(items=items, total=total, page=page, limit=limit)
 
 
@@ -514,3 +598,200 @@ async def data_gaps(
             items.append(DataGapItem(data_type=dtype, missing_dates=[d.isoformat() for d in missing], gap_count=len(missing)))
 
     return items
+
+
+# ── 데이터 검증 (SSE) ──
+
+
+_VERIFY_SOURCES: dict[str, dict] = {
+    "daily_candle": {
+        "display": "일봉 캔들",
+        "date_sql": "SELECT DISTINCT dt::date AS d FROM stock_candles WHERE interval = '1d'",
+        "count_sql": "SELECT COUNT(DISTINCT symbol) FROM stock_candles WHERE interval = '1d' AND dt::date = :d",
+    },
+    "minute_candle": {
+        "display": "분봉 캔들",
+        "date_sql": "SELECT DISTINCT dt::date AS d FROM stock_candles WHERE interval = '1m'",
+        "count_sql": "SELECT COUNT(DISTINCT symbol) FROM stock_candles WHERE interval = '1m' AND dt::date = :d",
+    },
+    "margin_short": {
+        "display": "신용잔고/공매도",
+        "date_sql": "SELECT DISTINCT dt AS d FROM margin_short_daily",
+        "count_sql": "SELECT COUNT(*) FROM margin_short_daily WHERE dt = :d AND (margin_balance > 0 OR short_volume > 0)",
+    },
+    "investor": {
+        "display": "투자자별 매매동향",
+        "date_sql": "SELECT DISTINCT dt::date AS d FROM investor_trading",
+        "count_sql": "SELECT COUNT(*) FROM investor_trading WHERE dt::date = :d",
+    },
+    "program_trading": {
+        "display": "프로그램 매매",
+        "date_sql": "SELECT DISTINCT dt::date AS d FROM program_trading",
+        "count_sql": "SELECT COUNT(*) FROM program_trading WHERE dt::date = :d AND (pgm_buy_amount > 0 OR pgm_sell_amount > 0)",
+    },
+}
+
+
+def _sse_msg(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+@router.get("/verify/{source}")
+async def verify_data(
+    source: str,
+    start_date: date | None = Query(None),
+    end_date: date | None = Query(None),
+    lookback_days: int = Query(90, ge=7, le=365),
+):
+    """데이터 갭 검증 — SSE 스트림으로 실시간 진행 로그 전송.
+
+    /real-log 원칙: 매 스텝마다 진행률, 갭 즉시 보고, 에러 숨기지 않음.
+    """
+    if source not in _VERIFY_SOURCES:
+        raise HTTPException(400, f"지원하지 않는 소스: {source}. 가능: {list(_VERIFY_SOURCES.keys())}")
+
+    cfg = _VERIFY_SOURCES[source]
+
+    async def _stream():
+        yield _sse_msg({"type": "start", "source": source, "display": cfg["display"]})
+
+        try:
+            # 영업일 목록 (일봉 캔들이 있는 날짜를 기준으로)
+            _end = end_date or date.today()
+            _start = start_date or (_end - timedelta(days=lookback_days))
+
+            async with async_session() as session:
+                result = await session.execute(text(
+                    "SELECT DISTINCT dt::date AS d FROM stock_candles "
+                    "WHERE interval = '1d' AND dt::date >= :s AND dt::date <= :e ORDER BY d"
+                ), {"s": _start, "e": _end})
+                trading_days = [r[0] for r in result.fetchall()]
+
+            if not trading_days:
+                yield _sse_msg({"type": "error", "message": f"영업일 데이터 없음 ({_start} ~ {_end})"})
+                yield _sse_msg({"type": "done", "verified_until": None, "gaps": [], "total_gaps": 0})
+                return
+
+            yield _sse_msg({
+                "type": "progress", "pct": 0,
+                "message": f"{cfg['display']} 검증 시작: {_start} ~ {_end} ({len(trading_days)} 영업일)",
+            })
+
+            # 해당 소스의 실제 데이터 날짜 조회
+            async with async_session() as session:
+                result = await session.execute(text(cfg["date_sql"]))
+                existing_dates = {r[0] for r in result.fetchall()}
+
+            gaps: list[dict] = []
+            verified_until: date | None = None
+            checked = 0
+
+            for td in trading_days:
+                checked += 1
+                pct = int(checked / len(trading_days) * 100)
+
+                if td not in existing_dates:
+                    gaps.append({"date": td.isoformat(), "type": "missing", "message": f"{td} 데이터 없음"})
+                    yield _sse_msg({"type": "gap", "date": td.isoformat(), "message": f"{td} 데이터 없음"})
+                else:
+                    # 데이터는 있지만 유효한지 (non-zero) 확인
+                    async with async_session() as session:
+                        result = await session.execute(text(cfg["count_sql"]), {"d": td})
+                        cnt = result.scalar() or 0
+                    if cnt == 0:
+                        gaps.append({"date": td.isoformat(), "type": "empty", "message": f"{td} 데이터 0건 (빈 값)"})
+                        yield _sse_msg({"type": "gap", "date": td.isoformat(), "message": f"{td} 데이터 0건 (빈 값)"})
+                    else:
+                        if not gaps or gaps[-1]["date"] != td.isoformat():
+                            verified_until = td
+
+                # 10일마다 진행 보고
+                if checked % 10 == 0:
+                    yield _sse_msg({
+                        "type": "progress", "pct": pct,
+                        "message": f"{checked}/{len(trading_days)} 영업일 검증 완료 (갭 {len(gaps)}건)",
+                    })
+
+                await asyncio.sleep(0)  # yield control
+
+            yield _sse_msg({
+                "type": "done",
+                "verified_until": verified_until.isoformat() if verified_until else None,
+                "gaps": gaps,
+                "total_gaps": len(gaps),
+                "total_checked": len(trading_days),
+                "message": f"검증 완료: {len(trading_days)}일 중 {len(gaps)}건 갭 발견",
+            })
+
+        except Exception as e:
+            yield _sse_msg({"type": "error", "message": f"검증 오류: {e}"})
+            yield _sse_msg({"type": "done", "verified_until": None, "gaps": [], "total_gaps": -1})
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+class RecollectRequest(BaseModel):
+    dates: list[str]
+    symbols: list[str] | None = None
+
+
+@router.post("/recollect/{source}")
+async def recollect_data(source: str, req: RecollectRequest):
+    """특정 날짜의 데이터 재수집 — SSE 스트림으로 진행 로그.
+
+    기존 수집기(pykrx, KIS API)를 활용하여 지정된 날짜만 재수집.
+    """
+    if source not in ("daily_candle", "margin_short", "investor"):
+        raise HTTPException(400, f"재수집 지원 소스: daily_candle, margin_short, investor")
+
+    if not req.dates:
+        raise HTTPException(400, "재수집 날짜를 지정해주세요")
+
+    async def _stream():
+        yield _sse_msg({"type": "start", "source": source, "dates": req.dates})
+        success = 0
+        fail = 0
+
+        for i, d_str in enumerate(req.dates):
+            try:
+                d = date.fromisoformat(d_str)
+            except ValueError:
+                yield _sse_msg({"type": "error", "message": f"날짜 형식 오류: {d_str}"})
+                fail += 1
+                continue
+
+            pct = int((i + 1) / len(req.dates) * 100)
+
+            try:
+                if source == "daily_candle":
+                    from app.scheduler.collectors.daily_candle import collect_daily_candles
+                    cnt = await collect_daily_candles(d)
+                    yield _sse_msg({"type": "progress", "pct": pct, "message": f"{d} 일봉 {cnt}건 수집"})
+                    success += 1
+
+                elif source == "margin_short":
+                    from app.scheduler.collectors.margin_short import collect_margin_short
+                    cnt = await collect_margin_short(d)
+                    yield _sse_msg({"type": "progress", "pct": pct, "message": f"{d} 신용/공매도 {cnt}건 수집"})
+                    success += 1
+
+                elif source == "investor":
+                    from app.scheduler.collectors.investor import collect_investor_trading
+                    cnt = await collect_investor_trading(d)
+                    yield _sse_msg({"type": "progress", "pct": pct, "message": f"{d} 투자자매매 {cnt}건 수집"})
+                    success += 1
+
+            except Exception as e:
+                fail += 1
+                yield _sse_msg({"type": "error", "message": f"{d} 수집 실패: {e}"})
+
+            await asyncio.sleep(0.1)  # rate limit
+
+        yield _sse_msg({
+            "type": "done",
+            "success": success,
+            "fail": fail,
+            "message": f"재수집 완료: {success}건 성공, {fail}건 실패",
+        })
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")

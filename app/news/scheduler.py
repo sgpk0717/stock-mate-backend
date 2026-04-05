@@ -31,6 +31,8 @@ async def collect_and_analyze(
     symbols: list[str],
     *,
     days: int = 1,
+    log_cb=None,
+    progress_cb=None,
 ) -> dict:
     """종목 리스트에 대해 뉴스 수집 → 감성 분석 → 스코어 산출을 수행한다.
 
@@ -38,14 +40,26 @@ async def collect_and_analyze(
         session: DB 세션
         symbols: 종목 코드 리스트
         days: 수집 기간 (일)
+        log_cb: UI 로그 콜백
+        progress_cb: 진행률 콜백 (total, completed, last_symbol)
 
     Returns:
         {"collected": N, "analyzed": N, "scored": N}
     """
     stats = {"collected": 0, "analyzed": 0, "scored": 0}
+    total = len(symbols)
 
-    for symbol in symbols:
+    for idx, symbol in enumerate(symbols):
         stock_name = get_stock_name(symbol) or symbol
+
+        # 3종목마다 진행 로그
+        if progress_cb and (idx + 1) % 3 == 0:
+            await progress_cb(total, idx + 1, symbol)
+        if log_cb and (idx + 1) % 3 == 0:
+            await log_cb(
+                f"  [{idx+1}/{total}] {stock_name}({symbol}) — "
+                f"수집 {stats['collected']}건, 분석 {stats['analyzed']}건"
+            )
 
         # ── 1. 수집 ──
         all_articles: list[RawArticle] = []
@@ -53,26 +67,41 @@ async def collect_and_analyze(
         # 네이버 금융
         try:
             naver_articles = await naver_collect(symbol, page=1)
+            if naver_articles:
+                all_articles.extend(naver_articles)
+                if log_cb and (idx + 1) % 3 == 1:
+                    await log_cb(f"    네이버 {stock_name}: {len(naver_articles)}건")
             logger.info("네이버 수집 결과 (%s): %d건", symbol, len(naver_articles))
-            all_articles.extend(naver_articles)
         except Exception as e:
             logger.warning("네이버 수집 실패 (%s): %s: %s", symbol, type(e).__name__, e)
+            if log_cb:
+                await log_cb(f"    네이버 실패 ({symbol}): {type(e).__name__}")
 
         # BigKinds (API 키 있을 때만)
         if settings.BIGKINDS_API_KEY:
             try:
                 bk_articles = await bigkinds_collect(stock_name, symbol, days=days)
-                all_articles.extend(bk_articles)
+                if bk_articles:
+                    all_articles.extend(bk_articles)
+                    if log_cb and (idx + 1) % 3 == 1:
+                        await log_cb(f"    BigKinds {stock_name}: {len(bk_articles)}건")
             except Exception as e:
                 logger.warning("BigKinds 수집 실패 (%s): %s", symbol, e)
+                if log_cb:
+                    await log_cb(f"    BigKinds 실패 ({symbol}): {type(e).__name__}")
 
-        # DART 공시 (API 키 있을 때만)
-        if settings.DART_API_KEY:
+        # DART 공시 (API 키 있을 때만, 첫 종목에서만)
+        if settings.DART_API_KEY and idx == 0:
             try:
                 dart_articles = await collect_disclosures(days=days)
-                all_articles.extend(dart_articles)
+                if dart_articles:
+                    all_articles.extend(dart_articles)
+                    if log_cb:
+                        await log_cb(f"    DART 공시: {len(dart_articles)}건")
             except Exception as e:
                 logger.warning("DART 공시 수집 실패: %s", e)
+                if log_cb:
+                    await log_cb(f"    DART 실패: {type(e).__name__}")
 
         if not all_articles:
             continue
@@ -107,8 +136,14 @@ async def collect_and_analyze(
 
         # ── 3. 감성 분석 (미분석 기사만) ──
         unanalyzed = [a for a in new_articles if a.sentiment_score is None]
+        if unanalyzed and log_cb and stats["analyzed"] == 0:
+            # 첫 분석 배치에서 실제 프로바이더 알림
+            provider = "Gemini" if settings.GEMINI_API_KEY else "Anthropic" if settings.ANTHROPIC_API_KEY else "없음"
+            await log_cb(f"  감성 분석 시작 (LLM: {provider}, 배치 {settings.NEWS_BATCH_SIZE}건씩)")
         if unanalyzed:
             batch_size = settings.NEWS_BATCH_SIZE
+            if log_cb:
+                await log_cb(f"    {stock_name} 감성 분석: {len(unanalyzed)}건 ({len(unanalyzed)//batch_size + 1}배치)")
             for i in range(0, len(unanalyzed), batch_size):
                 batch = unanalyzed[i : i + batch_size]
                 batch_dicts = [

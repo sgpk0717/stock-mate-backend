@@ -18,7 +18,7 @@ import logging
 import math
 import time
 from collections import deque
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import polars as pl
@@ -31,10 +31,9 @@ from app.alpha.ast_converter import (
 )
 from app.core.config import settings
 from app.core.stock_master import get_stock_name
+from app.core.timezone import now_kst
 
 logger = logging.getLogger(__name__)
-
-_KST = timezone(timedelta(hours=9))
 _RANK_WINDOW = 60  # 롤링 퍼센타일 윈도우 (거래일)
 
 
@@ -68,13 +67,20 @@ class AlphaScoreEngine:
         self._symbols = symbols
         self._factor_configs = factor_configs
 
-        # 1. 데이터 로딩 (5분봉 직접 로드 — 1분봉 리샘플링 우회)
+        # 1. 데이터 로딩 (기본 candles + alpha features)
         from app.backtest.data_loader import _load_raw_candles
+        from app.alpha.ast_converter import ensure_alpha_features
 
         end = date.today()
         start = end - timedelta(days=days + 30)  # 여유분 포함
 
         df = await _load_raw_candles(symbols, start, end, db_interval=interval, as_datetime=True)
+        # enriched 외부 데이터는 DB JOIN이 너무 무거우므로,
+        # 수식에 필요한 피처만 ensure_alpha_features로 추가
+        try:
+            df = ensure_alpha_features(df)
+        except Exception as e:
+            logger.warning("ScoreEngine alpha_features 추가 실패 (OHLCV만 사용): %s", e)
         if df.is_empty():
             logger.warning("AlphaScoreEngine cold_start: 데이터 없음")
             return 0
@@ -97,7 +103,7 @@ class AlphaScoreEngine:
 
         # 4. 캐시 저장
         self._cache = df
-        self._last_update = datetime.now(_KST)
+        self._last_update = now_kst()
 
         # 5. Redis 저장
         t3 = time.perf_counter()
@@ -126,7 +132,7 @@ class AlphaScoreEngine:
 
         t0 = time.perf_counter()
 
-        # 1. DB에서 최신 5분봉 로드 (직접 로드)
+        # 1. DB에서 최신 캔들 로드
         from app.backtest.data_loader import _load_raw_candles
 
         end = date.today()
@@ -154,7 +160,7 @@ class AlphaScoreEngine:
         self._cache = pl.concat([self._cache, new_slice])
 
         # 60일 초과분 trim
-        cutoff = datetime.now(_KST).replace(tzinfo=None) - timedelta(days=65)
+        cutoff = now_kst().replace(tzinfo=None) - timedelta(days=65)
         self._cache = self._cache.filter(pl.col("dt") >= cutoff)
 
         # 3. 시계열 지표 전체 재계산 (벡터화라 ~0.3초)
@@ -167,7 +173,7 @@ class AlphaScoreEngine:
         scored = await self._publish_to_redis(self._cache)
 
         total = time.perf_counter() - t0
-        self._last_update = datetime.now(_KST)
+        self._last_update = now_kst()
         self._version += 1
 
         logger.info(
@@ -327,6 +333,20 @@ class AlphaScoreEngine:
 
     def _compute_alpha_scores(self, df: pl.DataFrame) -> pl.DataFrame:
         """알파 팩터 수식 적용 + 롤링 퍼센타일 정규화."""
+        # 외부 데이터 피처가 없으면 0으로 채워서 수식 에러 방지
+        _EXTERNAL_FEATURES = [
+            "earnings_yield", "book_yield", "eps", "bps", "operating_margin", "debt_to_equity",
+            "foreign_net_norm", "inst_net_norm", "retail_net_norm",
+            "foreign_buy_ratio", "inst_buy_ratio", "retail_buy_ratio",
+            "sentiment_score", "article_count", "event_score",
+            "sector_return", "sector_rel_strength", "sector_rank",
+            "margin_rate", "short_balance_rate", "short_volume_ratio",
+            "pgm_net_norm", "pgm_buy_ratio", "vkospi",
+        ]
+        for feat in _EXTERNAL_FEATURES:
+            if feat not in df.columns:
+                df = df.with_columns(pl.lit(0.0).alias(feat))
+
         for fc in self._factor_configs:
             factor_id = fc["id"][:8]
             expr_str = fc["expression_str"]
@@ -375,10 +395,9 @@ class AlphaScoreEngine:
         return df
 
     async def _publish_to_redis(self, df: pl.DataFrame) -> int:
-        """스코어를 Redis Sorted Set + Hash에 저장 (더블 버퍼)."""
+        """팩터별로 분리된 스코어를 Redis에 저장."""
         try:
             from app.core.redis import get_client
-
             r = get_client()
 
             # 최신 시점 추출
@@ -388,75 +407,110 @@ class AlphaScoreEngine:
             if latest.is_empty():
                 return 0
 
-            # 팩터별 스코어 컬럼
             alpha_cols = [c for c in latest.columns if c.startswith("alpha_")]
             if not alpha_cols:
                 return 0
 
-            # 주요 알파 컬럼 (첫 번째 팩터 기준으로 랭킹)
-            primary_col = alpha_cols[0]
             rows = latest.to_dicts()
+            now_str = now_kst().isoformat()
 
-            now_str = datetime.now(_KST).isoformat()
-
-            # 더블 버퍼: tmp 키에 기록 → RENAME으로 원자적 교체
             pipe = r.pipeline()
 
-            # tmp 키 초기화
+            # 활성 팩터 목록 키 초기화
+            pipe.delete("alpha:factors_list")
+            # 하위호환용 기존 키 초기화
             pipe.delete("tmp:alpha:buy_ranking")
             pipe.delete("tmp:alpha:sell_ranking")
 
             scored = 0
-            for row in rows:
-                sym = row.get("symbol", "")
-                if not sym:
+
+            # ── 팩터별로 분리 저장 ──
+            for fc in self._factor_configs:
+                fid = fc["id"][:8]
+                col_name = f"alpha_{fid}"
+                if col_name not in alpha_cols:
                     continue
 
-                score = row.get(primary_col)
-                if score is None or math.isnan(score):
-                    score = 0.5
+                # 팩터별 tmp 키 초기화
+                pipe.delete(f"tmp:alpha:factor:{fid}:buy_ranking")
+                pipe.delete(f"tmp:alpha:factor:{fid}:sell_ranking")
 
-                # Sorted Set: 매수 랭킹 (score 높은 순)
-                pipe.zadd("tmp:alpha:buy_ranking", {sym: score})
-                # Sorted Set: 매도 랭킹 (1-score, 낮은 score = 매도 임박)
-                pipe.zadd("tmp:alpha:sell_ranking", {sym: 1.0 - score})
-
-                # Hash: 종목별 상세
-                detail = {
-                    "score": f"{score:.4f}",
-                    "close": str(row.get("close", 0)),
-                    "sma_20": f"{row.get('sma_20', 0):.2f}" if row.get("sma_20") else "0",
-                    "rsi": f"{row.get('rsi', 0):.1f}" if row.get("rsi") else "0",
-                    "volume_ratio": f"{row.get('volume_ratio', 0):.2f}" if row.get("volume_ratio") else "0",
-                    "zscore_volume": f"{row.get('zscore_volume', 0):.3f}" if row.get("zscore_volume") else "0",
+                # 팩터 메타 정보
+                pipe.hset(f"alpha:factor:{fid}:meta", mapping={
+                    "name": fc.get("name", fid),
+                    "expression_str": fc.get("expression_str", "")[:200],
+                    "interval": fc.get("interval", ""),
                     "updated_at": now_str,
-                    "name": get_stock_name(sym),
-                }
-                # 모든 알파 스코어 추가
-                for ac in alpha_cols:
-                    v = row.get(ac)
-                    detail[ac] = f"{v:.4f}" if v is not None and not math.isnan(v) else "0.5"
+                })
+                pipe.expire(f"alpha:factor:{fid}:meta", 43200)
 
-                pipe.hset(f"tmp:alpha:detail:{sym}", mapping=detail)
-                scored += 1
+                # 활성 팩터 목록에 추가
+                pipe.sadd("alpha:factors_list", fid)
 
             await pipe.execute()
 
-            # RENAME으로 원자적 교체
-            pipe2 = r.pipeline()
-            pipe2.rename("tmp:alpha:buy_ranking", "alpha:buy_ranking")
-            pipe2.rename("tmp:alpha:sell_ranking", "alpha:sell_ranking")
-            # detail은 키가 많으므로 tmp → 실제 키로 개별 RENAME
-            for row in rows:
-                sym = row.get("symbol", "")
-                if sym:
-                    pipe2.rename(f"tmp:alpha:detail:{sym}", f"alpha:detail:{sym}")
-            # 버전 + TTL
-            pipe2.set("alpha:version", str(self._version))
-            pipe2.set("alpha:updated_at", now_str)
-            pipe2.expire("alpha:buy_ranking", 43200)
-            pipe2.expire("alpha:sell_ranking", 43200)
-            await pipe2.execute()
+            # 종목별 스코어 저장 (200종목씩 배치)
+            batch_size = 200
+            for batch_start in range(0, len(rows), batch_size):
+                batch_rows = rows[batch_start:batch_start + batch_size]
+                pipe2 = r.pipeline()
+                for row in batch_rows:
+                    sym = row.get("symbol", "")
+                    if not sym:
+                        continue
+
+                    for fc in self._factor_configs:
+                        fid = fc["id"][:8]
+                        col_name = f"alpha_{fid}"
+                        score = row.get(col_name)
+                        if score is None or math.isnan(score):
+                            score = 0.5
+
+                        pipe2.zadd(f"tmp:alpha:factor:{fid}:buy_ranking", {sym: score})
+                        pipe2.zadd(f"tmp:alpha:factor:{fid}:sell_ranking", {sym: 1.0 - score})
+                        pipe2.hset(f"alpha:factor:{fid}:detail:{sym}", mapping={
+                            "score": f"{score:.4f}",
+                            "close": str(row.get("close", 0)),
+                            "rsi": f"{row.get('rsi', 0):.1f}" if row.get("rsi") else "0",
+                            "volume_ratio": f"{row.get('volume_ratio', 0):.2f}" if row.get("volume_ratio") else "0",
+                            "name": get_stock_name(sym),
+                        })
+
+                    # 하위호환
+                    primary_score = row.get(alpha_cols[0])
+                    if primary_score is None or math.isnan(primary_score):
+                        primary_score = 0.5
+                    pipe2.zadd("tmp:alpha:buy_ranking", {sym: primary_score})
+                    pipe2.zadd("tmp:alpha:sell_ranking", {sym: 1.0 - primary_score})
+                    pipe2.hset(f"alpha:detail:{sym}", mapping={
+                        "score": f"{primary_score:.4f}",
+                        "close": str(row.get("close", 0)),
+                        "rsi": f"{row.get('rsi', 0):.1f}" if row.get("rsi") else "0",
+                        "volume_ratio": f"{row.get('volume_ratio', 0):.2f}" if row.get("volume_ratio") else "0",
+                        "name": get_stock_name(sym),
+                        "updated_at": now_str,
+                    })
+                    scored += 1
+
+                await pipe2.execute()
+
+            # RENAME: Sorted Set만 (소수 키), detail은 tmp 없이 직접 저장했으므로 RENAME 불필요
+            pipe3 = r.pipeline()
+            for fc in self._factor_configs:
+                fid = fc["id"][:8]
+                pipe3.rename(f"tmp:alpha:factor:{fid}:buy_ranking", f"alpha:factor:{fid}:buy_ranking")
+                pipe3.rename(f"tmp:alpha:factor:{fid}:sell_ranking", f"alpha:factor:{fid}:sell_ranking")
+                pipe3.expire(f"alpha:factor:{fid}:buy_ranking", 43200)
+                pipe3.expire(f"alpha:factor:{fid}:sell_ranking", 43200)
+
+            pipe3.rename("tmp:alpha:buy_ranking", "alpha:buy_ranking")
+            pipe3.rename("tmp:alpha:sell_ranking", "alpha:sell_ranking")
+            pipe3.set("alpha:version", str(self._version))
+            pipe3.set("alpha:updated_at", now_str)
+            pipe3.expire("alpha:buy_ranking", 43200)
+            pipe3.expire("alpha:sell_ranking", 43200)
+            pipe3.expire("alpha:factors_list", 43200)
+            await pipe3.execute()
 
             return scored
 
@@ -505,7 +559,7 @@ async def start_score_engine_loop(
     while engine._running:
         await asyncio.sleep(interval_seconds)
         try:
-            now = datetime.now(_KST)
+            now = now_kst()
             # 장 시간만 (09:00~15:30)
             if now.hour < 9 or (now.hour >= 15 and now.minute >= 30):
                 continue

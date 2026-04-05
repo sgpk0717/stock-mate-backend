@@ -913,6 +913,18 @@ async def start_alpha_mining(
         "interval_minutes": interval_minutes,
     }
 
+    # user_stopped 체크 — 사용자가 중지한 상태면 시작 거부
+    try:
+        from app.core.redis import get_client as _get_redis
+        _r = _get_redis()
+        _flag = await _r.get("alpha:factory:user_stopped")
+        if _flag and str(_flag) == "true":
+            elapsed = int((time.monotonic() - start_ms) * 1000)
+            await audit_log("start_alpha_mining", params, {"blocked": True, "reason": "user_stopped"}, "blocked", execution_ms=elapsed)
+            return json.dumps({"success": False, "blocked": True, "reason": "마이닝 수동 중단 상태"}, ensure_ascii=False)
+    except Exception:
+        pass
+
     from app.alpha.factory_client import get_factory_client
 
     client = get_factory_client()

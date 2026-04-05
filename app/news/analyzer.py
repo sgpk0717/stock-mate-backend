@@ -133,30 +133,43 @@ async def analyze_batch(
     user_message = "\n\n".join(article_texts)
     messages = [{"role": "user", "content": user_message}]
 
-    # 1차: Gemini 시도 (5건씩 서브배치 — 큰 배치에서 JSON 잘림 방지)
+    # 1차: Gemini 시도 (5건씩 서브배치, asyncio.gather 병렬 — Semaphore로 동시성 제한)
     if has_gemini:
-        gemini_batch_size = 5
-        all_results: list[SentimentResult] = []
-        gemini_failed = False
+        import asyncio
 
+        gemini_batch_size = 5
+        gemini_sem = asyncio.Semaphore(3)  # 최대 3개 동시 호출
+
+        async def _run_sub_batch(offset: int, sub_texts: list[str]) -> list[SentimentResult]:
+            async with gemini_sem:
+                sub_message = "\n\n".join(sub_texts)
+                sub_messages = [{"role": "user", "content": sub_message}]
+                results = await _analyze_with_gemini(sub_messages)
+                for r in results:
+                    r.article_index += offset
+                return results
+
+        tasks = []
         for i in range(0, len(articles), gemini_batch_size):
             sub_articles = article_texts[i : i + gemini_batch_size]
-            sub_message = "\n\n".join(sub_articles)
-            sub_messages = [{"role": "user", "content": sub_message}]
+            tasks.append(_run_sub_batch(i, sub_articles))
 
-            try:
-                results = await _analyze_with_gemini(sub_messages)
-                # article_index 보정 (서브배치 오프셋)
-                for r in results:
-                    r.article_index += i
-                all_results.extend(results)
-            except Exception as e:
-                logger.warning("Gemini 감성 분석 실패 (batch %d~%d): %s", i, i + len(sub_articles), e)
-                gemini_failed = True
-                break
+        all_results: list[SentimentResult] = []
+        gemini_failed = False
+        try:
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for br in batch_results:
+                if isinstance(br, Exception):
+                    logger.warning("Gemini 서브배치 실패: %s", br)
+                    gemini_failed = True
+                else:
+                    all_results.extend(br)
+        except Exception as e:
+            logger.warning("Gemini gather 실패: %s", e)
+            gemini_failed = True
 
         if not gemini_failed and all_results:
-            logger.info("Gemini 감성 분석 완료: %d건", len(all_results))
+            logger.info("Gemini 감성 분석 완료: %d건 (병렬 %d배치)", len(all_results), len(tasks))
             return all_results
 
     # 2차: Anthropic 폴백
@@ -282,3 +295,217 @@ def _parse_results(text: str) -> list[dict]:
 def _clamp(value: float, min_v: float, max_v: float) -> float:
     """값을 범위 내로 제한."""
     return max(min_v, min(max_v, float(value)))
+
+
+# ── 종토방 전용 경량 감성분석 ──
+
+_DISC_PROMPT = """\
+한국 주식 종목토론방 게시글의 감성을 분석하세요.
+각 게시글에 대해 [감성점수, 확신도] 쌍을 반환하세요.
+- 감성점수: -1.0(매우 부정/하락) ~ +1.0(매우 긍정/상승). 중립은 0.0.
+- 확신도: 0.0(풍자/반어/애매) ~ 1.0(명확한 의견).
+
+응답은 JSON 2차원 배열만 출력. 입력 순서 동일.
+예: [[-0.3, 0.8], [0.5, 0.6], [0.0, 0.3]]
+
+설명 절대 금지. 배열만 출력."""
+
+
+async def analyze_discussion_batch(titles: list[str]) -> list[tuple[float, float]]:
+    """종토방 게시글 경량 감성분석 — 50건씩, [score, magnitude] 쌍 반환.
+
+    Returns:
+        [(score, magnitude), ...] 리스트 (입력과 동일 순서)
+    """
+    if not titles:
+        return []
+
+    lines = [f"{i}. {t[:80]}" for i, t in enumerate(titles)]
+    user_text = "\n".join(lines)
+
+    try:
+        from app.core.llm import chat_gemini
+        resp = await chat_gemini(
+            system=_DISC_PROMPT,
+            messages=[{"role": "user", "content": user_text}],
+            max_tokens=32000,
+            temperature=0.0,
+            json_mode=True,
+            caller="discussion.analyzer",
+        )
+        text = _repair_json(resp.text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            # 잘린 JSON 복구: 마지막 유효한 ] 위치까지 파싱
+            last_bracket = text.rfind("]")
+            if last_bracket > 0:
+                truncated = text[:last_bracket + 1]
+                # 열린 [ 짝 맞추기
+                if truncated.count("[") > truncated.count("]"):
+                    truncated += "]"
+                data = json.loads(truncated)
+                logger.info("종토방 감성분석: 잘린 JSON 복구 (%d chars)", last_bracket)
+            else:
+                raise
+        if isinstance(data, list):
+            result: list[tuple[float, float]] = []
+            for item in data[:len(titles)]:
+                if isinstance(item, list) and len(item) >= 2:
+                    result.append((_clamp(float(item[0]), -1, 1), _clamp(float(item[1]), 0, 1)))
+                elif isinstance(item, (int, float)):
+                    result.append((_clamp(float(item), -1, 1), 0.5))
+                else:
+                    result.append((0.0, 0.5))
+            return result
+    except Exception as e:
+        logger.warning("종토방 경량 감성분석 실패: %s", e)
+
+    return [(0.0, 0.5)] * len(titles)
+
+
+# ── 공시 전용 감성분석 ──
+
+_NOTICE_PROMPT = """\
+한국 주식시장 공시(공시, 시장조치, 수시공시 등)를 분석하세요.
+각 공시에 대해 해당 종목의 호재/악재 여부와 중요도를 판단하세요.
+
+각 공시에 대해 [감성점수, 중요도] 쌍을 반환하세요.
+- 감성점수: -1.0(강한 악재: 상장폐지, 횡령) ~ +1.0(강한 호재: 대규모 수주, 흑자전환). 중립은 0.0.
+- 중요도: 0.0(일상적 공시: 주총소집, 정기보고) ~ 1.0(중대 공시: 최대주주변경, 합병, 유상증자).
+
+응답은 JSON 2차원 배열만 출력. 입력 순서 동일.
+예: [[0.5, 0.8], [-0.7, 0.9], [0.0, 0.1]]
+설명 절대 금지. 배열만 출력."""
+
+
+async def analyze_notices_batch(
+    items: list[dict],
+) -> list[tuple[float, float]]:
+    """공시 배치 감성분석 — [score, impact] 쌍 반환.
+
+    Args:
+        items: [{"title": str, "content": str, "notice_type": str}] (최대 100건)
+    """
+    if not items:
+        return []
+
+    lines = []
+    for i, item in enumerate(items):
+        nt = item.get("notice_type", "")
+        title = item.get("title", "")[:100]
+        content = item.get("content", "")[:200]
+        lines.append(f"{i}. [{nt}] {title} | {content}")
+    user_text = "\n".join(lines)
+
+    try:
+        from app.core.llm import chat_gemini
+        resp = await chat_gemini(
+            system=_NOTICE_PROMPT,
+            messages=[{"role": "user", "content": user_text}],
+            max_tokens=16000,
+            temperature=0.0,
+            json_mode=True,
+            caller="notice.analyzer",
+        )
+        text = _repair_json(resp.text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            last = text.rfind("]")
+            if last > 0:
+                truncated = text[:last + 1]
+                if truncated.count("[") > truncated.count("]"):
+                    truncated += "]"
+                data = json.loads(truncated)
+            else:
+                raise
+        if isinstance(data, list):
+            result: list[tuple[float, float]] = []
+            for item_data in data[:len(items)]:
+                if isinstance(item_data, list) and len(item_data) >= 2:
+                    result.append((_clamp(float(item_data[0]), -1, 1), _clamp(float(item_data[1]), 0, 1)))
+                else:
+                    result.append((0.0, 0.1))
+            return result
+    except Exception as e:
+        logger.warning("공시 감성분석 실패: %s", e)
+
+    return [(0.0, 0.1)] * len(items)
+
+
+# ── 실시간 뉴스 전용 감성분석 (종목 추출 포함) ──
+
+_NEWS_PROMPT = """\
+한국 주식시장 뉴스 기사를 분석하세요.
+각 기사에 대해 [감성점수, 시장영향도, 관련종목코드] 를 반환하세요.
+
+- 감성점수: -1.0(매우 부정/하락) ~ +1.0(매우 긍정/상승). 중립 0.0.
+- 시장영향도: 0.0(관심 낮음) ~ 1.0(시장 전체 흔드는 뉴스).
+- 관련종목코드: 기사에서 언급된 한국 상장사의 6자리 종목코드를 콤마 구분. 없으면 빈 문자열.
+  예: "005930,000660" (삼성전자, SK하이닉스)
+
+응답은 JSON 2차원 배열만 출력. 입력 순서 동일.
+예: [[0.5, 0.7, "005930,000660"], [-0.3, 0.4, "035720"], [0.0, 0.2, ""]]
+설명 절대 금지. 배열만 출력."""
+
+
+async def analyze_news_batch(
+    items: list[dict],
+) -> list[tuple[float, float, str]]:
+    """뉴스 배치 감성분석 — [score, impact, symbols_csv] 반환.
+
+    Args:
+        items: [{"title": str, "subcontent": str, "office": str}] (최대 200건)
+    """
+    if not items:
+        return []
+
+    lines = []
+    for i, item in enumerate(items):
+        office = item.get("office", "")
+        title = item.get("title", "")[:100]
+        sub = item.get("subcontent", "")[:150]
+        lines.append(f"{i}. [{office}] {title} | {sub}")
+    user_text = "\n".join(lines)
+
+    try:
+        from app.core.llm import chat_gemini
+        resp = await chat_gemini(
+            system=_NEWS_PROMPT,
+            messages=[{"role": "user", "content": user_text}],
+            max_tokens=32000,
+            temperature=0.0,
+            json_mode=True,
+            caller="news_flash.analyzer",
+        )
+        text = _repair_json(resp.text)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            last = text.rfind("]")
+            if last > 0:
+                truncated = text[:last + 1]
+                if truncated.count("[") > truncated.count("]"):
+                    truncated += "]"
+                data = json.loads(truncated)
+            else:
+                raise
+        if isinstance(data, list):
+            result: list[tuple[float, float, str]] = []
+            for item_data in data[:len(items)]:
+                if isinstance(item_data, list) and len(item_data) >= 3:
+                    result.append((
+                        _clamp(float(item_data[0]), -1, 1),
+                        _clamp(float(item_data[1]), 0, 1),
+                        str(item_data[2]) if item_data[2] else "",
+                    ))
+                elif isinstance(item_data, list) and len(item_data) >= 2:
+                    result.append((_clamp(float(item_data[0]), -1, 1), _clamp(float(item_data[1]), 0, 1), ""))
+                else:
+                    result.append((0.0, 0.3, ""))
+            return result
+    except Exception as e:
+        logger.warning("뉴스 감성분석 실패: %s", e)
+
+    return [(0.0, 0.3, "")] * len(items)
