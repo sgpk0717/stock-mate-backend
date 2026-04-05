@@ -140,13 +140,21 @@ _OPTIONAL_FEATURE_BLOCKS: dict[str, tuple[str, list[str]]] = {
         "  retail_net_norm: 개인 순매수 / 거래량\n"
         "  foreign_buy_ratio: 외국인 매수비율 buy/(buy+sell) (0~1, 1=매수 일방)\n"
         "  inst_buy_ratio: 기관 매수비율 buy/(buy+sell)\n"
-        "  retail_buy_ratio: 개인 매수비율 buy/(buy+sell)",
+        "  retail_buy_ratio: 개인 매수비율 buy/(buy+sell)\n"
+        "  foreign_net_ema5: 외국인 순매수 5일 EMA (단기 추세)\n"
+        "  foreign_net_ema20: 외국인 순매수 20일 EMA (중기 추세)\n"
+        "  inst_net_ema5: 기관 순매수 5일 EMA\n"
+        "  inst_net_ema20: 기관 순매수 20일 EMA\n"
+        "  foreign_flow_accel: EMA5 - EMA20 (수급 가속도, 양수=매수 가속)\n"
+        "  smart_dumb_gap: 외국인 매수비율 - 개인 매수비율 (스마트머니 우위)",
         ["foreign_net_norm", "inst_net_norm", "foreign_buy_ratio"],
     ),
     "sentiment": (
         "- 뉴스 감성 (T+1 shift 적용, 룩어헤드 방지):\n"
         "  sentiment_score: 뉴스 감성 점수 (-1~+1)\n"
-        "  event_score: 이벤트 스코어 (감성 × 영향도 × log(기사수))",
+        "  event_score: 이벤트 스코어 (감성 × 영향도 × log(기사수))\n"
+        "  sentiment_ema3: 감성 점수 3일 EMA (단기 평활화)\n"
+        "  event_score_ema5: 이벤트 스코어 5일 EMA",
         ["sentiment_score", "event_score"],
     ),
     "sector": (
@@ -160,7 +168,9 @@ _OPTIONAL_FEATURE_BLOCKS: dict[str, tuple[str, list[str]]] = {
         "- 신용/공매도 (분봉: 전일 기준 T-1, 일봉: 당일):\n"
         "  margin_rate: 융자잔고율 (%)\n"
         "  short_balance_rate: 대차잔고비율 (%)\n"
-        "  short_volume_ratio: 공매도수량 / 거래량",
+        "  short_volume_ratio: 공매도수량 / 거래량\n"
+        "  short_asi_60: 공매도잔고 - 60일 이동평균 (이상 공매도 감지)\n"
+        "  margin_rate_roc10: 신용잔고율 10일 변화율 (레버리지 과열 감지)",
         ["margin_rate", "short_balance_rate", "short_volume_ratio"],
     ),
     "program_trading": (
@@ -174,7 +184,9 @@ _OPTIONAL_FEATURE_BLOCKS: dict[str, tuple[str, list[str]]] = {
         "  eps: 주당순이익\n"
         "  bps: 주당순자산\n"
         "  debt_to_equity: 부채비율 (%)\n"
-        "  operating_margin: 영업이익률 (%)",
+        "  operating_margin: 영업이익률 (%)\n"
+        "  days_since_disclosure: 공시일로부터 경과 일수 (staleness 모델링용)\n"
+        "  eps_fresh: eps × exp(-0.013 × days) (공시 후 감쇠된 EPS)",
         ["eps", "bps", "debt_to_equity", "operating_margin"],
     ),
     "vkospi": (
@@ -214,7 +226,10 @@ _OPTIONAL_FEATURE_BLOCKS: dict[str, tuple[str, list[str]]] = {
     "supply_events": (
         "- 수급 이벤트 (투자자 데이터 필요):\n"
         "  foreign_accumulate_5d: 외국인 5일 연속 순매수 (0/1)\n"
-        "  inst_accumulate_5d: 기관 5일 연속 순매수 (0/1)",
+        "  inst_accumulate_5d: 기관 5일 연속 순매수 (0/1)\n"
+        "  foreign_accum_10d: 외국인 10일간 순매수 일수 (0~10)\n"
+        "  foreign_accum_20d: 외국인 20일간 순매수 일수 (0~20)\n"
+        "  inst_accum_10d: 기관 10일간 순매수 일수 (0~10)",
         ["foreign_net_norm"],
     ),
 }
@@ -251,6 +266,10 @@ _CATEGORY_EXAMPLES: dict[str, list[dict]] = {
             "hypothesis": "장부가치 대비 저평가 + 외국인 매집 = 저평가 해소 기대",
             "formula": "book_yield * log(1 + abs(foreign_net_norm)) * sqrt(volume_ratio)",
         },
+        {
+            "hypothesis": "최신 실적(staleness 감쇠) + 기관 중기 순매수 추세 = 펀더멘털 모멘텀",
+            "formula": "eps_fresh * inst_net_ema20 / (1 + debt_to_equity / 100)",
+        },
     ],
     "supply_demand": [
         {
@@ -260,6 +279,10 @@ _CATEGORY_EXAMPLES: dict[str, list[dict]] = {
         {
             "hypothesis": "기관 매수 강도와 프로그램 매수 동시 증가 = 기관 주도 상승",
             "formula": "inst_buy_ratio * pgm_buy_ratio * vol_spike_5d",
+        },
+        {
+            "hypothesis": "외국인 수급 가속 + 공매도 이상 감소 = 숏커버 + 신규 매수 압력",
+            "formula": "foreign_flow_accel * (1 - short_asi_60) * vol_spike_5d",
         },
     ],
     "volatility": [
@@ -302,6 +325,18 @@ def _build_available_features(data_columns: set[str]) -> str:
         if any(c in data_columns for c in check_cols):
             blocks.append(desc)
     return "\n".join(blocks)
+
+# [2026-03-31] 딥리서치 R2 고유 권장 — FSA (Frequent Subtree Avoidance)
+# 프로세스: /deep-research → 2건 보고서 교차 분석
+# 변경/추가: 최근 세대에서 반복 발견되는 단순 수식 패턴을 LLM에 회피 지시
+_FSA_AVOID_PATTERNS = """
+주의: 다음 단순 수식 패턴은 이미 충분히 탐색되었으므로 사용하지 마세요:
+- 단순 역수: 1/rsi, 1/rsi_7, 1/rsi_21, -rsi, -rsi_7, -rsi_21
+- 단순 반전: -return_5d, -return_20d, -price_change_pct
+- 단순 수급: foreign_net_norm (단독), sign(foreign_net_norm) (단독)
+- 단순 섹터: -sector_rank, -sector_rel_strength (단독)
+이 피처들을 다른 피처와 비선형 조합하는 것은 허용합니다.
+"""
 
 _HYPOTHESIS_SYSTEM_TEMPLATE = """당신은 퀀트 리서처입니다. 한국 주식시장의 알파 팩터를 발견해야 합니다.
 
@@ -454,12 +489,15 @@ class EvolutionaryAlphaMiner:
         self.client = get_llm_client()
         # 실제 데이터 컬럼 기반 동적 피처 목록
         available_features = _build_available_features(set(data.columns))
+        # [2026-03-31] 딥리서치 R2 고유 권장 — FSA 회피 패턴을 시스템 프롬프트에 추가
+        # 프로세스: /deep-research → 2건 보고서 교차 분석
+        # 변경/추가: _FSA_AVOID_PATTERNS를 가설 생성/변이 프롬프트 모두에 결합
         self._hypothesis_system_prompt = _HYPOTHESIS_SYSTEM_TEMPLATE.format(
             available_features=available_features,
-        )
+        ) + _FSA_AVOID_PATTERNS
         self._mutation_system_prompt = _MUTATION_SYSTEM_TEMPLATE.format(
             available_features=available_features,
-        )
+        ) + _FSA_AVOID_PATTERNS
         logger.info(
             "Miner initialized: %d columns, interval=%s, features prompt length=%d",
             len(data.columns), interval, len(available_features),

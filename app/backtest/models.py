@@ -6,14 +6,17 @@ from datetime import date, datetime
 from sqlalchemy import (
     Date,
     DateTime,
+    Float,
+    ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSON, UUID
+from sqlalchemy.dialects.postgresql import JSON, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -59,3 +62,28 @@ class BacktestRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class BacktestDailySnapshot(Base):
+    """백테스트 거래별 일별 스냅샷 (보유기간 타임라인용)."""
+
+    __tablename__ = "backtest_daily_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "backtest_run_id", "trade_index", "snapshot_date",
+            name="uq_bds_run_trade_date",
+        ),
+        Index("idx_bds_run_trade", "backtest_run_id", "trade_index"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backtest_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("backtest_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    trade_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    close: Mapped[float | None] = mapped_column(Float, nullable=True)
+    variables: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

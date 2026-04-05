@@ -92,10 +92,12 @@ class ExternalFactoryClient(FactoryClient):
         import json as _json
         from app.core.redis import get_client as get_redis
 
-        # user_stopped 플래그 삭제 (start는 항상 플래그 초기화)
+        # user_stopped 플래그 체크 — 설정돼 있으면 시작 거부
         try:
             r = get_redis()
-            await r.delete("alpha:factory:user_stopped")
+            _flag = await r.get("alpha:factory:user_stopped")
+            if _flag and str(_flag) == "true":
+                return {"success": False, "blocked": True, "reason": "user_stopped"}
         except Exception:
             pass
 

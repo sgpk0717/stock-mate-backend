@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
 import asyncpg
 import polars as pl
 
 from app.core.config import settings
+from app.core.timezone import KST, to_kst
 
 logger = logging.getLogger(__name__)
-
-# DB의 TIMESTAMPTZ를 KST 거래일(date)로 변환하는 데 사용
-_KST = timezone(timedelta(hours=9))
 
 # 1분봉에서 집계 가능한 인터벌
 _DERIVED_FROM_1M = {"3m", "5m", "15m", "30m", "1h"}
@@ -179,7 +177,7 @@ async def _load_raw_candles(
             def _to_kst_datetime(dt_val: datetime) -> datetime:
                 if hasattr(dt_val, "astimezone"):
                     # 의도적 naive KST 변환: 백테스트 엔진이 naive datetime 기대
-                    return dt_val.astimezone(_KST).replace(tzinfo=None)
+                    return to_kst(dt_val).replace(tzinfo=None)
                 return dt_val
 
             data = {
@@ -195,7 +193,7 @@ async def _load_raw_candles(
             # 일봉: TIMESTAMPTZ → KST date
             def _to_kst_date(dt_val: datetime) -> date:
                 if hasattr(dt_val, "astimezone"):
-                    return dt_val.astimezone(_KST).date()
+                    return to_kst(dt_val).date()
                 if hasattr(dt_val, "date"):
                     return dt_val.date()
                 return dt_val
@@ -623,8 +621,8 @@ async def _load_program_trading(
         if not exists:
             return pl.DataFrame(schema={
                 "dt": pl.Date, "symbol": pl.Utf8,
-                "pgm_buy_qty": pl.Int64, "pgm_sell_qty": pl.Int64,
-                "pgm_net_qty": pl.Int64,
+                "pgm_buy_amount": pl.Int64, "pgm_sell_amount": pl.Int64,
+                "pgm_net_amount": pl.Int64,
             })
 
         clauses: list[str] = []
@@ -647,7 +645,7 @@ async def _load_program_trading(
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         query = f"""
             SELECT dt::date, symbol,
-                   pgm_buy_qty::bigint, pgm_sell_qty::bigint, pgm_net_qty::bigint
+                   pgm_buy_amount::bigint, pgm_sell_amount::bigint, pgm_net_amount::bigint
             FROM program_trading
             {where}
             ORDER BY symbol, dt
@@ -657,24 +655,93 @@ async def _load_program_trading(
         if not rows:
             return pl.DataFrame(schema={
                 "dt": pl.Date, "symbol": pl.Utf8,
-                "pgm_buy_qty": pl.Int64, "pgm_sell_qty": pl.Int64,
-                "pgm_net_qty": pl.Int64,
+                "pgm_buy_amount": pl.Int64, "pgm_sell_amount": pl.Int64,
+                "pgm_net_amount": pl.Int64,
             })
 
         return pl.DataFrame({
             "dt": [r["dt"] for r in rows],
             "symbol": [r["symbol"] for r in rows],
-            "pgm_buy_qty": [r["pgm_buy_qty"] for r in rows],
-            "pgm_sell_qty": [r["pgm_sell_qty"] for r in rows],
-            "pgm_net_qty": [r["pgm_net_qty"] for r in rows],
+            "pgm_buy_amount": [r["pgm_buy_amount"] for r in rows],
+            "pgm_sell_amount": [r["pgm_sell_amount"] for r in rows],
+            "pgm_net_amount": [r["pgm_net_amount"] for r in rows],
         })
     except Exception as e:
         logger.debug("program_trading load failed (table may not exist): %s", e)
         return pl.DataFrame(schema={
             "dt": pl.Date, "symbol": pl.Utf8,
-            "pgm_buy_qty": pl.Int64, "pgm_sell_qty": pl.Int64,
-            "pgm_net_qty": pl.Int64,
+            "pgm_buy_amount": pl.Int64, "pgm_sell_amount": pl.Int64,
+            "pgm_net_amount": pl.Int64,
         })
+    finally:
+        await conn.close()
+
+
+async def _load_discussion(
+    symbols: list[str] | None,
+    start_date: date | None,
+    end_date: date | None,
+) -> pl.DataFrame:
+    """종토방 시간별 집계 데이터 로드."""
+    _empty = pl.DataFrame(schema={
+        "dt": pl.Datetime("us", "Asia/Seoul"), "symbol": pl.Utf8,
+        "disc_count": pl.Int64, "disc_sentiment": pl.Float64,
+        "disc_positive_ratio": pl.Float64, "disc_negative_ratio": pl.Float64,
+        "disc_velocity": pl.Float64,
+    })
+    conn: asyncpg.Connection = await asyncpg.connect(_dsn())
+    try:
+        exists = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name='discussion_sentiment_hourly')"
+        )
+        if not exists:
+            return _empty
+
+        clauses: list[str] = []
+        params: list = []
+        idx = 1
+
+        if start_date is not None:
+            clauses.append(f"dt >= ${idx}")
+            params.append(start_date)
+            idx += 1
+        if end_date is not None:
+            clauses.append(f"dt <= ${idx}")
+            params.append(end_date)
+            idx += 1
+        if symbols is not None and len(symbols) > 0:
+            clauses.append(f"symbol = ANY(${idx})")
+            params.append(symbols)
+            idx += 1
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT dt, symbol, post_count, avg_sentiment,
+                   positive_ratio, negative_ratio, total_likes, total_dislikes
+            FROM discussion_sentiment_hourly
+            {where}
+            ORDER BY symbol, dt
+        """
+        rows = await conn.fetch(query, *params)
+        if not rows:
+            return _empty
+
+        df = pl.DataFrame({
+            "dt": [r["dt"] for r in rows],
+            "symbol": [r["symbol"] for r in rows],
+            "disc_count": [r["post_count"] for r in rows],
+            "disc_sentiment": [r["avg_sentiment"] for r in rows],
+            "disc_positive_ratio": [r["positive_ratio"] for r in rows],
+            "disc_negative_ratio": [r["negative_ratio"] for r in rows],
+        })
+        # disc_velocity: 전 시간 대비 게시글 수 변화율
+        df = df.with_columns(
+            (pl.col("disc_count") / pl.col("disc_count").shift(1).over("symbol").clip(1, None)).alias("disc_velocity")
+        )
+        return df
+    except Exception as e:
+        logger.debug("discussion load failed: %s", e)
+        return _empty
     finally:
         await conn.close()
 
@@ -690,6 +757,7 @@ async def load_enriched_candles(
     include_sector: bool = True,
     include_margin_short: bool = True,
     include_program_trading: bool = True,
+    include_discussion: bool = True,
 ) -> pl.DataFrame:
     """풍부화된 캔들 데이터: OHLCV + 투자자 수급 + DART 재무 + 뉴스 감성 + 섹터 + 신용/공매도 + 프로그램 매매.
 
@@ -700,91 +768,72 @@ async def load_enriched_candles(
     if df.is_empty():
         return df
 
-    # 분봉인 경우 dt가 Datetime. 일별 데이터 JOIN 시 date 컬럼이 필요.
+    # ── Phase 1: DB 조회 (async — 이벤트 루프 차단 안 함) ──
     is_intraday = interval != "1d"
-    if is_intraday:
-        df = df.with_columns(pl.col("dt").cast(pl.Date).alias("dt_date"))
 
-    # 투자자 수급 데이터 JOIN (분봉: T-1 전일 기준, 일봉: 당일)
-    if include_investor:
-        inv_df = await _load_investor_trading(symbols, start_date, end_date)
+    # Phase 1: DB 조회 (async — 병렬 가능)
+    inv_df = await _load_investor_trading(symbols, start_date, end_date) if include_investor else pl.DataFrame()
+    dart_df = await _load_dart_financials(symbols, start_date, end_date) if include_dart else pl.DataFrame()
+    sent_df = await _load_sentiment(symbols, start_date, end_date) if include_sentiment else pl.DataFrame()
+    sector_df = await _load_sector_mapping(symbols) if include_sector else pl.DataFrame()
+    ms_df = await _load_margin_short(symbols, start_date, end_date) if include_margin_short else pl.DataFrame()
+    pgm_df = await _load_program_trading(symbols, start_date, end_date) if include_program_trading else pl.DataFrame()
+    disc_df = await _load_discussion(symbols, start_date, end_date) if include_discussion else pl.DataFrame()
+
+    # Phase 2: Polars JOIN/enrich (CPU 바운드 — to_thread로 이벤트 루프 해방)
+    def _enrich_sync(
+        df: pl.DataFrame,
+        inv_df: pl.DataFrame, dart_df: pl.DataFrame, sent_df: pl.DataFrame,
+        sector_df: pl.DataFrame, ms_df: pl.DataFrame, pgm_df: pl.DataFrame,
+        disc_df: pl.DataFrame,
+        is_intraday: bool,
+    ) -> pl.DataFrame:
+        if is_intraday:
+            df = df.with_columns(pl.col("dt").cast(pl.Date).alias("dt_date"))
+
+        # 투자자 수급
         if not inv_df.is_empty():
             if is_intraday:
-                # T-1 shift: 전일 투자자 데이터를 오늘 분봉에 매칭 (look-ahead bias 방지)
                 inv_shifted = inv_df.with_columns(
                     (pl.col("dt").cast(pl.Date) + pl.duration(days=1)).alias("dt_next")
                 )
                 df = df.join(inv_shifted, left_on=["symbol", "dt_date"], right_on=["symbol", "dt_next"], how="left")
                 if "dt_right" in df.columns:
                     df = df.drop("dt_right")
-                if "dt" in df.columns and df["dt"].dtype == inv_df["dt"].dtype:
-                    pass  # 원본 dt 유지
             else:
                 df = df.join(inv_df, on=["symbol", "dt"], how="left")
-            for col in [
-                "foreign_net", "inst_net", "retail_net",
-                "foreign_buy_vol", "foreign_sell_vol",
-                "inst_buy_vol", "inst_sell_vol",
-                "retail_buy_vol", "retail_sell_vol",
-            ]:
-                if col in df.columns:
-                    df = df.with_columns(pl.col(col).fill_null(0).alias(col))
+            # NaN 전파: enrichment 결측은 null 유지 (0-fill 제거)
+            # GP가 0↔비제로 구조적 단절을 허위 알파로 착각하는 문제 방지
             logger.info("Enriched candles with investor trading data (%d rows)", inv_df.height)
-        await asyncio.sleep(0)  # yield to event loop
 
-    # DART 재무 데이터 JOIN (join_asof: 가장 최근 공시)
-    if include_dart:
-        dart_df = await _load_dart_financials(symbols, start_date, end_date)
+        # DART 재무
         if not dart_df.is_empty():
             join_col = "dt_date" if is_intraday else "dt"
             df = df.sort(["symbol", join_col])
             dart_df = dart_df.sort(["symbol", "disclosure_date"])
-            df = df.join_asof(
-                dart_df,
-                left_on=join_col,
-                right_on="disclosure_date",
-                by="symbol",
-                strategy="backward",
-            )
+            df = df.join_asof(dart_df, left_on=join_col, right_on="disclosure_date", by="symbol", strategy="backward")
             logger.info("Enriched candles with DART financials (%d records)", dart_df.height)
-        else:
-            logger.info("No DART financial data found — adding placeholder columns")
-        # 컬럼이 없으면 0.0 placeholder 추가
         for col in ["eps", "bps", "operating_margin", "debt_to_equity"]:
             if col not in df.columns:
-                df = df.with_columns(pl.lit(0.0).alias(col))
-            else:
-                df = df.with_columns(pl.col(col).fill_null(0.0).alias(col))
-        await asyncio.sleep(0)  # yield to event loop
+                df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
-    # 뉴스 감성 데이터 JOIN
-    if include_sentiment:
-        sent_df = await _load_sentiment(symbols, start_date, end_date)
+        # 뉴스 감성
         if not sent_df.is_empty():
             if is_intraday:
                 df = df.join(sent_df, left_on=["symbol", "dt_date"], right_on=["symbol", "dt"], how="left")
             else:
                 df = df.join(sent_df, on=["symbol", "dt"], how="left")
             logger.info("Enriched candles with news sentiment (%d rows)", sent_df.height)
-        else:
-            logger.info("No news sentiment data found — adding placeholder columns")
-        # 컬럼이 없으면 0.0 placeholder 추가 (데이터 부재 시에도 수식 에러 방지)
         for col in ["sentiment_score", "article_count", "event_score"]:
             if col not in df.columns:
-                df = df.with_columns(pl.lit(0.0).alias(col))
-            else:
-                df = df.with_columns(pl.col(col).fill_null(0.0).alias(col))
+                df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
-    # 섹터 ID 매핑 JOIN
-    if include_sector:
-        sector_df = await _load_sector_mapping(symbols)
+        # 섹터 매핑
         if not sector_df.is_empty():
             df = df.join(sector_df, on="symbol", how="left")
             logger.info("Enriched candles with sector mapping (%d symbols)", sector_df.height)
 
-    # 신용잔고/공매도 JOIN (분봉: T-1 전일 기준, 일봉: 당일)
-    if include_margin_short:
-        ms_df = await _load_margin_short(symbols, start_date, end_date)
+        # 신용/공매도
         if not ms_df.is_empty():
             if is_intraday:
                 ms_shifted = ms_df.with_columns(
@@ -795,15 +844,10 @@ async def load_enriched_candles(
                     df = df.drop("dt_right")
             else:
                 df = df.join(ms_df, on=["symbol", "dt"], how="left")
-            for col in ["margin_balance", "margin_rate", "short_volume", "short_balance", "short_balance_rate"]:
-                if col in df.columns:
-                    df = df.with_columns(pl.col(col).fill_null(0).alias(col))
+            # NaN 전파: 신용/공매도 결측 null 유지
             logger.info("Enriched candles with margin/short data (%d rows)", ms_df.height)
-        await asyncio.sleep(0)  # yield to event loop
 
-    # 프로그램 매매 JOIN (분봉: T-1 전일 기준, 일봉: 당일)
-    if include_program_trading:
-        pgm_df = await _load_program_trading(symbols, start_date, end_date)
+        # 프로그램 매매
         if not pgm_df.is_empty():
             if is_intraday:
                 pgm_shifted = pgm_df.with_columns(
@@ -815,21 +859,59 @@ async def load_enriched_candles(
             else:
                 df = df.join(pgm_df, on=["symbol", "dt"], how="left")
             logger.info("Enriched candles with program trading (%d rows)", pgm_df.height)
-        else:
-            logger.info("No program trading data found — adding placeholder columns")
-        # 컬럼이 없으면 0 placeholder 추가
-        for col in ["pgm_buy_qty", "pgm_sell_qty", "pgm_net_qty"]:
+        for col in ["pgm_buy_amount", "pgm_sell_amount", "pgm_net_amount"]:
             if col not in df.columns:
-                df = df.with_columns(pl.lit(0).alias(col))
+                df = df.with_columns(pl.lit(None).cast(pl.Int64).alias(col))
+
+        # 종토방 여론
+        if not disc_df.is_empty():
+            if is_intraday:
+                # 분봉: dt의 시간(hour) 기준 JOIN — timezone 통일
+                _disc_tz = disc_df["dt"].dtype
+                df = df.with_columns(
+                    pl.col("dt").dt.truncate("1h").alias("dt_hour")
+                )
+                # disc_df의 dt가 timezone-aware이면 dt_hour도 맞춤
+                if hasattr(_disc_tz, "time_zone") and _disc_tz.time_zone:
+                    df = df.with_columns(pl.col("dt_hour").dt.replace_time_zone(_disc_tz.time_zone))
+                df = df.join(disc_df, left_on=["symbol", "dt_hour"], right_on=["symbol", "dt"], how="left")
+                if "dt_right" in df.columns:
+                    df = df.drop("dt_right")
+                df = df.drop("dt_hour")
             else:
-                df = df.with_columns(pl.col(col).fill_null(0).alias(col))
+                # 일봉: disc_df에서 일별 합산 후 T+1 shift JOIN
+                disc_daily = disc_df.group_by(
+                    [pl.col("symbol"), pl.col("dt").cast(pl.Date).alias("disc_date")]
+                ).agg([
+                    pl.col("disc_count").sum(),
+                    pl.col("disc_sentiment").mean(),
+                    pl.col("disc_positive_ratio").mean(),
+                    pl.col("disc_negative_ratio").mean(),
+                ])
+                # T+1 shift (룩어헤드 편향 방지)
+                disc_daily = disc_daily.with_columns(
+                    (pl.col("disc_date").cast(pl.Date) + pl.duration(days=1)).alias("dt_shifted")
+                )
+                df = df.join(
+                    disc_daily.drop("disc_date"),
+                    left_on=["symbol", "dt"],
+                    right_on=["symbol", "dt_shifted"],
+                    how="left",
+                )
+            logger.info("Enriched candles with discussion (%d rows)", disc_df.height)
+        for col in ["disc_count", "disc_sentiment", "disc_positive_ratio", "disc_negative_ratio", "disc_velocity"]:
+            if col not in df.columns:
+                df = df.with_columns(pl.lit(None).cast(pl.Float64).alias(col))
 
-    # 분봉 헬퍼 컬럼 제거
-    if is_intraday and "dt_date" in df.columns:
-        df = df.drop("dt_date")
+        # 정리
+        if is_intraday and "dt_date" in df.columns:
+            df = df.drop("dt_date")
+        df = df.sort(["symbol", "dt"])
+        return df
 
-    # 원래 정렬 복원
-    df = df.sort(["symbol", "dt"])
+    df = await asyncio.to_thread(
+        _enrich_sync, df, inv_df, dart_df, sent_df, sector_df, ms_df, pgm_df, disc_df, is_intraday,
+    )
 
     return df
 

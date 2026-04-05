@@ -10,8 +10,6 @@ Round 3 (2026-03-21): IC 정규화 추가 + ICIR 가중치 강화.
 
 from __future__ import annotations
 
-import math
-
 # Turnover 하한: 이보다 낮으면 Buy-and-Hold (스캘핑 무용) → 즉시 탈락
 _TURNOVER_FLOOR = 0.005  # 0.5% (일봉 가치팩터 턴오버 1~2% 허용, 딥리서치 권고)
 
@@ -36,6 +34,8 @@ def compute_composite_fitness(
     w_complexity: float = 0.10,
     max_depth: int = 10,
     max_size: int = 30,
+    coverage_pct: float = 1.0,
+    coverage_exp: float = 0.4,
 ) -> float:
     """다목적 복합 적합도. 높을수록 좋음.
 
@@ -50,6 +50,8 @@ def compute_composite_fitness(
     max_drawdown : 최대 낙폭 (음수, 낮을수록 나쁨, 패널티)
     w_ic, w_icir, w_sharpe, w_mdd, w_turnover, w_complexity : 가중치
     max_depth, max_size : 정규화 기준
+    coverage_pct : IC 유효 비율 (0~1, 1.0=전체 기간 데이터 존재)
+    coverage_exp : 커버리지 패널티 지수 (0.4=딥리서치 권고)
     """
     # ── Hard filter: Buy-and-Hold 퇴화 팩터 즉시 제거 ──
     # 스캘핑 목적상 최소 턴오버 미달 팩터는 무조건 탈락
@@ -73,15 +75,27 @@ def compute_composite_fitness(
     size_norm = tree_size / max(max_size, 1)
     complexity_penalty = (depth_norm + size_norm) / 2.0
 
-    # Turnover 로그 스케일: 선형 패널티 → 로그 패널티
-    # 저turnover(0.05)와 고turnover(0.9) 차이를 완화하여 IC 높은 팩터가 불이익 안 받도록
-    turnover_penalty = -math.log(max(turnover, 0.05))  # log(0.05)≈-3, log(1.0)=0
+    # [2026-03-31] 딥리서치 R1+R2 공통 권장 — 턴오버 패널티 선형화
+    # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+    # 변경: -log(max(T, 0.05)) → -max(0, T-0.005)*15 | 판단: log 패널티는 저턴오버(buy-and-hold) 팩터를 과도하게 선호. 15bp = 한국 시장 round-trip 비용
+    turnover_penalty = -max(0, turnover - 0.005) * 15
 
-    return (
+    raw_fitness = (
         ic_norm * w_ic
         + icir * w_icir
         + sharpe_norm * w_sharpe
         - mdd_norm * w_mdd
-        + turnover_penalty * w_turnover  # 로그 스케일 (음수값 → 패널티)
+        + turnover_penalty * w_turnover  # 선형 스케일 (음수값 → 패널티)
         - complexity_penalty * w_complexity
     )
+
+    # 커버리지 패널티: 데이터가 부분적으로만 존재하는 팩터의 적합도 하향
+    # coverage=1.0 → 1.0 (무패널티), 0.5 → 0.76, 0.01 → 0.16
+    if coverage_pct < 1.0 and coverage_exp > 0:
+        # [2026-03-31] 딥리서치 R2 권장 — 커버리지 floor 0.7 적용
+        # 프로세스: /deep-research → 2건 보고서 교차 분석 → 공통 Tier 1 권장
+        # 변경: max(0.01, pct) → max(0.7, pct) | 판단: 데이터 50% 미만이어도 floor 0.7로 패널티 상한 제한. 뉴스/프로그램 팩터 차단 해소
+        coverage_factor = max(0.7, coverage_pct) ** coverage_exp
+        return raw_fitness * coverage_factor
+
+    return raw_fitness

@@ -217,6 +217,7 @@ class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
     equity_curve: list[dict] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    daily_snapshots_raw: list[dict] | None = field(default=None, repr=False)
 
 
 # ── 확신도 & 포지션 사이징 ────────────────────────────────

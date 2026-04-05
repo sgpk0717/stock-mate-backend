@@ -150,6 +150,12 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
     "sentiment_score": "sentiment_score",
     "article_count": "article_count",
     "event_score": "event_score",
+    # 종토방 여론 피처 (discussion_sentiment_hourly에서 제공)
+    "disc_count": "disc_count",
+    "disc_sentiment": "disc_sentiment",
+    "disc_positive_ratio": "disc_positive_ratio",
+    "disc_negative_ratio": "disc_negative_ratio",
+    "disc_velocity": "disc_velocity",
     # 섹터 횡단면 피처
     "sector_return": "sector_return",
     "sector_rel_strength": "sector_rel_strength",
@@ -188,6 +194,31 @@ NAMED_VARIABLE_MAP: dict[str, str] = {
     # 수급 이벤트 (enriched candles에서 제공)
     "foreign_accumulate_5d": "foreign_accumulate_5d",
     "inst_accumulate_5d": "inst_accumulate_5d",
+
+    # ── 파생 피처: 투자자 수급 EMA ──
+    "foreign_net_ema5": "foreign_net_ema5",
+    "foreign_net_ema20": "foreign_net_ema20",
+    "inst_net_ema5": "inst_net_ema5",
+    "inst_net_ema20": "inst_net_ema20",
+    "foreign_flow_accel": "foreign_flow_accel",
+    "smart_dumb_gap": "smart_dumb_gap",
+
+    # ── 파생 피처: 재무 staleness decay ──
+    "days_since_disclosure": "days_since_disclosure",
+    "eps_fresh": "eps_fresh",
+
+    # ── 파생 피처: 뉴스 감성 EMA ──
+    "sentiment_ema3": "sentiment_ema3",
+    "event_score_ema5": "event_score_ema5",
+
+    # ── 파생 피처: 신용/공매도 이격도 ──
+    "short_asi_60": "short_asi_60",
+    "margin_rate_roc10": "margin_rate_roc10",
+
+    # ── 파생 피처: 수급 누적 확장 ──
+    "foreign_accum_10d": "foreign_accum_10d",
+    "foreign_accum_20d": "foreign_accum_20d",
+    "inst_accum_10d": "inst_accum_10d",
 }
 
 # 모든 유효한 변수명 합집합
@@ -229,18 +260,29 @@ _FAMILY_DEFINITIONS: dict[str, list[str]] = {
         "foreign_net_norm", "inst_net_norm", "retail_net_norm",
         "foreign_buy_ratio", "inst_buy_ratio", "retail_buy_ratio",
         "foreign_accumulate_5d", "inst_accumulate_5d",
+        "foreign_net_ema5", "foreign_net_ema20",
+        "inst_net_ema5", "inst_net_ema20",
+        "foreign_flow_accel", "smart_dumb_gap",
+        "foreign_accum_10d", "foreign_accum_20d", "inst_accum_10d",
     ],
     "fundamental": [
         "eps", "bps", "operating_margin", "debt_to_equity",
         "earnings_yield", "book_yield",
+        "days_since_disclosure", "eps_fresh",
     ],
     "sentiment": [
         "sentiment_score", "article_count", "event_score",
+        "sentiment_ema3", "event_score_ema5",
+    ],
+    "discussion": [
+        "disc_count", "disc_sentiment", "disc_positive_ratio",
+        "disc_negative_ratio", "disc_velocity",
     ],
     "market_micro": [
         "margin_rate", "short_balance_rate", "short_volume_ratio",
         "pgm_net_norm", "pgm_buy_ratio",
         "sector_return", "sector_rel_strength", "sector_rank",
+        "short_asi_60", "margin_rate_roc10",
     ],
 }
 
@@ -497,6 +539,16 @@ _ALPHA_FEATURE_COLUMNS = {
     "range_breakout", "range_breakdown",
     "rsi_oversold_bounce", "macd_cross_up", "bb_squeeze", "bb_breakout_upper",
     "foreign_accumulate_5d", "inst_accumulate_5d",
+    # 파생 피처 (Phase 3)
+    "foreign_net_ema5", "foreign_net_ema20", "inst_net_ema5", "inst_net_ema20",
+    "foreign_flow_accel", "smart_dumb_gap",
+    "days_since_disclosure", "eps_fresh",
+    "sentiment_ema3", "event_score_ema5",
+    "short_asi_60", "margin_rate_roc10",
+    "foreign_accum_10d", "foreign_accum_20d", "inst_accum_10d",
+    # 종토방 여론 (discussion_sentiment_hourly에서 제공)
+    "disc_count", "disc_sentiment", "disc_positive_ratio",
+    "disc_negative_ratio", "disc_velocity",
 }
 
 
@@ -655,7 +707,7 @@ def ensure_alpha_features(
     existing = set(df.columns)
 
     # ── 전이적 의존성 확장 ──
-    # sector 피처는 price_change_pct → sector_return → sector_rel_strength 체인 필요
+    # 파생 피처가 필요하면 원본 피처도 함께 계산해야 함
     if required_cols is not None:
         expanded = set(required_cols)
         _SECTOR_COLS = {"sector_return", "sector_rel_strength", "sector_rank"}
@@ -663,6 +715,29 @@ def ensure_alpha_features(
             expanded.add("price_change_pct")
         if "sector_rel_strength" in expanded:
             expanded.add("sector_return")
+        # 파생 피처 의존성 체인
+        _DEPS = {
+            "smart_dumb_gap": {"foreign_buy_ratio", "retail_buy_ratio"},
+            "foreign_flow_accel": {"foreign_net_ema5", "foreign_net_ema20"},
+            "foreign_net_ema5": {"foreign_net_norm"},
+            "foreign_net_ema20": {"foreign_net_norm"},
+            "inst_net_ema5": {"inst_net_norm"},
+            "inst_net_ema20": {"inst_net_norm"},
+            "eps_fresh": {"days_since_disclosure"},
+            "foreign_accumulate_5d": {"foreign_net_norm"},
+            "inst_accumulate_5d": {"inst_net_norm"},
+            "foreign_accum_10d": {"foreign_net_norm"},
+            "foreign_accum_20d": {"foreign_net_norm"},
+            "inst_accum_10d": {"inst_net_norm"},
+        }
+        changed = True
+        while changed:
+            changed = False
+            for col in list(expanded):
+                for dep in _DEPS.get(col, set()):
+                    if dep not in expanded:
+                        expanded.add(dep)
+                        changed = True
         required_cols = expanded
 
     def _need(col: str) -> bool:
@@ -911,6 +986,30 @@ def ensure_alpha_features(
                 ).alias(ratio_col)
             )
 
+    # ── 투자자 수급 EMA 파생 피처 ──
+    existing = set(df.columns)
+    for src_col, periods in [
+        ("foreign_net_norm", [5, 20]),
+        ("inst_net_norm", [5, 20]),
+    ]:
+        if src_col in existing:
+            prefix = src_col.replace("_net_norm", "_net_ema")
+            for p in periods:
+                alias = f"{prefix}{p}"
+                if _need(alias):
+                    df = df.with_columns(
+                        pl.col(src_col).ewm_mean(span=p, ignore_nulls=True).alias(alias)
+                    )
+    existing = set(df.columns)
+    if _need("foreign_flow_accel") and "foreign_net_ema5" in existing and "foreign_net_ema20" in existing:
+        df = df.with_columns(
+            (pl.col("foreign_net_ema5") - pl.col("foreign_net_ema20")).alias("foreign_flow_accel")
+        )
+    if _need("smart_dumb_gap") and "foreign_buy_ratio" in existing and "retail_buy_ratio" in existing:
+        df = df.with_columns(
+            (pl.col("foreign_buy_ratio") - pl.col("retail_buy_ratio")).alias("smart_dumb_gap")
+        )
+
     # ── DART 재무 파생 피처 (enriched candles에서 raw 컬럼이 존재할 때만) ──
     existing = set(df.columns)
     if _need("earnings_yield") and "eps" in existing:
@@ -920,6 +1019,21 @@ def ensure_alpha_features(
     if _need("book_yield") and "bps" in existing:
         df = df.with_columns(
             (pl.col("bps") / pl.col("close").clip(lower_bound=1.0)).alias("book_yield")
+        )
+
+    # ── DART 재무 staleness decay ──
+    existing = set(df.columns)
+    if _need("days_since_disclosure") and "disclosure_date" in existing:
+        df = df.with_columns(
+            (pl.col("dt").cast(pl.Date) - pl.col("disclosure_date")).dt.total_days()
+            .cast(pl.Float64)
+            .alias("days_since_disclosure")
+        )
+    existing = set(df.columns)
+    if _need("eps_fresh") and "eps" in existing and "days_since_disclosure" in existing:
+        df = df.with_columns(
+            (pl.col("eps") * (-0.013 * pl.col("days_since_disclosure")).exp())
+            .alias("eps_fresh")
         )
 
     # ── 섹터 횡단면 모멘텀 (sector_id + price_change_pct 필요) ──
@@ -955,19 +1069,36 @@ def ensure_alpha_features(
 
     # ── 프로그램 매매 파생 피처 ──
     existing = set(df.columns)
-    if "pgm_net_qty" in existing:
+    if "pgm_net_amount" in existing:
         if _need("pgm_net_norm"):
             df = df.with_columns(
-                (pl.col("pgm_net_qty").cast(pl.Float64) / pl.col("volume").cast(pl.Float64).clip(lower_bound=1.0))
+                (pl.col("pgm_net_amount").cast(pl.Float64) / pl.col("volume").cast(pl.Float64).clip(lower_bound=1.0))
                 .alias("pgm_net_norm")
             )
-        if _need("pgm_buy_ratio") and "pgm_buy_qty" in existing:
+        if _need("pgm_buy_ratio") and "pgm_buy_amount" in existing:
             df = df.with_columns(
                 (
-                    pl.col("pgm_buy_qty").cast(pl.Float64)
-                    / (pl.col("pgm_buy_qty") + pl.col("pgm_sell_qty")).cast(pl.Float64).clip(lower_bound=1.0)
+                    pl.col("pgm_buy_amount").cast(pl.Float64)
+                    / (pl.col("pgm_buy_amount") + pl.col("pgm_sell_amount")).cast(pl.Float64).clip(lower_bound=1.0)
                 ).alias("pgm_buy_ratio")
             )
+
+    # ── 신용/공매도 이격도 + 변화율 ──
+    existing = set(df.columns)
+    if _need("short_asi_60") and "short_balance_rate" in existing:
+        df = df.with_columns(
+            (
+                pl.col("short_balance_rate")
+                - pl.col("short_balance_rate").rolling_mean(window_size=60, min_periods=10)
+            ).alias("short_asi_60")
+        )
+    if _need("margin_rate_roc10") and "margin_rate" in existing:
+        df = df.with_columns(
+            (
+                (pl.col("margin_rate") - pl.col("margin_rate").shift(10))
+                / pl.col("margin_rate").shift(10).clip(lower_bound=1e-10)
+            ).alias("margin_rate_roc10")
+        )
 
     # ── VKOSPI 대용 (KOSPI200 실현변동성) ──
     # stock_candles의 VKOSPI_PROXY 심볼에서 dt 기준 join
@@ -1145,6 +1276,30 @@ def ensure_alpha_features(
             .eq(5)
             .cast(pl.Int8)
             .alias("inst_accumulate_5d")
+        )
+
+    # ── 수급 누적 확장 (10일, 20일) ──
+    for src, alias_prefix in [("foreign_net_norm", "foreign_accum"), ("inst_net_norm", "inst_accum")]:
+        if src in existing:
+            for window in [10, 20]:
+                alias = f"{alias_prefix}_{window}d"
+                if _need(alias):
+                    df = df.with_columns(
+                        (pl.col(src) > 0)
+                        .cast(pl.Int8)
+                        .rolling_sum(window_size=window, min_periods=window)
+                        .alias(alias)
+                    )
+
+    # ── 뉴스 감성 EMA ──
+    existing = set(df.columns)
+    if _need("sentiment_ema3") and "sentiment_score" in existing:
+        df = df.with_columns(
+            pl.col("sentiment_score").ewm_mean(span=3, ignore_nulls=True).alias("sentiment_ema3")
+        )
+    if _need("event_score_ema5") and "event_score" in existing:
+        df = df.with_columns(
+            pl.col("event_score").ewm_mean(span=5, ignore_nulls=True).alias("event_score_ema5")
         )
 
     return df

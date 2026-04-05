@@ -110,10 +110,25 @@ class AlphaFactorBacktestRequest(BaseModel):
     rebalance_freq: str = Field("weekly", pattern=r"^(every_bar|hourly|daily|weekly|monthly)$")
     band_threshold: float = Field(0.05, ge=0.0, le=0.2)  # 밴드 리밸런싱 임계값
     stop_loss_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포지션 손절 (0=비활성, 0.05=5%)
+    trailing_stop_pct: float = Field(0.0, ge=0.0, le=0.5)  # 트레일링 스탑 (0=비활성, 0.20=고점 대비 20%)
     max_drawdown_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포트폴리오 서킷 브레이커 (0=비활성)
+    buy_commission: float | None = Field(None, ge=0.0, le=0.01)  # 매수 수수료 (None=인터벌 기본값)
+    sell_commission: float | None = Field(None, ge=0.0, le=0.01)  # 매도 수수료+세금 (None=인터벌 기본값)
+    slippage_pct: float | None = Field(None, ge=0.0, le=0.01)  # 슬리피지 (None=인터벌 기본값)
     eod_liquidation: bool = Field(True, description="장중 단타: 매일 장 마감 시 전량 청산")
     skip_opening_minutes: int = Field(0, ge=0, le=120, description="장 시작 N분 회피 (0=비활성, 30=09:30부터 리밸런싱)")
     engine: str = Field("loop", pattern=r"^(loop|vectorbt)$", description="시뮬레이션 엔진 (loop=기본, vectorbt=Numba 가속)")
+    # 듀얼 팩터 모드
+    intraday_factor_id: str | None = Field(None, description="5분봉 팩터 ID (None이면 단일 팩터 모드)")
+    intraday_interval: str = Field("5m", pattern=r"^(1m|3m|5m|15m|30m|1h)$", description="분봉 인터벌")
+    intraday_entry_threshold: float = Field(0.8, ge=0.5, le=1.0, description="분봉 팩터 진입 기준 (랭크 상위)")
+    intraday_exit_threshold: float = Field(0.2, ge=0.0, le=0.5, description="분봉 팩터 퇴출 기준 (랭크 하위)")
+    # 지정가 매매 시뮬레이션
+    use_limit_orders: bool = Field(True, description="지정가 매매 시뮬레이션 (False=즉시 체결)")
+    strict_fill: bool = Field(False, description="Strict 모드 (한 호가 관통 시에만 체결)")
+    limit_ttl_bars: int = Field(2, ge=1, le=10, description="미체결 대기 봉 수")
+    # 보유기간 타임라인
+    collect_daily_snapshots: bool = Field(False, description="보유기간 일별 스냅샷 수집 (타임라인용)")
 
 
 class CausalValidationResponse(BaseModel):
@@ -164,6 +179,9 @@ class AlphaFactoryStatusResponse(BaseModel):
     operator_stats: dict | None = None
     last_funnel: dict | None = None
     user_stopped: bool = False
+    log_lines: list[str] = []
+    causal_pending_count: int = 0
+    causal_sweep_job_id: str | None = None
 
 
 class CompositeFactorBuildRequest(BaseModel):
@@ -322,3 +340,64 @@ class FactorChatSessionResponse(BaseModel):
     status: str
     created_at: str
     updated_at: str
+
+
+# ── 마이닝 리포트 대시보드 ──
+
+class FunnelData(BaseModel):
+    attempted: int = 0
+    eval_ok: int = 0
+    ic_pass: int = 0
+    wf_overfit: int = 0
+    sharpe_fail: int = 0
+    cpcv_candidates: int = 0
+
+class CoverageTier(BaseModel):
+    count: int = 0
+    avg_pct: float = 0.0
+
+class CoverageHealth(BaseModel):
+    tier_a: CoverageTier = CoverageTier()
+    tier_b: CoverageTier = CoverageTier()
+    tier_c: CoverageTier = CoverageTier()
+
+class IcTrendPoint(BaseModel):
+    gen: int
+    avg_ic: float
+    best_ic: float
+    avg_icir: float = 0.0
+    factor_count: int = 0
+
+class DiscoveredFactorSummary(BaseModel):
+    expression: str
+    ic_mean: float = 0.0
+    icir: float = 0.0
+    sharpe: float = 0.0
+    max_drawdown: float = 0.0
+    turnover: float = 0.0
+    hypothesis: str | None = None
+
+class MiningReportResponse(BaseModel):
+    generation: int = 0
+    cycle_num: int = 0
+    elapsed: str = ""
+    universe: str = "KOSPI200"
+    data_interval: str = "1d"
+    ic_threshold: float = 0.03
+    total_discovered: int = 0
+    funnel: FunnelData = FunnelData()
+    operator_stats: dict[str, dict] = {}
+    discovered_factors: list[DiscoveredFactorSummary] = []
+    family_distribution: dict[str, float] = {}
+    family_delta: dict[str, float] = {}
+    derived_feature_usage: dict[str, int] = {}
+    coverage_health: CoverageHealth = CoverageHealth()
+    ic_trend: list[IcTrendPoint] = []
+
+
+class MiningReportsRangeResponse(BaseModel):
+    reports: list[MiningReportResponse] = []
+    total: int = 0
+    interval: str = "1d"
+    min_gen: int = 0       # 해당 인터벌의 리포트 최소 세대
+    max_gen: int = 0       # 해당 인터벌의 리포트 최대 세대

@@ -26,6 +26,18 @@ class Trade:
     exit_reason_detail: list[dict] | None = None
     entry_snapshot: dict | None = None
     exit_snapshot: dict | None = None
+    # ── 듀얼 팩터 상세 ──
+    intraday_rank_at_entry: float | None = None
+    intraday_rank_at_exit: float | None = None
+    daily_rank_at_entry: float | None = None
+    daily_rank_at_exit: float | None = None
+    used_intraday_factor: bool = False
+    # ── 지정가 상세 ──
+    order_type: str = "market"
+    limit_price: float | None = None
+    fill_price: float | None = None
+    wait_bars: int = 0
+    fill_method: str = ""
 
 
 def compute_metrics(

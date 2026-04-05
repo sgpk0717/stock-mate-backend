@@ -20,6 +20,13 @@ from app.alpha.memory import ExperienceVectorMemory
 from app.alpha.miner import DiscoveredFactor
 from app.alpha.models import AlphaFactor, AlphaMiningRun
 from app.alpha.operators import OperatorRegistry
+from app.alpha.report_metrics import (
+    compute_coverage_health,
+    compute_derived_feature_usage,
+    compute_family_delta,
+    compute_family_distribution,
+    compute_ic_trend,
+)
 from app.alpha.universe import Universe, resolve_universe
 from app.backtest.data_loader import load_candles, load_enriched_candles
 from app.core.config import settings
@@ -48,6 +55,8 @@ class _FactoryState:
     last_funnel: dict = field(default_factory=dict)
     generation_ic_history: list = field(default_factory=list)  # 세대별 IC 추이 (최근 20개)
     user_stopped: bool = False  # 사용자가 의도적으로 중지 (watchdog 재시작 방지)
+    log_lines: list = field(default_factory=list)  # 실시간 로그 (최근 500줄 링버퍼)
+    prev_family_distribution: dict[str, float] = field(default_factory=dict)
 
 
 class AlphaFactoryScheduler:
@@ -71,6 +80,17 @@ class AlphaFactoryScheduler:
         self._cached_data: pl.DataFrame | None = None
         self._data_cache_key: str = ""
 
+    def _append_log(self, msg: str) -> None:
+        """실시간 로그에 타임스탬프 포함 메시지 추가 (최근 500줄)."""
+        if not self._state.running:
+            return
+        from app.core.timezone import now_kst
+        ts = now_kst().strftime("%H:%M:%S")
+        self._state.log_lines.append(f"[{ts}] {msg}")
+        if len(self._state.log_lines) > 500:
+            self._state.log_lines = self._state.log_lines[-500:]
+        self._state.current_cycle_message = msg
+
     async def start(
         self,
         context: str = "",
@@ -85,6 +105,10 @@ class AlphaFactoryScheduler:
         enable_crossover: bool | None = None,
         max_cycles: int | None = None,
         seed_factor_ids: list[str] | None = None,
+        population_size: int | None = None,
+        cpcv_n_groups: int | None = None,
+        cpcv_n_test: int | None = None,
+        cpcv_embargo_days: int | None = None,
     ) -> bool:
         """스케줄러 시작. 이미 실행 중이면 False 반환."""
         async with self._lock:
@@ -135,6 +159,10 @@ class AlphaFactoryScheduler:
                     "enable_crossover": crossover,
                     "max_cycles": max_cycles,
                     "seed_factor_ids": seed_factor_ids,
+                    "population_size": population_size,
+                    "cpcv_n_groups": cpcv_n_groups,
+                    "cpcv_n_test": cpcv_n_test,
+                    "cpcv_embargo_days": cpcv_embargo_days,
                 },
             )
 
@@ -150,6 +178,7 @@ class AlphaFactoryScheduler:
                     max_gen = await db.execute(
                         select(func.max(AlphaFactor.birth_generation))
                         .where(AlphaFactor.population_active == True)  # noqa: E712
+                        .where(AlphaFactor.interval == data_interval)
                     )
                     last_gen = max_gen.scalar() or 0
                     self._state.generation = last_gen
@@ -192,7 +221,43 @@ class AlphaFactoryScheduler:
                 except asyncio.CancelledError:
                     pass
             self._task = None
-            logger.info("Alpha factory stopped")
+
+            # 메모리 해제: 대용량 캐시 참조 제거
+            self._cached_data = None
+            self._data_cache_key = ""
+            if self._evolution_engine is not None:
+                self._evolution_engine._data = None
+                self._evolution_engine._population = []
+                self._evolution_engine._last_population = []
+                if hasattr(self._evolution_engine, '_FEATURE_LIST'):
+                    self._evolution_engine._FEATURE_LIST = None
+            if self._vector_memory is not None:
+                self._vector_memory._cache = {}
+
+            # DB 연결 풀 정리: 유휴 연결의 work_mem 해제
+            try:
+                from app.core.database import engine
+                await engine.dispose()
+                logger.info("DB 연결 풀 해제 완료")
+            except Exception as e:
+                logger.warning("DB 연결 풀 해제 실패: %s", e)
+
+            # PostgreSQL에 CHECKPOINT + 캐시 정리 요청
+            # (DB가 페이지 캐시를 해제하도록 유도 — WSL2 vmmem 반환)
+            try:
+                from sqlalchemy import text as sa_text
+                from app.core.database import async_session
+                async with async_session() as _db:
+                    await _db.execute(sa_text("CHECKPOINT"))
+                    await _db.execute(sa_text("DISCARD ALL"))
+                    await _db.commit()
+                logger.info("DB CHECKPOINT + DISCARD 완료 (캐시 정리)")
+            except Exception as e:
+                logger.debug("DB 캐시 정리 실패: %s", e)
+
+            import gc
+            gc.collect()
+            logger.info("Alpha factory stopped (메모리 해제 완료)")
 
             # WebSocket 즉시 알림
             try:
@@ -205,6 +270,10 @@ class AlphaFactoryScheduler:
                 pass
 
             return True
+
+    def get_last_config(self) -> dict:
+        """마지막으로 사용한 팩토리 설정 반환 (자동 재시작용)."""
+        return self._state.config if self._state else {}
 
     def get_status(self) -> dict:
         """현재 상태 반환 (부작용 없음 — 상태 보고만)."""
@@ -234,6 +303,7 @@ class AlphaFactoryScheduler:
             "operator_stats": self._state.operator_stats,
             "last_funnel": self._state.last_funnel,
             "user_stopped": self._state.user_stopped,
+            "log_lines": list(self._state.log_lines[-500:]),
         }
 
     async def _loop(self) -> None:
@@ -339,11 +409,13 @@ class AlphaFactoryScheduler:
 
         try:
             logger.info("Cycle %d: starting (config=%s)", cycle_num, {k: v for k, v in config.items() if k != "context"})
+            self._append_log(f"사이클 {cycle_num} 시작")
 
             # 유니버스 리졸브 → 데이터 로드
             universe_code = config.get("universe", "KOSPI200")
             data_interval = config.get("data_interval", "1d")
             symbols = await resolve_universe(Universe(universe_code))
+            self._append_log(f"유니버스 {universe_code}: {len(symbols)}개 종목 리졸브")
 
             # 인터벌별 종목 수 동적 제한 (OOM 방지, 분봉일수록 종목 적게)
             from app.alpha.interval import max_symbols_for_mining
@@ -352,6 +424,7 @@ class AlphaFactoryScheduler:
                 orig_count = len(symbols)
                 symbols = symbols[:max_sym]
                 logger.info("Cycle %d: %s — 종목 수 %d → %d 제한 (OOM 방지)", cycle_num, data_interval, orig_count, max_sym)
+                self._append_log(f"종목 수 제한: {orig_count} → {max_sym} (OOM 방지)")
 
             logger.info("Cycle %d: resolved %d symbols for %s", cycle_num, len(symbols), universe_code)
 
@@ -363,6 +436,7 @@ class AlphaFactoryScheduler:
             if self._cached_data is not None and self._data_cache_key == cache_key:
                 data = self._cached_data
                 logger.info("Cycle %d: using cached candles %d rows x %d cols", cycle_num, data.height, data.width)
+                self._append_log(f"캐시 데이터 사용 ({data.height:,}행 × {data.width}피처)")
                 await manager.broadcast("alpha:factory", {
                     "type": "progress",
                     "cycle": cycle_num,
@@ -371,6 +445,7 @@ class AlphaFactoryScheduler:
                     "current": 0, "total": 100,
                 })
             else:
+                self._append_log(f"Enriched 캔들 로드 중... ({data_interval}, {len(symbols)}종목)")
                 data = await load_enriched_candles(
                     symbols=symbols,
                     start_date=start,
@@ -381,6 +456,7 @@ class AlphaFactoryScheduler:
                 self._data_cache_key = cache_key
                 _size_mb = data.estimated_size() / 1024 / 1024
                 logger.info("Cycle %d: loaded enriched candles %d rows x %d cols (%.0fMB)", cycle_num, data.height, data.width, _size_mb)
+                self._append_log(f"데이터 로드 완료: {data.height:,}행 × {data.width}피처 ({_size_mb:.0f}MB)")
                 # 팩트 기반 로그: 실제 로드 결과
                 await manager.broadcast("alpha:factory", {
                     "type": "progress",
@@ -395,13 +471,15 @@ class AlphaFactoryScheduler:
                 return
 
             # 진화 엔진 기반 실행
+            self._append_log("진화 엔진 초기화 중...")
             async with async_session() as db:
                 if self._vector_memory:
                     await self._vector_memory.load_cache(db)
+                    self._append_log("벡터 메모리 캐시 로드 완료")
 
                 async def progress_cb(current: int, total: int, msg: str) -> None:
                     self._state.current_cycle_progress = current
-                    self._state.current_cycle_message = msg
+                    self._append_log(msg)
                     await manager.broadcast("alpha:factory", {
                         "type": "progress",
                         "cycle": cycle_num,
@@ -444,11 +522,12 @@ class AlphaFactoryScheduler:
                     })
 
                 if self._evolution_engine is None:
+                    self._append_log(f"진화 엔진 신규 생성 (세대 {self._state.generation}, 모집단 {config.get('population_size') or settings.ALPHA_POPULATION_SIZE})")
                     self._evolution_engine = EvolutionEngine(
                         data=data,
                         db=db,
                         operator_registry=self._operator_registry,
-                        population_size=settings.ALPHA_POPULATION_SIZE,
+                        population_size=config.get("population_size") or settings.ALPHA_POPULATION_SIZE,
                         elite_pct=settings.ALPHA_ELITE_PCT,
                         context=config.get("context", ""),
                         ic_threshold=config["ic_threshold"],
@@ -456,10 +535,17 @@ class AlphaFactoryScheduler:
                         vector_memory=self._vector_memory,
                         generation=self._state.generation,
                         interval=data_interval,
+                        cpcv_n_groups=config.get("cpcv_n_groups") or 10,
+                        cpcv_n_test=config.get("cpcv_n_test") or 3,
+                        cpcv_embargo_days=config.get("cpcv_embargo_days") or 10,
                     )
+                    # 취소 체크 콜백 — to_thread 내부에서 running=False 감지 시 즉시 종료
+                    self._evolution_engine._is_cancelled = lambda: not self._state.running
                 else:
+                    self._append_log(f"진화 엔진 데이터 갱신 (세대 {self._state.generation})")
                     self._evolution_engine.update_data(data)
                     self._evolution_engine._db = db
+                    self._evolution_engine._is_cancelled = lambda: not self._state.running
 
                 # Phase 3 메모리 확보: cached_data 임시 해제 (train/val에 복사 완료)
                 self._cached_data = None
@@ -476,7 +562,7 @@ class AlphaFactoryScheduler:
                     status="RUNNING",
                     progress=0,
                     factors_found=0,
-                    total_evaluated=settings.ALPHA_POPULATION_SIZE,
+                    total_evaluated=config.get("population_size") or settings.ALPHA_POPULATION_SIZE,
                 )
                 db.add(mining_run)
                 await db.flush()  # DB에 레코드 생성 → FK 참조 가능
@@ -486,13 +572,19 @@ class AlphaFactoryScheduler:
                 # seed_factor_ids: 첫 사이클에서만 주입, 이후 사이클에서는 무시
                 _seed_ids = config.get("seed_factor_ids") if cycle_num == 1 else None
 
+                def log_cb(msg: str) -> None:
+                    self._append_log(msg)
+
+                self._append_log(f"세대 {self._evolution_engine.generation + 1} run_generation 시작")
                 logger.info("Cycle %d: starting run_generation (gen=%d, seed_factor_ids=%s)", cycle_num, self._evolution_engine.generation, _seed_ids)
                 discovered = await self._evolution_engine.run_generation(
                     progress_cb=progress_cb,
                     iteration_cb=iteration_cb,
+                    log_cb=log_cb,
                     seed_factor_ids=_seed_ids,
                 )
                 logger.info("Cycle %d: run_generation done, discovered=%d", cycle_num, len(discovered))
+                self._append_log(f"세대 완료: {len(discovered)}개 팩터 발견")
 
                 self._state.generation = self._evolution_engine.generation
                 self._state.operator_stats = self._operator_registry.to_dict()
@@ -537,7 +629,9 @@ class AlphaFactoryScheduler:
 
             # 인과 검증: 항상 실행 (팩터 발견 시)
             if len(discovered) > 0 and run_id:
+                self._append_log(f"인과 검증 시작: {len(discovered)}개 팩터")
                 await self._run_causal_validation(run_id, cycle_num)
+                self._append_log("인과 검증 완료")
 
         finally:
             # 성공이든 실패든 카운터 반영 + 브로드캐스트
@@ -559,6 +653,7 @@ class AlphaFactoryScheduler:
                 self._state.factors_discovered_total += len(discovered)
             self._state.last_cycle_at = datetime.now(timezone.utc).isoformat()
             self._state.current_cycle_progress = 100
+            self._append_log(f"사이클 {cycle_num} 완료: {len(discovered)}개 발견 (누적 {self._state.factors_discovered_total})")
 
             await manager.broadcast("alpha:factory", {
                 "type": "cycle_complete",
@@ -598,6 +693,39 @@ class AlphaFactoryScheduler:
                         cycle_num, discovered, config,
                         _last_funnel, _last_eval, _last_candidates, elapsed_str,
                     )
+
+                    # IC 트렌드는 DB 조회이므로 report_data 구성 직후 비동기로
+                    report_data["ic_trend"] = await compute_ic_trend(
+                        interval=config.get("data_interval", "1d"), limit=10,
+                    )
+
+                    # Redis 캐싱 (프론트엔드 API용, 24시간 TTL)
+                    try:
+                        import json as _json
+                        from app.core.redis import get_client as get_redis
+                        _redis = get_redis()
+                        _interval = config.get("data_interval", "1d")
+                        await _redis.set(
+                            f"alpha:mining_report:{_interval}",
+                            _json.dumps(report_data, default=str),
+                            ex=86400,
+                        )
+                    except Exception:
+                        pass
+
+                    # DB 영속화
+                    try:
+                        from app.alpha.models import AlphaGenerationReport
+                        async with async_session() as _persist_db:
+                            _persist_db.add(AlphaGenerationReport(
+                                generation=report_data["generation"],
+                                data_interval=report_data.get("data_interval", "1d"),
+                                cycle_num=report_data.get("cycle_num", 0),
+                                report_data=report_data,
+                            ))
+                            await _persist_db.commit()
+                    except Exception as e:
+                        logger.warning("Mining report DB persist failed: %s", e)
 
                     # LLM 리포트 생성 (Gemini), 실패 시 기존 f-string 폴백
                     try:
@@ -685,7 +813,7 @@ class AlphaFactoryScheduler:
         # 연산자 성능 통계 (UCB1)
         op_stats = self._state.operator_stats or {}
 
-        return {
+        report = {
             "generation": self._state.generation,
             "cycle_num": cycle_num,
             "elapsed": elapsed_str,
@@ -705,7 +833,7 @@ class AlphaFactoryScheduler:
             "operator_stats": {
                 k: {
                     "calls": v.get("calls", 0),
-                    "avg_fitness_delta": round(v.get("avg_fitness_delta", 0), 4),
+                    "avg_fitness_delta": round(v.get("recent_avg_reward", 0) or v.get("avg_fitness_delta", 0), 4),
                 }
                 for k, v in (op_stats.get("operators", {}) if isinstance(op_stats, dict) else {}).items()
                 if isinstance(v, dict)
@@ -715,6 +843,23 @@ class AlphaFactoryScheduler:
             "fail_samples": eval_data.get("fail_samples", []) if eval_data else [],
             "generation_ic_trend": self._state.generation_ic_history,
         }
+
+        # ── 신규 메트릭 (마이닝 리포트 고도화) ──
+        population = getattr(self._evolution_engine, "_last_population", []) if self._evolution_engine else []
+        offspring = candidates_data.get("offspring", []) if candidates_data else []
+
+        family_dist = compute_family_distribution(population)
+        report["family_distribution"] = family_dist
+        report["family_delta"] = compute_family_delta(
+            family_dist,
+            self._state.prev_family_distribution,
+        )
+        self._state.prev_family_distribution = family_dist
+
+        report["derived_feature_usage"] = compute_derived_feature_usage(offspring)
+        report["coverage_health"] = compute_coverage_health(population)
+
+        return report
 
     async def _generate_llm_report(self, report_data: dict) -> str:
         """Gemini로 마이닝 리포트 생성."""
@@ -742,6 +887,10 @@ class AlphaFactoryScheduler:
             "   - 다음 사이클 방향 권고 (연산자 비율, 유니버스, 인터벌 등)\n"
             "   - 팩터 미발견 시 원인 진단 + 개선 방향\n\n"
             "7. **하단 설정**: universe / interval / cycle_num 한 줄\n\n"
+            "8. **피처 다양성 분석**: family_distribution 비율과 delta를 해석. 특정 패밀리가 과도하거나 과소한 경우 원인 분석.\n\n"
+            "9. **커버리지 건강**: coverage_health의 Tier 분포를 해석. 데이터 부족으로 탈락한 팩터가 많으면 데이터 수집 강화 권고.\n\n"
+            "10. **IC 트렌드**: ic_trend 시계열 추세를 해석. 정체/하락/상승 패턴 식별.\n\n"
+            "11. **신규 피처**: derived_feature_usage 중 활발히 사용되는 피처와 미사용 피처를 언급.\n\n"
             "## 형식 제약\n"
             "- Telegram HTML만 사용: <b>, <i>, <code> 태그만 허용\n"
             "- <br>, <p>, <div>, <span>, <ul>, <li> 등은 절대 사용 금지 (텔레그램 미지원)\n"
@@ -779,97 +928,106 @@ class AlphaFactoryScheduler:
         )
         return msg
 
-    def _build_fallback_report(self, report_data: dict) -> str:
-        """LLM 실패 시 기존 f-string 폴백 리포트."""
-        gen = report_data["generation"]
-        elapsed_str = report_data["elapsed"]
-        discovered_count = len(report_data["discovered_factors"])
-        total = report_data["total_discovered"]
-        ic_thr = report_data["ic_threshold"]
-        f = report_data["funnel"]
-        universe_code = report_data["universe"]
-        data_interval = report_data["data_interval"]
-        cycle_num = report_data["cycle_num"]
-        op_breakdown = report_data.get("operator_breakdown", {})
+    def _build_fallback_report(self, data: dict) -> str:
+        """텔레그램 폴백 리포트 (LLM 실패 시)."""
+        gen = data.get("generation", "?")
+        elapsed = data.get("elapsed", "?")
+        discovered = data.get("discovered_factors", [])
+        funnel = data.get("funnel", {})
+        total = data.get("total_discovered", 0)
 
-        # 상태 이모지
-        if discovered_count >= 5:
-            status_emoji = "\U0001f525"  # 🔥
-        elif discovered_count > 0:
-            status_emoji = "\u2705"  # ✅
+        # ── Executive Summary ──
+        best_ic = max((f.get("ic_mean", 0) for f in discovered), default=0)
+        n_found = len(discovered)
+        if n_found > 0:
+            emoji = "\U0001f525" if best_ic >= 0.05 else "\u2705"
+            summary = f"{emoji} <b>Gen {gen}</b>: {n_found}개 발견 (최고 IC {best_ic:.4f}) [{elapsed}]"
         else:
-            status_emoji = "\U0001f52c"  # 🔬
+            emoji = "\U0001f52c"
+            summary = f"{emoji} <b>Gen {gen}</b>: 탐색 중 [{elapsed}]"
 
-        msg = f"{status_emoji} <b>{gen}번째 탐색 완료</b> ({elapsed_str})\n\n"
+        lines = [summary, ""]
 
-        # 결과 — 쉬운 말로
-        if discovered_count > 0:
-            msg += f"이번에 쓸 만한 전략을 <b>{discovered_count}개</b> 찾았어요! (지금까지 총 {total}개)\n"
-        else:
-            msg += f"이번엔 기준을 통과한 전략이 없었어요. (지금까지 총 {total}개)\n"
+        # ── 핵심 수치 ──
+        attempted = funnel.get("attempted", 0)
+        rate = (n_found / attempted * 100) if attempted > 0 else 0
+        lines.append(
+            f"\U0001f4ca 발견 {n_found}개 / 평가 {attempted}개 / "
+            f"통과율 {rate:.1f}% / 총 {total}개"
+        )
+        lines.append("")
 
-        # 발견 팩터 상세 — 쉽게 설명
-        if report_data["discovered_factors"]:
-            msg += f"\n\U0001f3c6 <b>찾아낸 전략 (상위 3개)</b>\n"
-            for i, d in enumerate(report_data["discovered_factors"][:3], 1):
-                ic = d.get("ic_mean", 0)
-                sh = d.get("sharpe", 0)
-                # IC/Sharpe를 별점으로 직관 표현
-                ic_stars = "\u2b50" * min(5, max(1, int(ic / 0.03)))
-                msg += (
-                    f"  {i}. 예측력 {ic_stars} ({ic:.3f})"
-                    f" · 안정성 {sh:.1f}점\n"
-                )
+        # ── 상위 팩터 ──
+        if discovered:
+            lines.append("\U0001f3c6 <b>상위 전략</b>")
+            for i, f in enumerate(discovered[:3], 1):
+                ic = f.get("ic_mean", 0)
+                sh = f.get("sharpe", 0)
+                expr = f.get("expression", "?")[:70]
+                lines.append(f"  {i}. IC {ic:.4f} | Sharpe {sh:.2f}")
+                lines.append(f"     <code>{expr}</code>")
+            lines.append("")
 
-        # 진화 과정 — 비유로 설명
-        if f.get("attempted"):
-            attempted = f["attempted"]
-            eval_ok = f.get("eval_ok", 0)
-            ic_pass = f.get("ic_pass", 0)
-            eval_pct = int(eval_ok / attempted * 100) if attempted else 0
+        # ── 퍼널 ──
+        eval_ok = funnel.get("eval_ok", 0)
+        ic_pass = funnel.get("ic_pass", 0)
+        cpcv = funnel.get("cpcv_candidates", 0)
+        lines.append("\U0001f52c <b>파이프라인</b>")
+        lines.append(f"  {attempted} \u2192 {eval_ok} \u2192 {ic_pass} \u2192 {cpcv} \u2192 {n_found}")
+        lines.append("")
 
-            msg += (
-                f"\n\U0001f9ec <b>이번 탐색 과정</b>\n"
-                f"  {attempted}개 후보를 만들어서 테스트했어요\n"
-                f"  \u251c 제대로 계산된 것: {eval_ok}개 ({eval_pct}%)\n"
-                f"  \u251c 예측력 기준 통과: {ic_pass}개\n"
+        # ── 패밀리 분포 ──
+        family_dist = data.get("family_distribution", {})
+        family_delta = data.get("family_delta", {})
+        if family_dist:
+            lines.append("\U0001f4ca <b>패밀리 분포</b>")
+            for fam in sorted(family_dist, key=family_dist.get, reverse=True):
+                pct = family_dist[fam] * 100
+                bar_len = int(pct / 5)
+                bar = "\u2588" * bar_len + "\u2591" * (10 - bar_len)
+                delta = family_delta.get(fam, 0) * 100
+                delta_str = f" ({delta:+.0f}pp)" if abs(delta) >= 1 else ""
+                lines.append(f"  {fam:10s} {bar} {pct:4.0f}%{delta_str}")
+            lines.append("")
+
+        # ── 커버리지 ──
+        cov = data.get("coverage_health", {})
+        if cov:
+            ta = cov.get("tier_a", {})
+            tb = cov.get("tier_b", {})
+            lines.append(
+                f"\U0001f4c8 커버리지  A(>80%): {ta.get('count', 0)}개 | "
+                f"B(50-80%): {tb.get('count', 0)}개"
             )
-            wf_overfit = f.get("wf_overfit", 0)
-            sharpe_fail = f.get("sharpe_fail", 0)
-            if wf_overfit > 0:
-                msg += f"  \u251c 과거에만 잘 맞는 것 제외: {wf_overfit}개\n"
-            if sharpe_fail > 0:
-                msg += f"  \u251c 수익이 불안정한 것 제외: {sharpe_fail}개\n"
-            msg += f"  \u2514 최종 합격: <b>{discovered_count}개</b>\n"
+            lines.append("")
 
-        # 미발견 시 최고 성적
-        if not report_data["discovered_factors"]:
-            samples = report_data.get("top_samples") or report_data.get("fail_samples", [])
-            if samples:
-                best_ic = max(s.get("ic", 0) for s in samples)
-                msg += f"\n\U0001f4c8 가장 유망했던 후보의 예측력: {best_ic:.4f}\n"
+        # ── IC 트렌드 ──
+        ic_trend = data.get("ic_trend", [])
+        if ic_trend and len(ic_trend) >= 2:
+            lines.append("\U0001f4c9 <b>IC 추이</b>")
+            max_ic = max(t["avg_ic"] for t in ic_trend) or 0.01
+            for t in ic_trend[-5:]:
+                bar_len = int(t["avg_ic"] / max_ic * 8) if max_ic > 0 else 0
+                bar = "\u25a0" * bar_len
+                mark = " \u2605" if t["avg_ic"] == max_ic else ""
+                lines.append(f"  Gen{t['gen']:>3d} \u2524{bar:<8s} {t['avg_ic']:.4f}{mark}")
+            lines.append("")
 
-        # 쉬운 해석
-        if discovered_count == 0:
-            best_ic = 0.0
-            all_samples = report_data.get("top_samples", []) + report_data.get("fail_samples", [])
-            if all_samples:
-                best_ic = max(s.get("ic", 0) for s in all_samples)
-            if best_ic >= ic_thr * 0.8:
-                msg += f"\n\U0001f4a1 기준에 거의 근접했어요. 조금만 더 진화하면 찾을 수 있어요.\n"
-            elif f.get("eval_ok", 0) == 0:
-                msg += f"\n\u26a0\ufe0f 계산 실패가 많아요. 데이터를 점검해볼 필요가 있어요.\n"
-            else:
-                msg += f"\n\U0001f4a1 아직 좋은 전략을 못 찾았지만, 탐색을 계속하면 점점 나아져요.\n"
-        else:
-            msg += (
-                f"\n\U0001f4a1 <b>용어 설명</b>\n"
-                f"  예측력(IC): 내일 주가를 얼마나 잘 맞추는지 (높을수록 좋음)\n"
-                f"  안정성(Sharpe): 수익이 꾸준한지 (1.0 이상이면 좋음)\n"
-            )
+        # ── 연산자 Top 3 ──
+        op_stats = data.get("operator_stats", {})
+        if op_stats:
+            sorted_ops = sorted(
+                op_stats.items(),
+                key=lambda x: x[1].get("avg_fitness_delta", 0),
+                reverse=True,
+            )[:3]
+            lines.append("\u2699\ufe0f <b>연산자 Top 3</b>")
+            for op, stats in sorted_ops:
+                calls = stats.get("calls", 0)
+                delta = stats.get("avg_fitness_delta", 0)
+                lines.append(f"  {op}: {calls}회 (avg {delta:+.4f})")
 
-        msg += f"\n\u2699\ufe0f 탐색 범위: {universe_code} / {data_interval} / {cycle_num}번째 사이클"
-        return msg
+        return "\n".join(lines)
 
     async def _run_causal_validation(self, run_id: uuid.UUID, cycle_num: int) -> None:
         """인과 검증을 동기적으로 실행. 검증 완료 후 다음 사이클로 진행."""
@@ -878,8 +1036,11 @@ class AlphaFactoryScheduler:
 
             logger.info("Cycle %d: starting causal validation (run=%s)", cycle_num, run_id)
             async with async_session() as causal_db:
-                count = await validate_factors_batch(run_id, causal_db)
+                count = await validate_factors_batch(
+                    run_id, causal_db, log_cb=self._append_log,
+                )
             logger.info("Cycle %d: causal validation complete (%d factors)", cycle_num, count)
+            self._append_log(f"인과 검증 완료: {count}개 팩터 검증됨")
 
             await manager.broadcast("alpha:factory", {
                 "type": "causal_complete",
@@ -888,6 +1049,7 @@ class AlphaFactoryScheduler:
             })
         except Exception as e:
             logger.error("Cycle %d: causal validation failed: %s", cycle_num, e)
+            self._append_log(f"인과 검증 실패: {e}")
 
 
 # ── 인터벌별 스케줄러 인스턴스 ──
