@@ -775,6 +775,8 @@ async def run_factor_backtest(
     interval: str = "1d",
     stop_loss_pct: float = 0.0,
     trailing_stop_pct: float = 0.0,
+    profit_target_pct: float = 0.0,
+    max_hold_bars: int = 0,
     max_drawdown_pct: float = 0.0,
     eod_liquidation: bool = True,
     skip_opening_minutes: int = 0,
@@ -1095,6 +1097,47 @@ async def run_factor_backtest(
                         del holdings[sym]
                         logger.debug("Stop-loss triggered: %s (%.1f%%)", sym, drawdown * 100)
 
+                # [2026-04-06] Triple Barrier: 익절 체크
+                if sym in holdings and profit_target_pct > 0 and not circuit_breaker_triggered:
+                    gain = (price - pos["avg_price"]) / pos["avg_price"]
+                    if gain >= profit_target_pct:
+                        _tv = today.get(sym, {}).get("volume", 0) if has_volume else 0
+                        sell_price = effective_sell_price(price, cost_config, order_qty=pos["qty"], bar_volume=_tv)
+                        pnl = (sell_price - pos["avg_price"]) * pos["qty"]
+                        trades.append(Trade(
+                            symbol=sym, entry_date=str(pos["entry_date"]),
+                            exit_date=str(current_date), entry_price=pos["avg_price"],
+                            exit_price=sell_price, quantity=pos["qty"],
+                            pnl=pnl, pnl_pct=(sell_price / pos["avg_price"] - 1) * 100,
+                            holding_days=_calc_holding_days(current_date, pos["entry_date"], intraday),
+                            scale_step="S-PROFIT",
+                            exit_reason=f"익절 목표 달성 ({gain:.1%} >= {profit_target_pct:.1%})",
+                            entry_reason=_make_entry_reason(pos),
+                        ))
+                        total_sells += 1
+                        del holdings[sym]
+
+                # [2026-04-06] Triple Barrier: 최대 보유 기간 체크
+                if sym in holdings and max_hold_bars > 0 and not circuit_breaker_triggered:
+                    _entry_idx = pos.get("entry_bar_idx", 0)
+                    _hold_bars = day_idx - _entry_idx
+                    if _hold_bars >= max_hold_bars:
+                        _tv = today.get(sym, {}).get("volume", 0) if has_volume else 0
+                        sell_price = effective_sell_price(price, cost_config, order_qty=pos["qty"], bar_volume=_tv)
+                        pnl = (sell_price - pos["avg_price"]) * pos["qty"]
+                        trades.append(Trade(
+                            symbol=sym, entry_date=str(pos["entry_date"]),
+                            exit_date=str(current_date), entry_price=pos["avg_price"],
+                            exit_price=sell_price, quantity=pos["qty"],
+                            pnl=pnl, pnl_pct=(sell_price / pos["avg_price"] - 1) * 100,
+                            holding_days=_calc_holding_days(current_date, pos["entry_date"], intraday),
+                            scale_step="S-TIME",
+                            exit_reason=f"최대 보유 기간 도달 ({_hold_bars}/{max_hold_bars}봉)",
+                            entry_reason=_make_entry_reason(pos),
+                        ))
+                        total_sells += 1
+                        del holdings[sym]
+
                 # 트레일링 스탑 체크 (매 바마다, 손절과 독립 실행)
                 if sym in holdings and trailing_stop_pct > 0 and not circuit_breaker_triggered:
                     high_price = pos.get("high_price", pos["avg_price"])
@@ -1362,6 +1405,9 @@ async def run_factor_backtest(
                 per_stock_budget = cash / max(len(buy_list), 1)
 
                 for sym in buy_list:
+                    # [2026-04-06] VI 발동 종목 매수 금지
+                    if today.get(sym, {}).get("vi_triggered", False):
+                        continue
                     # 이미 pending 매수가 있는 종목은 건너뜀
                     if use_limit_orders and any(o["symbol"] == sym and o["side"] == "BUY" for o in pending_orders):
                         continue
@@ -1433,6 +1479,7 @@ async def run_factor_backtest(
                             "qty": qty,
                             "avg_price": buy_price,
                             "entry_date": current_date,
+                            "entry_bar_idx": day_idx,
                             "last_close": buy_price,
                             "high_price": buy_price,
                             "low_price": buy_price,
@@ -1726,6 +1773,8 @@ async def execute_factor_backtest(
     interval: str = "1d",
     stop_loss_pct: float = 0.0,
     trailing_stop_pct: float = 0.0,
+    profit_target_pct: float = 0.0,
+    max_hold_bars: int = 0,
     max_drawdown_pct: float = 0.0,
     eod_liquidation: bool = True,
     skip_opening_minutes: int = 0,
@@ -2080,6 +2129,8 @@ async def run_dual_factor_backtest(
     intraday_exit_threshold: float = 0.2,
     stop_loss_pct: float = 0.15,
     trailing_stop_pct: float = 0.20,
+    profit_target_pct: float = 0.0,
+    max_hold_bars: int = 0,
     cost_config: CostConfig | None = None,
     progress_cb: ProgressCallback = None,
     use_limit_orders: bool = True,

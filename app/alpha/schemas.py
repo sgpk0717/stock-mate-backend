@@ -111,6 +111,8 @@ class AlphaFactorBacktestRequest(BaseModel):
     band_threshold: float = Field(0.05, ge=0.0, le=0.2)  # 밴드 리밸런싱 임계값
     stop_loss_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포지션 손절 (0=비활성, 0.05=5%)
     trailing_stop_pct: float = Field(0.0, ge=0.0, le=0.5)  # 트레일링 스탑 (0=비활성, 0.20=고점 대비 20%)
+    profit_target_pct: float = Field(0.0, ge=0.0, le=1.0)  # Triple Barrier 익절 (0=비활성, 0.05=5%)
+    max_hold_bars: int = Field(0, ge=0, le=10000)  # Triple Barrier 최대 보유 봉 수 (0=비활성)
     max_drawdown_pct: float = Field(0.0, ge=0.0, le=0.5)  # 포트폴리오 서킷 브레이커 (0=비활성)
     buy_commission: float | None = Field(None, ge=0.0, le=0.01)  # 매수 수수료 (None=인터벌 기본값)
     sell_commission: float | None = Field(None, ge=0.0, le=0.01)  # 매도 수수료+세금 (None=인터벌 기본값)
