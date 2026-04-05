@@ -92,7 +92,7 @@ class AlphaFactor(Base):
 
     # 상태
     status: Mapped[str] = mapped_column(
-        String(20), nullable=False, server_default="'discovered'"
+        String(20), nullable=False, server_default="discovered"
     )
 
     # Phase 2: 인과 검증
@@ -138,10 +138,14 @@ class AlphaFactor(Base):
         Boolean, nullable=False, server_default="false"
     )
 
+    # [2026-04-06] 멀티호라이즌 IC — 알파 반감기/최적 보유기간
+    optimal_horizon: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    half_life_days: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Phase 3: 계보 + 복합 팩터
     parent_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     factor_type: Mapped[str] = mapped_column(
-        String(20), nullable=False, server_default="'single'"
+        String(20), nullable=False, server_default="single"
     )
     component_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
@@ -184,4 +188,29 @@ class AlphaExperience(Base):
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class AlphaGenerationReport(Base):
+    """세대별 마이닝 리포트 영속 저장."""
+
+    __tablename__ = "alpha_generation_reports"
+    __table_args__ = (
+        Index("ix_gen_report_interval_gen", "data_interval", "generation"),
+        Index("ix_gen_report_interval_created", "data_interval", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    data_interval: Mapped[str] = mapped_column(
+        String(5), nullable=False, server_default="'1d'"
+    )
+    cycle_num: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    report_data: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
