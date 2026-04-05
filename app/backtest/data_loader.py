@@ -677,6 +677,63 @@ async def _load_program_trading(
         await conn.close()
 
 
+def _shift_weekend_discussion(disc_df: pl.DataFrame) -> pl.DataFrame:
+    """주말+금요일 장마감 후 종토방 데이터를 다음 거래일(월요일)로 리맵.
+
+    - 금요일 15:30 이후 → 다음 월요일 09:00
+    - 토요일 전체 → 다음 월요일 09:00
+    - 일요일 전체 → 다음 월요일 09:00
+    - 그 외 → 그대로 유지
+
+    리맵 후 동일 (symbol, dt)로 재집계하여 월요일에 주말 전체 누적 반영.
+    """
+    if disc_df.is_empty() or "dt" not in disc_df.columns:
+        return disc_df
+
+    # weekday: 1=월 ~ 7=일 (Polars 기본)
+    disc_df = disc_df.with_columns(
+        pl.col("dt").dt.weekday().alias("_wd"),
+        pl.col("dt").dt.hour().alias("_hr"),
+        pl.col("dt").dt.minute().alias("_mn"),
+    )
+
+    # 리맵 조건: 금요일(5) 15:30+ / 토요일(6) / 일요일(7)
+    disc_df = disc_df.with_columns(
+        pl.when(
+            (pl.col("_wd") == 5) & ((pl.col("_hr") > 15) | ((pl.col("_hr") == 15) & (pl.col("_mn") >= 30)))
+        ).then(
+            # 금요일 15:30+ → 월요일 (+3일) 09:00
+            pl.col("dt").dt.truncate("1d") + pl.duration(days=3, hours=9)
+        ).when(
+            pl.col("_wd") == 6
+        ).then(
+            # 토요일 → 월요일 (+2일) 09:00
+            pl.col("dt").dt.truncate("1d") + pl.duration(days=2, hours=9)
+        ).when(
+            pl.col("_wd") == 7
+        ).then(
+            # 일요일 → 월요일 (+1일) 09:00
+            pl.col("dt").dt.truncate("1d") + pl.duration(days=1, hours=9)
+        ).otherwise(
+            pl.col("dt")
+        ).alias("dt")
+    ).drop(["_wd", "_hr", "_mn"])
+
+    # 동일 (symbol, dt)로 재집계
+    agg_exprs = [
+        pl.col("disc_count").sum(),
+        pl.col("disc_sentiment").mean(),
+        pl.col("disc_positive_ratio").mean(),
+        pl.col("disc_negative_ratio").mean(),
+    ]
+    if "disc_velocity" in disc_df.columns:
+        agg_exprs.append(pl.col("disc_velocity").mean())
+
+    disc_df = disc_df.group_by(["symbol", "dt"]).agg(agg_exprs)
+
+    return disc_df
+
+
 async def _load_discussion(
     symbols: list[str] | None,
     start_date: date | None,
@@ -865,6 +922,9 @@ async def load_enriched_candles(
 
         # 종토방 여론
         if not disc_df.is_empty():
+            # [2026-04-06] 주말 종토방 데이터를 다음 거래일(월요일)로 리맵
+            disc_df = _shift_weekend_discussion(disc_df)
+
             if is_intraday:
                 # 분봉: dt의 시간(hour) 기준 JOIN — timezone 통일
                 _disc_tz = disc_df["dt"].dtype
@@ -887,6 +947,7 @@ async def load_enriched_candles(
                     pl.col("disc_sentiment").mean(),
                     pl.col("disc_positive_ratio").mean(),
                     pl.col("disc_negative_ratio").mean(),
+                    (pl.col("disc_velocity").mean() if "disc_velocity" in disc_df.columns else pl.lit(None).cast(pl.Float64)).alias("disc_velocity"),
                 ])
                 # T+1 shift (룩어헤드 편향 방지)
                 disc_daily = disc_daily.with_columns(
