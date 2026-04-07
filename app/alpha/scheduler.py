@@ -805,8 +805,25 @@ class AlphaFactoryScheduler:
 
         # 발견 팩터 상세
         discovered_factors = []
-        for d in sorted(discovered, key=lambda x: x.metrics.ic_mean if x.metrics else 0, reverse=True):
-            entry: dict = {"expression": d.expression_str[:60]}
+        _sorted = sorted(discovered, key=lambda x: x.metrics.ic_mean if x.metrics else 0, reverse=True)
+        for i, d in enumerate(_sorted):
+            # 상위 3개: 전체 수식 + 한국어 번역 (Gemini 상세 설명용)
+            if i < 3:
+                entry: dict = {"expression": d.expression_str}
+                if d.hypothesis:
+                    entry["hypothesis"] = d.hypothesis
+                # sympy_to_korean 결과 추가
+                try:
+                    from app.alpha.ast_converter import parse_expression
+                    from app.alpha.expression_translator import sympy_to_korean
+                    _expr = parse_expression(d.expression_str)
+                    entry["expression_korean"] = sympy_to_korean(_expr)
+                except Exception:
+                    entry["expression_korean"] = ""
+            else:
+                entry = {"expression": d.expression_str[:60]}
+                if d.hypothesis:
+                    entry["hypothesis"] = d.hypothesis[:100]
             if d.metrics:
                 entry.update({
                     "ic_mean": round(d.metrics.ic_mean, 4),
@@ -815,8 +832,6 @@ class AlphaFactoryScheduler:
                     "max_drawdown": round(d.metrics.max_drawdown, 3) if hasattr(d.metrics, "max_drawdown") and d.metrics.max_drawdown else 0,
                     "turnover": round(d.metrics.turnover, 3) if hasattr(d.metrics, "turnover") and d.metrics.turnover else 0,
                 })
-            if d.hypothesis:
-                entry["hypothesis"] = d.hypothesis[:100]
             discovered_factors.append(entry)
 
         # 연산자 분포
@@ -895,9 +910,16 @@ class AlphaFactoryScheduler:
             "   - ✅ 팩터 1~4개 발견\n"
             "   - 🔬 팩터 미발견\n\n"
             "2. **결과 요약**: 이번 사이클 발견 팩터 수, 누적 발견 수\n\n"
-            "3. **발견 팩터 상세** (있으면 상위 3개만):\n"
-            "   - 수식 (<code>태그), IC, Sharpe\n"
-            "   - 각 팩터의 경제적 의미 1줄 해석 (hypothesis 참고)\n\n"
+            "3. **발견 팩터 상세** (상위 3개):\n"
+            "   - 수식(<code>태그로 축약), IC, Sharpe\n"
+            "   - expression_korean 필드를 참고하여, 비전문가가 이해할 수 있는 상세 설명 (150~200자)\n"
+            "   - 수식의 각 변수가 무엇인지 하나하나 풀어서 설명할 것\n"
+            "   - '어떤 조건의 종목을 찾는지' 투자 관점으로 서술. 수학식 그대로 옮기지 말 것\n"
+            "   - 계수(0.5, 1.0 등)의 의미도 설명 (예: '0.65는 영향을 65%만 반영')\n"
+            "   - 예시: '이익수익률(EPS÷주가)이 높고, 최근 5일 평균가격이 상승 중이면서,\n"
+            "     변동성(ATR)이 낮은 안정적인 종목에 높은 점수를 줌. 외국인이 개인보다\n"
+            "     더 많이 매수하는 종목(스마트머니 갭)일수록 추가 가산점'\n"
+            "   - [생성 방식] 텍스트는 포함하지 말 것\n\n"
             "4. **진화 퍼널**: attempted → eval_ok → IC통과 → 최종 (퍼센트 포함)\n\n"
             "5. **진화 방향성 분석** (generation_ic_trend 데이터 기반):\n"
             "   - IC 추이 해석: 수렴 중인지, 발산 중인지, 정체인지\n"

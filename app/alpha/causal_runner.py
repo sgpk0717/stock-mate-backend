@@ -382,16 +382,28 @@ async def validate_single_factor(
 
     # 6. DB 업데이트
     new_status = "validated" if causal_result.is_causally_robust else "mirage"
+    _update_values = {
+        "causal_robust": causal_result.is_causally_robust,
+        "causal_effect_size": causal_result.causal_effect_size,
+        "causal_p_value": causal_result.p_value,
+        "causal_failure_type": causal_result.failure_type,
+        "status": new_status,
+    }
+
+    # [2026-04-08] 인과검증 통과 시 비전문가용 상세 수식 설명 생성 (Gemini)
+    if causal_result.is_causally_robust:
+        try:
+            detailed = await _generate_detailed_explanation(factor.expression_str)
+            if detailed:
+                _update_values["hypothesis"] = detailed
+                _log("hypothesis", f"[{factor_idx}/{factor_total}] {fname} 상세 설명 생성 완료", fname)
+        except Exception as e:
+            logger.warning("상세 설명 생성 실패 (%s): %s", fname, e)
+
     await db.execute(
         update(AlphaFactor)
         .where(AlphaFactor.id == factor_id)
-        .values(
-            causal_robust=causal_result.is_causally_robust,
-            causal_effect_size=causal_result.causal_effect_size,
-            causal_p_value=causal_result.p_value,
-            causal_failure_type=causal_result.failure_type,
-            status=new_status,
-        )
+        .values(**_update_values)
     )
     await db.commit()
 
@@ -411,6 +423,45 @@ async def validate_single_factor(
     )
 
     return causal_result
+
+
+async def _generate_detailed_explanation(expression_str: str) -> str | None:
+    """인과검증 통과 팩터에 대해 비전문가용 상세 수식 설명을 Gemini로 생성.
+
+    토큰 절약을 위해 인과검증 통과 팩터에만 호출 (1회성).
+    """
+    from app.core.llm import chat_gemini
+    from app.alpha.ast_converter import parse_expression
+    from app.alpha.expression_translator import sympy_to_korean
+
+    try:
+        expr = parse_expression(expression_str)
+        korean_formula = sympy_to_korean(expr)
+    except Exception:
+        korean_formula = expression_str
+
+    prompt = (
+        "아래는 주식 알파 팩터 수식과 한국어 변환입니다.\n\n"
+        f"수식: {expression_str}\n"
+        f"한국어 변환: {korean_formula}\n\n"
+        "이 수식이 '어떤 조건의 종목을 찾는지'를 투자 초보자가 이해할 수 있도록 설명해주세요.\n"
+        "규칙:\n"
+        "- 200~300자 이내\n"
+        "- 수식의 각 변수가 무엇인지 하나하나 풀어서 설명\n"
+        "- 계수(0.5, 1.0 등)의 의미도 설명\n"
+        "- 수학식을 그대로 옮기지 말고 투자 관점으로 서술\n"
+        "- [생성 방식] 텍스트는 포함하지 말 것\n"
+        "- 예시: '이익수익률(EPS÷주가)이 높고, 최근 5일 평균가격이 상승 중이면서, "
+        "변동성(ATR)이 낮은 안정적인 종목에 높은 점수를 줌. "
+        "0.65는 5일 평균가격의 영향을 65%만 반영한다는 뜻'"
+    )
+
+    response = await chat_gemini(
+        system="주식 팩터 수식을 비전문가가 이해할 수 있도록 설명하는 전문가입니다.",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
+    )
+    return response.strip() if response else None
 
 
 async def validate_factors_batch(
