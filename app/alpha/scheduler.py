@@ -500,16 +500,30 @@ class AlphaFactoryScheduler:
                         _last_funnel = event.get("funnel", {})
                         self._state.last_funnel = _last_funnel
                         # IC 히스토리 기록 (세대별 추이 — LLM 리포트용)
+                        # [2026-04-07] 전체 offspring 통계 사용 (sampling 기반 → 전수 통계)
                         _best_ic = 0.0
+                        _avg_ic = 0.0
+                        _best_sharpe = 0.0
+                        _avg_sharpe = 0.0
                         if _last_eval:
-                            _all_s = _last_eval.get("top_samples", []) + _last_eval.get("fail_samples", [])
-                            if _all_s:
-                                _best_ic = max(s.get("ic", 0) for s in _all_s)
+                            _best_ic = _last_eval.get("population_best_ic", 0)
+                            _avg_ic = _last_eval.get("population_avg_ic", 0)
+                            _best_sharpe = _last_eval.get("population_best_sharpe", 0)
+                            _avg_sharpe = _last_eval.get("population_avg_sharpe", 0)
+                            # 폴백: 이전 버전 호환 (population_best_ic 없으면 sampling 방식)
+                            if not _best_ic and not _avg_ic:
+                                _all_s = _last_eval.get("top_samples", []) + _last_eval.get("fail_samples", [])
+                                if _all_s:
+                                    _best_ic = max(s.get("ic", 0) for s in _all_s)
                         self._state.generation_ic_history.append({
                             "gen": event.get("generation", 0),
                             "best_ic": round(_best_ic, 4),
+                            "avg_ic": round(_avg_ic, 4),
+                            "best_sharpe": round(_best_sharpe, 2),
+                            "avg_sharpe": round(_avg_sharpe, 2),
                             "discovered": event.get("new_discovered", 0),
                             "eval_ok": _last_funnel.get("eval_ok", 0),
+                            "cross_gen_dup": _last_eval.get("cross_gen_dup", 0) if _last_eval else 0,
                         })
                         self._state.generation_ic_history = self._state.generation_ic_history[-20:]
                     elif etype == "candidates_ready":
@@ -859,6 +873,12 @@ class AlphaFactoryScheduler:
         report["derived_feature_usage"] = compute_derived_feature_usage(offspring)
         report["coverage_health"] = compute_coverage_health(population)
 
+        # ── 다양성 메트릭 (세대간 수렴/정체 진단용) ──
+        report["population_unique_hashes"] = len(set(
+            f.expression_hash for f in population if hasattr(f, "expression_hash") and f.expression_hash
+        ))
+        report["cross_gen_dup"] = eval_data.get("cross_gen_dup", 0) if eval_data else 0
+
         return report
 
     async def _generate_llm_report(self, report_data: dict) -> str:
@@ -891,6 +911,10 @@ class AlphaFactoryScheduler:
             "9. **커버리지 건강**: coverage_health의 Tier 분포를 해석. 데이터 부족으로 탈락한 팩터가 많으면 데이터 수집 강화 권고.\n\n"
             "10. **IC 트렌드**: ic_trend 시계열 추세를 해석. 정체/하락/상승 패턴 식별.\n\n"
             "11. **신규 피처**: derived_feature_usage 중 활발히 사용되는 피처와 미사용 피처를 언급.\n\n"
+            "12. **다양성 진단**: population_unique_hashes(고유 수식 수)와 cross_gen_dup(교차세대 중복 수)를 확인.\n"
+            "    - 고유 수식 수가 모집단의 50% 미만이면 수렴 경고.\n"
+            "    - cross_gen_dup > 0이면 이전 세대와 동일한 팩터가 반복 발견되고 있음.\n"
+            "    - generation_ic_trend의 avg_ic/best_ic/avg_sharpe를 세대간 비교하여 정체 여부 진단.\n\n"
             "## 형식 제약\n"
             "- Telegram HTML만 사용: <b>, <i>, <code> 태그만 허용\n"
             "- <br>, <p>, <div>, <span>, <ul>, <li> 등은 절대 사용 금지 (텔레그램 미지원)\n"

@@ -304,6 +304,11 @@ class EvolutionEngine:
         self._generation += 1
         self._eval_fail_logged = 0  # 세대별 리셋
 
+        # 0. 기존 discovered 팩터 해시 로드 (교차세대 중복 방지)
+        existing_discovered_hashes = await self._load_discovered_hashes()
+        if log_cb:
+            log_cb(f"세대 {self._generation}: 기존 발견 팩터 {len(existing_discovered_hashes)}개 해시 로드")
+
         # 1. 모집단 로드
         if log_cb:
             log_cb(f"세대 {self._generation}: DB에서 모집단 로드 중...")
@@ -432,6 +437,14 @@ class EvolutionEngine:
         train_data = compute_forward_returns(train_data, periods=_fwd_periods)
         if val_data is not None:
             val_data = compute_forward_returns(val_data, periods=_fwd_periods)
+
+        # 3.6. 엘리트 메트릭 재평가 (stale metrics 방지 — 같은 데이터라도 train 분할 기준으로 재평가)
+        if elites:
+            if log_cb:
+                log_cb(f"세대 {self._generation}: 엘리트 {len(elites)}개 메트릭 재평가 중...")
+            elites = self._refresh_elite_metrics(elites, train_data)
+            if log_cb:
+                log_cb(f"세대 {self._generation}: 엘리트 재평가 완료")
 
         # 4. 진화 3-Phase 파이프라인
         import time as _time
@@ -672,6 +685,7 @@ class EvolutionEngine:
             log_cb,
             _cancel_check,
             tier2_data,
+            existing_discovered_hashes,
         )
 
         logger.info("세대 %d: Phase 3 to_thread 완료 — offspring %d개", self._generation, len(offspring))
@@ -711,6 +725,9 @@ class EvolutionEngine:
                 }
                 for o in ic_failed[-3:]
             ]
+            # 전체 offspring IC/Sharpe 통계 (generation_ic_history 정확도 개선)
+            _all_ics = [o.ic_mean for o in offspring if hasattr(o, "ic_mean")]
+            _all_sharpes = [o.sharpe for o in offspring if hasattr(o, "sharpe")]
             await iteration_cb({
                 "type": "eval_complete",
                 "generation": self._generation,
@@ -730,6 +747,12 @@ class EvolutionEngine:
                     }
                     for d in new_discovered
                 ],
+                # 전체 통계 (sampling 아닌 전수)
+                "population_best_ic": round(max(_all_ics), 4) if _all_ics else 0,
+                "population_avg_ic": round(sum(_all_ics) / len(_all_ics), 4) if _all_ics else 0,
+                "population_best_sharpe": round(max(_all_sharpes), 2) if _all_sharpes else 0,
+                "population_avg_sharpe": round(sum(_all_sharpes) / len(_all_sharpes), 2) if _all_sharpes else 0,
+                "cross_gen_dup": funnel.get("cross_gen_dup", 0),
             })
 
         # 4.5. 다양성 시드 주입 (수렴 감지 시에만)
@@ -814,6 +837,7 @@ class EvolutionEngine:
         log_cb=None,  # callable(str) — 실시간 로그 (scheduler._append_log)
         is_cancelled=None,  # callable() -> bool — 취소 체크
         tier2_data: pl.DataFrame | None = None,  # Tier 2 평가용 데이터 구간
+        existing_discovered_hashes: set[str] | None = None,  # 교차세대 중복 방지
     ) -> tuple[list, list, dict]:
         """Phase 3: 배치 평가 + Walk-Forward + CPCV (CPU-bound, 별도 스레드에서 실행).
 
@@ -1108,6 +1132,15 @@ class EvolutionEngine:
                     _hash = expression_hash(child.expression)
                     if _hash in _discovered_hashes:
                         logger.debug("Clone skipped: %s", child.expression_str[:50])
+                        continue
+                    # ★ 교차세대 중복 방지: 이전 세대에서 이미 발견된 팩터 스킵
+                    _existing = existing_discovered_hashes or set()
+                    if _hash in _existing:
+                        logger.info(
+                            "Cross-gen duplicate skipped: %s (hash=%s)",
+                            child.expression_str[:50], _hash[:8],
+                        )
+                        funnel["cross_gen_dup"] = funnel.get("cross_gen_dup", 0) + 1
                         continue
                     _discovered_hashes.add(_hash)
 
@@ -2286,6 +2319,63 @@ class EvolutionEngine:
             if h not in seen or factor.fitness_composite > seen[h].fitness_composite:
                 seen[h] = factor
         return list(seen.values())
+
+    async def _load_discovered_hashes(self) -> set[str]:
+        """DB에서 기존 discovered 팩터의 expression_hash를 로드 (교차세대 중복 방지)."""
+        result = await self._db.execute(
+            select(AlphaFactor.expression_hash).where(
+                AlphaFactor.status == "discovered",
+                AlphaFactor.interval == self._interval,
+                AlphaFactor.expression_hash.isnot(None),
+            )
+        )
+        return {h for h in result.scalars().all()}
+
+    def _refresh_elite_metrics(
+        self, elites: list[ScoredFactor], train_data: pl.DataFrame,
+    ) -> list[ScoredFactor]:
+        """엘리트의 IC/Sharpe를 현재 train 데이터로 재평가.
+
+        같은 데이터라도 train 분할이 달라질 수 있고,
+        데이터가 추가되면 메트릭이 변화해야 한다.
+        """
+        from app.alpha.interval import default_round_trip_cost
+
+        refreshed = []
+        for elite in elites:
+            metrics = self._evaluate_on_data_full(elite.expression, train_data)
+            if metrics is not None and metrics.ic_series:
+                old_ic = elite.ic_mean
+                elite.ic_mean = metrics.ic_mean
+                elite.ic_std = metrics.ic_std
+                elite.icir = metrics.icir
+                elite.sharpe = metrics.sharpe
+                elite.max_drawdown = metrics.max_drawdown
+                elite.turnover = metrics.turnover
+                elite.fitness_composite = compute_composite_fitness(
+                    ic_mean=metrics.ic_mean,
+                    icir=metrics.icir,
+                    turnover=metrics.turnover,
+                    tree_depth=elite.tree_depth,
+                    tree_size=elite.tree_size,
+                    sharpe=metrics.sharpe,
+                    max_drawdown=metrics.max_drawdown,
+                    w_ic=settings.ALPHA_FITNESS_W_IC,
+                    w_icir=settings.ALPHA_FITNESS_W_ICIR,
+                    w_sharpe=settings.ALPHA_FITNESS_W_SHARPE,
+                    w_mdd=settings.ALPHA_FITNESS_W_MDD,
+                    w_turnover=settings.ALPHA_FITNESS_W_TURNOVER,
+                    w_complexity=settings.ALPHA_FITNESS_W_COMPLEXITY,
+                    coverage_pct=metrics.coverage_pct,
+                    coverage_exp=settings.ALPHA_COVERAGE_PENALTY_EXP,
+                )
+                if abs(old_ic - elite.ic_mean) > 0.0001:
+                    logger.info(
+                        "엘리트 재평가: %s IC %.4f→%.4f, Sharpe %.2f",
+                        elite.expression_str[:40], old_ic, elite.ic_mean, elite.sharpe,
+                    )
+            refreshed.append(elite)
+        return refreshed
 
     async def _persist_population(self, population: list[ScoredFactor]) -> None:
         """모집단을 DB에 영속화."""
