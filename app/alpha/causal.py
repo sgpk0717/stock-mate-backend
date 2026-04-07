@@ -339,8 +339,8 @@ class CausalValidationResult:
     regime_ate_first_half: float = 0.0
     regime_ate_second_half: float = 0.0
     dag_edges: list[dict] = field(default_factory=lambda: list(DAG_EDGES))
-    # H4: 실패 분류 (PASSED, LOW_IC, CONFOUNDED, FRAGILE, REGIME_SHIFT)
-    failure_type: str = "PASSED"
+    # H4: 실패 분류 (PASSED, LOW_TSTAT, CONFOUNDED, FRAGILE, REGIME_SHIFT, INSUFFICIENT_DATA, ERROR)
+    failure_type: str = "UNKNOWN"
 
 
 class FactorMirageFilter:
@@ -387,6 +387,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="CONSTANT_FACTOR",
             )
 
         try:
@@ -403,6 +404,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="ERROR",
             )
 
     @staticmethod
@@ -501,6 +503,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="INSUFFICIENT_DATA",
             )
 
         # 데이터 통합 DataFrame 구축
@@ -530,6 +533,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="INSUFFICIENT_DATA",
             )
 
         # dt 컬럼은 DoWhy에 불필요하므로 제거
@@ -660,6 +664,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="INSUFFICIENT_DATA",
             )
 
         # 데이터 통합 DataFrame 구축 (기존 _run_dowhy와 동일)
@@ -694,6 +699,7 @@ class FactorMirageFilter:
                 placebo_effect=0.0,
                 random_cause_passed=False,
                 random_cause_delta=0.0,
+                failure_type="INSUFFICIENT_DATA",
             )
 
         # NumPy 배열 추출
