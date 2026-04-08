@@ -139,12 +139,8 @@ def _prepare_factor_and_validate_sync(
     polars_expr = sympy_to_polars(expr)
     df = base_df.with_columns(polars_expr.alias("alpha_factor"))
 
-    # [2026-04-06] 분봉 인과검증 정합성: IC 평가와 동일한 수익률 정의 사용
-    from app.alpha.interval import is_intraday
-    from app.core.config import settings
-    if is_intraday(interval) and settings.ALPHA_FWD_RETURN_MODE == "intraday":
-        from app.alpha.evaluator import _collapse_to_daily
-        df = _collapse_to_daily(df, factor_col="alpha_factor")
+    # [2026-04-08] 분봉 인과검증: _collapse_to_daily 폐기 (98.7% 데이터 손실 방지)
+    # 분봉 원본(N~9,360)으로 직접 인과검증. 교란변수/t-stat/regime은 causal.py에서 분기.
 
     # NaN 제거
     df = df.filter(
@@ -181,7 +177,7 @@ def _prepare_factor_and_validate_sync(
         use_fast_engine=settings.CAUSAL_USE_FAST_ENGINE,
     )
 
-    return causal_filter.validate(factor_values, forward_returns, aligned)
+    return causal_filter.validate(factor_values, forward_returns, aligned, interval=interval)
 
 
 async def validate_single_factor(

@@ -363,6 +363,7 @@ class FactorMirageFilter:
         factor_values: np.ndarray,
         forward_returns: np.ndarray,
         confounders_df: pd.DataFrame,
+        interval: str = "1d",
     ) -> CausalValidationResult:
         """팩터의 인과적 유효성을 검증한다.
 
@@ -392,7 +393,7 @@ class FactorMirageFilter:
 
         try:
             if self.use_fast_engine:
-                return self._run_fast(factor_values, forward_returns, confounders_df)
+                return self._run_fast(factor_values, forward_returns, confounders_df, interval=interval)
             return self._run_dowhy_legacy(factor_values, forward_returns, confounders_df)
         except Exception as e:
             logger.exception("Causal validation failed: %s", e)
@@ -644,17 +645,28 @@ class FactorMirageFilter:
         factor_values: np.ndarray,
         forward_returns: np.ndarray,
         confounders_df: pd.DataFrame,
+        interval: str = "1d",
     ) -> CausalValidationResult:
         """NumPy 고속 인과 검증 — DoWhy와 수학적으로 동일한 연산.
 
         statsmodels/DoWhy 객체 생성 오버헤드를 제거하고,
         동일한 OLS 회귀 + 플라시보/랜덤원인/체제변화 검증을 수행한다.
+
+        [2026-04-08] 분봉(intraday) 전용 완화:
+        - 교란변수: sector_id만 사용 (거시 변수 과잉통제 방지)
+        - t-stat 게이트: 3.0 → 2.0
+        - Regime Split: 비활성화 (경고만)
+        - _MIN_SAMPLES: 100 → 500
         """
+        from app.alpha.interval import is_intraday
+        _is_intra = is_intraday(interval)
+        _min_samples = 500 if _is_intra else _MIN_SAMPLES
+
         n = min(len(factor_values), len(forward_returns), len(confounders_df))
-        if n < _MIN_SAMPLES:
+        if n < _min_samples:
             logger.warning(
                 "Insufficient data for causal validation: %d rows (min %d)",
-                n, _MIN_SAMPLES,
+                n, _min_samples,
             )
             return CausalValidationResult(
                 is_causally_robust=False,
@@ -686,10 +698,10 @@ class FactorMirageFilter:
             _block_dates = data["dt"].values  # 날짜 배열 보존
             data = data.drop(columns=["dt"])
 
-        if len(data) < _MIN_SAMPLES:
+        if len(data) < _min_samples:
             logger.warning(
                 "Insufficient clean data for causal validation: %d rows (min %d)",
-                len(data), _MIN_SAMPLES,
+                len(data), _min_samples,
             )
             return CausalValidationResult(
                 is_causally_robust=False,
@@ -704,7 +716,10 @@ class FactorMirageFilter:
 
         # NumPy 배열 추출
         y = data["forward_return"].values.astype(np.float64)
-        X_conf = data[_CONFOUNDER_COLS].values.astype(np.float64)
+        # [2026-04-08] 분봉: 교란변수 축소 (sector_id만) — 거시 변수 과잉통제 방지
+        _conf_cols = ["sector_id"] if _is_intra else _CONFOUNDER_COLS
+        _conf_cols = [c for c in _conf_cols if c in data.columns]
+        X_conf = data[_conf_cols].values.astype(np.float64) if _conf_cols else np.zeros((len(data), 1))
         treatment_raw = data["alpha_factor"].values.astype(np.float64)
 
         # ── Treatment Z-score 표준화 ──
@@ -740,10 +755,12 @@ class FactorMirageFilter:
         se_ate = np.sqrt(max(mse * XtX_inv[-1, -1], 0.0))
         t_stat_ate = abs(ate / se_ate) if se_ate > 1e-15 else 0.0
 
-        if t_stat_ate < 3.0:
+        # [2026-04-08] 분봉: t-stat 2.0 (표본 충분), 일봉: 3.0 (Harvey 2016)
+        _t_threshold = 2.0 if _is_intra else 3.0
+        if t_stat_ate < _t_threshold:
             logger.info(
-                "Causal t-stat gate: ATE=%.6f, t=%.2f < 3.0 → REJECT (Harvey et al. 2016)",
-                ate, t_stat_ate,
+                "Causal t-stat gate: ATE=%.6f, t=%.2f < %.1f → REJECT",
+                ate, t_stat_ate, _t_threshold,
             )
             return CausalValidationResult(
                 is_causally_robust=False,
@@ -816,7 +833,11 @@ class FactorMirageFilter:
             X_base, treatment, y,
         )
 
-        is_robust = placebo_passed and random_passed and regime_passed
+        # [2026-04-08] 분봉: regime_passed를 탈락 조건에서 제외 (60일 분할은 검정력 부족)
+        if _is_intra:
+            is_robust = placebo_passed and random_passed
+        else:
+            is_robust = placebo_passed and random_passed and regime_passed
 
         # 실패 분류
         if is_robust:
@@ -825,7 +846,7 @@ class FactorMirageFilter:
             failure_type = "CONFOUNDED"
         elif not random_passed:
             failure_type = "FRAGILE"
-        elif not regime_passed:
+        elif not _is_intra and not regime_passed:
             failure_type = "REGIME_SHIFT"
         else:
             failure_type = "LOW_IC"
