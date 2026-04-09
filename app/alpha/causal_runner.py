@@ -139,8 +139,14 @@ def _prepare_factor_and_validate_sync(
     polars_expr = sympy_to_polars(expr)
     df = base_df.with_columns(polars_expr.alias("alpha_factor"))
 
-    # [2026-04-08] 분봉 인과검증: _collapse_to_daily 폐기 (98.7% 데이터 손실 방지)
-    # 분봉 원본(N~9,360)으로 직접 인과검증. 교란변수/t-stat/regime은 causal.py에서 분기.
+    # [2026-04-09] 분봉 인과검증: _collapse_to_daily로 장중 수익률 적용 (마이닝 IC 평가와 동일 기준)
+    # 분봉 원본 유지가 아닌, 일별 축소하여 장중 수익률(open 09:10→close 15:25)로 인과검증
+    # 이유: 마이닝에서 장중 수익률로 IC를 계산하므로, 인과검증도 동일 수익률 사용해야 정합성 유지
+    from app.alpha.interval import is_intraday
+    from app.core.config import settings
+    if is_intraday(interval) and settings.ALPHA_FWD_RETURN_MODE == "intraday":
+        from app.alpha.evaluator import _collapse_to_daily
+        df = _collapse_to_daily(df, factor_col="alpha_factor")
 
     # NaN 제거
     df = df.filter(
